@@ -37,6 +37,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import (local directories, sharded checkpoints, optional Hub download, explicit compatibility reports) | **implemented** |
 | GPT-2 and Llama HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and GPT-2/Llama reference-logit parity | **implemented for the explicit GPT-2 and Llama adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; other architectures are reported `unsupported`** |
+| Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama graphs; per-output tolerances and error metrics) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
 | Torch-CPU NIR execution (NumPy parity; `rope`/`repeat_kv` currently use the explicit NumPy fallback) | **implemented** |
@@ -104,6 +105,8 @@ uzen import model.safetensors --family transformer_decoder
 uzen import ./tiny-hf-model --revision main
 uzen import --repo-id org/model-name --revision main
 uzen modify <artifact_id> interpolate --other <artifact_id> --param t=0.5
+uzen forward <artifact_id> --tokens '[[0,1,2,3]]'
+uzen compare-models <source_id> <candidate_id> --tokens '[[0,1,2,3]]'
 uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
 uzen serve --host 0.0.0.0 --port 8080
 uzen mcp --root ./uzen-workspace
@@ -182,6 +185,7 @@ uzen/
 * [docs/CAPABILITY_MATRIX.md](docs/CAPABILITY_MATRIX.md) — every operation, maturity and assumptions.
 * [docs/API.md](docs/API.md) — REST/SDK/CLI/MCP contracts and error codes.
 * [docs/P1_IMPORT.md](docs/P1_IMPORT.md) — Hugging Face/safetensors import and compatibility report.
+* [docs/P2_MODEL_EXECUTION.md](docs/P2_MODEL_EXECUTION.md) — stored-model execution and modified-model comparison.
 
 ## Tests
 

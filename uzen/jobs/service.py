@@ -27,6 +27,12 @@ from uzen.core.nws.store import ArtifactRecord, ArtifactStore
 from uzen.core.nws.tensors import WeightPackage
 from uzen.core.vel.verify import verify
 from uzen.core.wie.inspector import WeightIntelligenceEngine
+from uzen.core.wie.model_execution import (
+    ModelExecution,
+    compare_executions,
+    execute_stored_model,
+    graph_from_manifest,
+)
 from uzen.engines.mar.engine import ModelArchitectureResearch
 from uzen.engines.war.engine import WeightArchitectureResearch
 from uzen.engines.wge.engine import WeightGenerationEngine
@@ -216,6 +222,58 @@ class JobService:
         if not self.store.exists(artifact_id):
             raise ArtifactNotFound(f"artifact '{artifact_id}' is not in the store")
         return self.store.get(artifact_id)
+
+    def forward_model(
+        self,
+        artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    ) -> ModelExecution:
+        """Execute the stored graph recovered from an imported model artifact."""
+        return execute_stored_model(
+            self.get_package(artifact_id),
+            self.artifact_manifest(artifact_id),
+            artifact_id=artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+
+    def compare_models(
+        self,
+        source_artifact_id: str,
+        candidate_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+    ) -> dict[str, Any]:
+        """Compare two model artifacts on exactly the same inputs and graph."""
+        source_manifest = self.artifact_manifest(source_artifact_id)
+        candidate_manifest = self.artifact_manifest(candidate_artifact_id)
+        source_graph = graph_from_manifest(source_manifest)
+        candidate_graph = graph_from_manifest(candidate_manifest)
+        if source_graph.to_dict() != candidate_graph.to_dict():
+            raise InvalidOperationParameters(
+                "source and candidate artifacts have different stored NIR graphs; "
+                "only weight-only modifications can be compared as the same model"
+            )
+        source = execute_stored_model(
+            self.get_package(source_artifact_id),
+            source_manifest,
+            artifact_id=source_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        candidate = execute_stored_model(
+            self.get_package(candidate_artifact_id),
+            candidate_manifest,
+            artifact_id=candidate_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        return compare_executions(source, candidate, atol=atol, rtol=rtol)
 
     # ------------------------------------------------------------------ #
     # jobs

@@ -121,6 +121,9 @@ single-objective contract.
 | --- | --- |
 | Families: `transformer_decoder`, `mlp`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `moe`, `state_space`, `gnn`, `vae`, `diffusion`, `multimodal`, `hybrid` | implemented |
 | NIR operators (41): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, reductions, activations | implemented |
+| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama graphs; finite output validation, no tokenizer or KV cache |
+| Weight-only modification with stored-graph preservation | implemented; parent graph metadata is copied to the modified artifact |
+| Source/candidate model output comparison | implemented; same-graph enforcement, recorded tolerances and per-output errors |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
 | Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |

@@ -259,6 +259,41 @@ def create_app(
             "checksum": record.manifest.checksum,
         }
 
+    @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward")
+    def forward_model(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        if "tokens" not in payload:
+            raise HTTPException(400, detail={"code": "request.invalid", "message": "provide tokens"})
+        client = Uzen(root=service.root)
+        return client.forward_model(
+            artifact_id,
+            tokens=payload["tokens"],
+            positions=payload.get("positions"),
+            include_values=bool(payload.get("include_values", False)),
+        )
+
+    @app.post(f"/{API_VERSION}/models/compare")
+    def compare_models(payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        required = ("source_artifact_id", "candidate_artifact_id", "tokens")
+        missing = [key for key in required if key not in payload]
+        if missing:
+            raise HTTPException(
+                400,
+                detail={"code": "request.invalid", "message": f"provide {', '.join(missing)}"},
+            )
+        client = Uzen(root=service.root)
+        return client.compare_models(
+            payload["source_artifact_id"],
+            payload["candidate_artifact_id"],
+            tokens=payload["tokens"],
+            positions=payload.get("positions"),
+            atol=float(payload.get("atol", 1e-5)),
+            rtol=float(payload.get("rtol", 1e-5)),
+        )
+
     @app.get(f"/{API_VERSION}/models")
     def list_models(limit: int = 100, _: None = Depends(require_auth)):
         return {"models": service.models(limit=limit)}

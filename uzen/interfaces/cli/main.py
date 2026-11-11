@@ -124,6 +124,20 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--family")
     ev.add_argument("--spec")
 
+    fwd = sub.add_parser("forward", help="execute a stored reconstructed model graph")
+    fwd.add_argument("artifact_id")
+    fwd.add_argument("--tokens", required=True, help="JSON token matrix, e.g. '[[0,1,2,3]]'")
+    fwd.add_argument("--positions", help="JSON position matrix; defaults to arange")
+    fwd.add_argument("--values", action="store_true", help="include output values")
+
+    cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
+    cmp_models.add_argument("source_artifact_id")
+    cmp_models.add_argument("candidate_artifact_id")
+    cmp_models.add_argument("--tokens", required=True, help="JSON token matrix")
+    cmp_models.add_argument("--positions", help="JSON position matrix")
+    cmp_models.add_argument("--atol", type=float, default=1e-5)
+    cmp_models.add_argument("--rtol", type=float, default=1e-5)
+
     align = sub.add_parser("align", help="align one artifact to another")
     align.add_argument("source")
     align.add_argument("target")
@@ -304,6 +318,30 @@ def _dispatch(args: argparse.Namespace) -> int:
                 reference_artifact_id=args.reference,
                 family=args.family,
                 spec=_json_arg(args.spec),
+            )
+        )
+        return 0
+
+    if cmd == "forward":
+        _emit(
+            _client(args).forward_model(
+                args.artifact_id,
+                tokens=_json_arg(args.tokens),
+                positions=_json_arg(args.positions),
+                include_values=args.values,
+            )
+        )
+        return 0
+
+    if cmd == "compare-models":
+        _emit(
+            _client(args).compare_models(
+                args.source_artifact_id,
+                args.candidate_artifact_id,
+                tokens=_json_arg(args.tokens),
+                positions=_json_arg(args.positions),
+                atol=args.atol,
+                rtol=args.rtol,
             )
         )
         return 0

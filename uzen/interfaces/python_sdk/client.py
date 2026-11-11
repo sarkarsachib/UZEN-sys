@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from uzen.core.nws.tensors import WeightPackage
+from uzen.core.wie.model_execution import ModelExecution
 from uzen.errors import UzenError
 from uzen.jobs.service import JobService
 
@@ -33,6 +34,19 @@ class _RemoteConfig:
     base_url: str
     token: str | None = None
     timeout: float = 120.0
+
+
+def _execution_payload(execution: ModelExecution, *, include_values: bool) -> dict[str, Any]:
+    payload = execution.summary()
+    if include_values:
+        payload["outputs"] = {
+            name: {
+                **payload["outputs"][name],
+                "values": execution.outputs[name].tolist(),
+            }
+            for name in execution.outputs
+        }
+    return payload
 
 
 class Uzen:
@@ -232,6 +246,63 @@ class Uzen:
             )
         return self.service.get_package(artifact_id)
 
+    def forward_model(
+        self,
+        artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        include_values: bool = False,
+    ) -> dict[str, Any]:
+        """Run a stored reconstructed model graph on token IDs."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/forward",
+                {
+                    "tokens": [list(row) for row in tokens],
+                    "positions": positions,
+                    "include_values": include_values,
+                },
+            )
+        execution = self.service.forward_model(
+            artifact_id, tokens=tokens, positions=positions
+        )
+        return _execution_payload(execution, include_values=include_values)
+
+    def compare_models(
+        self,
+        source_artifact_id: str,
+        candidate_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+    ) -> dict[str, Any]:
+        """Compare source and modified model artifacts on identical inputs."""
+        if not self.local:
+            return self._request(
+                "POST",
+                "/v1/models/compare",
+                {
+                    "source_artifact_id": source_artifact_id,
+                    "candidate_artifact_id": candidate_artifact_id,
+                    "tokens": [list(row) for row in tokens],
+                    "positions": positions,
+                    "atol": atol,
+                    "rtol": rtol,
+                },
+            )
+        return self.service.compare_models(
+            source_artifact_id,
+            candidate_artifact_id,
+            tokens=tokens,
+            positions=positions,
+            atol=atol,
+            rtol=rtol,
+        )
+
     # ------------------------------------------------------------------ #
     # direct engineering calls (local mode executes immediately)
     # ------------------------------------------------------------------ #
@@ -264,14 +335,23 @@ class Uzen:
             seed=seed,
             scope=TaskScope.WEIGHT_MODIFICATION,
         )
+        parent_metadata = service.artifact_manifest(artifact_id).get("metadata") or {}
+        metadata: dict[str, Any] = {
+            "method": method,
+            "architecture_preserved": result.architecture_preserved,
+        }
+        for key in ("graph", "model_kind", "source_path", "tokenizer"):
+            if key in parent_metadata:
+                metadata[key] = parent_metadata[key]
+        parents = list(dict.fromkeys([artifact_id, *others]))
         record = service.store.put(
             result.package,
             operation=result.record.code,
-            parents=[artifact_id] + list(others),
+            parents=parents,
             operations=[result.record.to_dict()],
             rng_seeds={"main": result.record.seed},
             policy=result.record.policy,
-            metadata={"method": method, "architecture_preserved": result.architecture_preserved},
+            metadata=metadata,
         )
         service.db.index_artifact(
             artifact_id=record.artifact_id,

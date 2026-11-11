@@ -63,6 +63,58 @@ class MCPServer:
                 },
                 self._import_model,
             ),
+            "uzen.forward_model": (
+                {
+                    "description": (
+                        "Run a stored reconstructed GPT-2/Llama model graph on token IDs. "
+                        "Returns output shapes and optional values; no training or gradients."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "tokens": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "include_values": {"type": "boolean"},
+                        },
+                        "required": ["artifact_id", "tokens"],
+                    },
+                },
+                self._forward_model,
+            ),
+            "uzen.compare_models": (
+                {
+                    "description": (
+                        "Compare a source model artifact and a weight-modified candidate on "
+                        "identical token/position inputs with recorded tolerances."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_artifact_id": {"type": "string"},
+                            "candidate_artifact_id": {"type": "string"},
+                            "tokens": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "atol": {"type": "number"},
+                            "rtol": {"type": "number"},
+                        },
+                        "required": ["source_artifact_id", "candidate_artifact_id", "tokens"],
+                    },
+                },
+                self._compare_models,
+            ),
             "uzen.inspect_model": (
                 {
                     "description": "Inspect a checkpoint or artifact: tensors, dtypes, roles, statistics, family hypothesis.",
@@ -357,6 +409,24 @@ class MCPServer:
     def _progress(self, stage: str, status: str, message: str) -> None:
         if self._progress_callback is not None:
             self._progress_callback(stage, status, message)
+
+    def _forward_model(self, args: Mapping[str, Any]) -> Any:
+        return self.client.forward_model(
+            str(args["artifact_id"]),
+            tokens=args["tokens"],
+            positions=args.get("positions"),
+            include_values=bool(args.get("include_values", False)),
+        )
+
+    def _compare_models(self, args: Mapping[str, Any]) -> Any:
+        return self.client.compare_models(
+            str(args["source_artifact_id"]),
+            str(args["candidate_artifact_id"]),
+            tokens=args["tokens"],
+            positions=args.get("positions"),
+            atol=float(args.get("atol", 1e-5)),
+            rtol=float(args.get("rtol", 1e-5)),
+        )
 
     def _inspect_model(self, args: Mapping[str, Any]) -> Any:
         if args.get("artifact_id"):
