@@ -1,10 +1,10 @@
 """Hugging Face and safetensors checkpoint import.
 
-The importer is deliberately conservative. It can establish that every tensor
-was loaded, that a configuration was parsed and that roles were inferred; it
-does **not** claim that an NIR graph was reconstructed or that the model was
-executed. Those stages are reported separately and remain ``not_implemented`` /
-``not_run`` until they exist.
+The importer is deliberately conservative. It establishes that every tensor was
+loaded, that a configuration was parsed and that roles were inferred. For the
+explicit GPT-2 adapter it then reconstructs and validates an NIR graph and runs
+a finite forward pass; other architectures are reported as unsupported rather
+than guessed. Import, reconstruction and execution remain independent claims.
 
 Supported sources
 -----------------
@@ -24,7 +24,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -32,6 +32,7 @@ from uzen.core.nws.dtypes import dtype_name
 from uzen.core.nws.roles import infer_role
 from uzen.core.nws.tensors import WeightPackage
 from uzen.core.wie.inspector import WeightIntelligenceEngine
+from uzen.core.wie.reconstruction import reconstruct_hf_model
 from uzen.errors import ArtifactIntegrityError, RuntimeUnavailable, UnsupportedFormat
 from uzen.infrastructure.storage.safetensors_io import read_safetensors
 from uzen.util.canonical import ContentHasher, sha256_file, utc_now_iso
@@ -158,6 +159,8 @@ class ModelImportReport:
     warnings: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     understanding: dict[str, Any] = field(default_factory=dict)
+    reconstruction: dict[str, Any] = field(default_factory=dict)
+    progress: list[dict[str, Any]] = field(default_factory=list)
     imported_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,6 +184,8 @@ class ModelImportReport:
             "warnings": self.warnings,
             "metadata": self.metadata,
             "understanding": self.understanding,
+            "reconstruction": self.reconstruction,
+            "progress": self.progress,
             "imported_at": self.imported_at,
         }
 
@@ -189,6 +194,8 @@ class ModelImportReport:
 class ModelImportResult:
     report: ModelImportReport
     package: WeightPackage | None = None
+    reconstruction: Any | None = None
+    artifact_package: WeightPackage | None = None
 
     @property
     def ok(self) -> bool:
@@ -411,6 +418,11 @@ def _tokenizer_metadata(root: Path, config: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def _notify(on_progress: Callable[[str, str, str], None] | None, stage: str, status: str, message: str) -> None:
+    if on_progress is not None:
+        on_progress(stage, status, message)
+
+
 def _source_hash(files: Sequence[SourceFile], *, repo_id: str | None, revision: str | None) -> str:
     h = ContentHasher()
     h.field("repo_id", repo_id or "")
@@ -418,6 +430,56 @@ def _source_hash(files: Sequence[SourceFile], *, repo_id: str | None, revision: 
     for item in sorted(files, key=lambda f: f.path):
         h.field(f"file:{item.path}", f"{item.sha256}|{item.role}|{item.bytes}")
     return h.hexdigest()
+
+
+def _compatibility_with_reconstruction(
+    *,
+    weights_status: str,
+    config_status: str,
+    architecture_status: str,
+    tokenizer_status: str,
+    base_overall: str,
+    reconstruction: Any | None,
+) -> Compatibility:
+    """Compose the import-stage and reconstruction-stage claims without conflation."""
+    if reconstruction is None:
+        return Compatibility(
+            weights=weights_status,
+            config=config_status,
+            tokenizer=tokenizer_status,
+            architecture=architecture_status,
+            reconstruction="not_attempted",
+            execution="not_run",
+            overall=base_overall,
+            reasons=["weights and metadata were imported; no architecture adapter was attempted"],
+        )
+    report = reconstruction.report
+    execution_status = "not_run"
+    if report.execution:
+        execution_status = str(report.execution.get("status", "not_run"))
+    if report.status == "validated":
+        overall = "validated"
+    elif report.status == "partial":
+        overall = "validated_with_unresolved"
+    elif report.status == "failed":
+        overall = "weights_only" if weights_status == "complete" else base_overall
+    else:
+        overall = base_overall
+    reasons = list(report.reasons)
+    if report.missing:
+        reasons.append(f"missing NIR parameters: {report.missing[:8]}")
+    if report.shape_errors:
+        reasons.append(f"shape inconsistencies: {report.shape_errors[:4]}")
+    return Compatibility(
+        weights=weights_status,
+        config=config_status,
+        tokenizer=tokenizer_status,
+        architecture=architecture_status,
+        reconstruction=report.status,
+        execution=execution_status,
+        overall=overall,
+        reasons=reasons,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +504,7 @@ class ModelImporter:
         repo_id: str | None = None,
         local_files_only: bool = False,
         cache_dir: str | None = None,
+        on_progress: Callable[[str, str, str], None] | None = None,
     ) -> ModelImportResult:
         if repo_id is None and not Path(source).exists():
             text = str(source)
@@ -455,12 +518,15 @@ class ModelImporter:
                 revision=revision,
                 local_files_only=local_files_only,
                 cache_dir=cache_dir,
+                on_progress=on_progress,
             )
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(str(path))
         if path.is_dir():
-            return self._import_directory(path, name=name, family=family, revision=revision)
+            return self._import_directory(
+                path, name=name, family=family, revision=revision, on_progress=on_progress
+            )
         if path.suffix.lower() != ".safetensors":
             raise UnsupportedFormat(
                 f"the HF/safetensors importer handles directories and .safetensors files; "
@@ -473,6 +539,7 @@ class ModelImporter:
             family=family,
             revision=revision,
             single_file=path,
+            on_progress=on_progress,
         )
 
     def import_huggingface_repo(
@@ -484,6 +551,7 @@ class ModelImporter:
         revision: str | None = None,
         local_files_only: bool = False,
         cache_dir: str | None = None,
+        on_progress: Callable[[str, str, str], None] | None = None,
     ) -> ModelImportResult:
         hub = self._hub or _load_huggingface_hub()
         kwargs: dict[str, Any] = {
@@ -509,6 +577,7 @@ class ModelImporter:
             revision=revision,
             source_kind="huggingface_repo",
             repo_id=repo_id,
+            on_progress=on_progress,
         )
         return result
 
@@ -526,7 +595,9 @@ class ModelImporter:
         single_file: Path | None = None,
         source_kind: str | None = None,
         repo_id: str | None = None,
+        on_progress: Callable[[str, str, str], None] | None = None,
     ) -> ModelImportResult:
+        _notify(on_progress, "source", "complete", f"source resolved: {root}")
         problems: list[str] = []
         warnings: list[str] = []
         files: list[SourceFile] = []
@@ -567,6 +638,7 @@ class ModelImporter:
                 )
             )
 
+        _notify(on_progress, "config", config_status, "configuration parsed as data")
         tokenizer = _tokenizer_metadata(root, config)
         for entry in tokenizer.get("files", []):
             files.append(SourceFile(**entry))
@@ -671,6 +743,7 @@ class ModelImporter:
                 )
             )
 
+        _notify(on_progress, "weights", "complete" if arrays else "failed", f"loaded {len(records)} tensors")
         if not selected_family and records:
             selected_family = self.engine.guess_family_from_names([r.name for r in records]).get("family")
         if not selected_family or selected_family == "unknown":
@@ -682,59 +755,93 @@ class ModelImporter:
             if family_from_config in KNOWN_FAMILIES
             else ("inferred" if selected_family in KNOWN_FAMILIES else "unknown")
         )
-        reconstruction = "not_implemented"
-        reasons = [
-            "weight loading and metadata inspection are implemented",
-            "NIR graph reconstruction from imported HF configurations is not implemented in this build",
-            "no forward pass has been executed or validated",
-        ]
         if problems:
-            overall = "unsupported"
+            base_overall = "unsupported"
         elif (
             weights_status == "complete"
             and config_status == "parsed"
             and architecture_status == "recognized"
             and tokenizer.get("status") == "present"
         ):
-            overall = "ready_for_reconstruction"
+            base_overall = "ready_for_reconstruction"
         elif weights_status == "complete":
-            overall = "weights_only"
+            base_overall = "weights_only"
         else:
-            overall = "inspect_only"
-
-        compatibility = Compatibility(
-            weights=weights_status,
-            config=config_status,
-            tokenizer=str(tokenizer.get("status")),
-            architecture=architecture_status,
-            reconstruction=reconstruction,
-            execution="not_run",
-            overall=overall,
-            reasons=reasons,
-        )
+            base_overall = "inspect_only"
 
         if revision is None:
             commit_hash = config.get("_commit_hash")
             revision = str(commit_hash) if commit_hash else None
 
+        display_source = str(single_file) if single_file is not None else str(root)
+        default_name = single_file.stem if single_file is not None else root.name
+        source_hash = _source_hash(files, repo_id=repo_id, revision=revision)
+        reconstruction_result = None
+        if arrays and config_status == "parsed":
+            reconstruction_result = reconstruct_hf_model(
+                arrays,
+                config,
+                source_dtypes=source_dtypes,
+                name=name or default_name,
+                source_hash=source_hash,
+                on_progress=on_progress,
+            )
+        reconstruction_doc = (
+            reconstruction_result.report.to_dict() if reconstruction_result is not None else {}
+        )
+        compatibility = _compatibility_with_reconstruction(
+            weights_status=weights_status,
+            config_status=config_status,
+            architecture_status=architecture_status,
+            tokenizer_status=str(tokenizer.get("status")),
+            base_overall=base_overall,
+            reconstruction=reconstruction_result,
+        )
+
         architecture = _architecture_metadata(config, family_from_config or selected_family)
+        graph_reconstructed = bool(
+            reconstruction_result is not None
+            and reconstruction_result.report.graph_reconstructed
+        )
+        execution_validated = bool(
+            reconstruction_result is not None
+            and reconstruction_result.report.execution_validated
+        )
         understanding = {
             "weights_loaded": weights_status == "complete",
             "config_parsed": config_status == "parsed",
             "tokenizer_available": tokenizer.get("status") == "present",
             "architecture_family_recognized": architecture_status == "recognized",
-            "graph_reconstructed": False,
-            "execution_validated": False,
-            "classification": overall,
-            "note": "weights metadata can be complete while graph reconstruction is still unavailable",
+            "graph_reconstructed": graph_reconstructed,
+            "execution_validated": execution_validated,
+            "classification": compatibility.overall,
+            "note": "weights metadata can be complete while an architecture adapter is unsupported",
         }
         role_counts: dict[str, int] = {}
         for rec in records:
             role_counts[rec.role] = role_counts.get(rec.role, 0) + 1
         role_counts["unclassified"] = sum(1 for r in records if r.role == "unclassified")
 
-        display_source = str(single_file) if single_file is not None else str(root)
-        default_name = single_file.stem if single_file is not None else root.name
+        progress = [
+            {
+                "stage": "source",
+                "status": "complete",
+                "message": f"source resolved with {len(files)} metadata/weight files",
+            },
+            {"stage": "config", "status": config_status, "message": "configuration parsed as data"},
+            {"stage": "weights", "status": weights_status, "message": f"loaded {len(records)} tensors"},
+        ]
+        if reconstruction_result is not None:
+            progress.extend(reconstruction_result.report.progress)
+        else:
+            progress.append(
+                {
+                    "stage": "reconstruction",
+                    "status": "not_attempted",
+                    "message": "no parsed configuration was available for an adapter",
+                }
+            )
+
         report = ModelImportReport(
             source=display_source,
             source_kind=loaded_kind or "safetensors_directory",
@@ -748,19 +855,21 @@ class ModelImporter:
             role_counts=role_counts,
             compatibility=compatibility,
             files=[f.to_dict() for f in files],
-            source_hash=_source_hash(files, repo_id=repo_id, revision=revision),
+            source_hash=source_hash,
             repo_id=repo_id,
             revision=revision,
             problems=problems,
             warnings=warnings,
             understanding=understanding,
+            reconstruction=reconstruction_doc,
+            progress=progress,
             metadata={
                 "importer": "hf/safetensors",
                 "config_status": config_status,
                 "sharded": index_path.exists() or len(list(root.glob("*.safetensors"))) > 1,
                 "tensor_count": len(records),
                 "numel": int(sum(int(np.prod(r.shape)) for r in records)),
-                "note": "architecture reconstruction and execution are separate, unimplemented stages",
+                "note": "reconstruction status is reported separately from weight import",
             },
         )
 
@@ -783,12 +892,30 @@ class ModelImporter:
                         "files": tokenizer.get("files", []),
                     },
                     "compatibility": compatibility.to_dict(),
+                    "reconstruction": {
+                        "status": reconstruction_doc.get("status"),
+                        "architecture": reconstruction_doc.get("architecture"),
+                        "spec": reconstruction_doc.get("spec"),
+                        "graph_summary": reconstruction_doc.get("graph_summary"),
+                        "tensor_mapping": reconstruction_doc.get("tensor_mapping"),
+                    },
                 },
                 source_dtypes=source_dtypes,
             )
+            canonical = (
+                reconstruction_result.package
+                if reconstruction_result is not None and reconstruction_result.usable
+                else None
+            )
             report.metadata["stored_family"] = package.family
-            return ModelImportResult(report=report, package=package)
-        return ModelImportResult(report=report, package=None)
+            report.metadata["artifact_tensor_names"] = "canonical_nir" if canonical else "source_names"
+            return ModelImportResult(
+                report=report,
+                package=package,
+                reconstruction=reconstruction_result,
+                artifact_package=canonical or package,
+            )
+        return ModelImportResult(report=report, package=None, reconstruction=reconstruction_result)
 
     # ------------------------------------------------------------------ #
     # shard loading

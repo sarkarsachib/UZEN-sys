@@ -1,0 +1,1054 @@
+"""Reconstruct an NIR graph from an imported Hugging Face checkpoint.
+
+This module only reconstructs architectures for which the mapping is explicit and
+the resulting graph can be validated against the imported tensors. It does not
+guess missing layers. Unsupported architectures and unsupported fields are
+returned as explicit ``unsupported`` reports; partial or inconsistent checkpoints
+never become a validated artifact.
+
+GPT-2 uses learned position embeddings, pre-LayerNorm blocks, fused QKV, causal
+attention, GELU, and a tied LM head. Its Hugging Face Conv1D weights are
+transposed into the NIR linear convention, and those transforms are recorded per
+tensor. Llama uses separate Q/K/V/O projections, RMSNorm, SwiGLU, real RoPE, and
+GQA-aware K/V repetition; those mappings and graph nodes are likewise explicit.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+import numpy as np
+
+from uzen.core.nir.executor import execute
+from uzen.core.nir.graph import Graph
+from uzen.core.nir.types import Ref, TensorType
+from uzen.core.nws.dtypes import dtype_name
+from uzen.core.nws.families import ArchitectureDefinition, build_architecture
+from uzen.core.nws.tensors import WeightPackage
+from uzen.errors import UzenError
+
+
+@dataclass
+class ReconstructionReport:
+    status: str
+    architecture: str | None
+    family: str | None
+    spec: dict[str, Any]
+    graph: dict[str, Any] | None
+    graph_summary: dict[str, Any] | None
+    tensor_mapping: list[dict[str, Any]]
+    missing: list[str]
+    extra: list[str]
+    shape_errors: list[str]
+    unresolved: list[str]
+    warnings: list[str]
+    validation: dict[str, Any] | None
+    execution: dict[str, Any] | None
+    source_tensor_count: int
+    mapped_tensor_count: int
+    progress: list[dict[str, Any]] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+
+    @property
+    def graph_reconstructed(self) -> bool:
+        return self.graph is not None and self.validation is not None and bool(self.validation.get("ok"))
+
+    @property
+    def execution_validated(self) -> bool:
+        return self.execution is not None and self.execution.get("status") == "passed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "architecture": self.architecture,
+            "family": self.family,
+            "spec": self.spec,
+            "graph": self.graph,
+            "graph_summary": self.graph_summary,
+            "tensor_mapping": self.tensor_mapping,
+            "missing": self.missing,
+            "extra": self.extra,
+            "shape_errors": self.shape_errors,
+            "unresolved": self.unresolved,
+            "warnings": self.warnings,
+            "validation": self.validation,
+            "execution": self.execution,
+            "source_tensor_count": self.source_tensor_count,
+            "mapped_tensor_count": self.mapped_tensor_count,
+            "progress": self.progress,
+            "reasons": self.reasons,
+            "graph_reconstructed": self.graph_reconstructed,
+            "execution_validated": self.execution_validated,
+        }
+
+
+@dataclass
+class ReconstructionResult:
+    report: ReconstructionReport
+    package: WeightPackage | None = None
+    definition: ArchitectureDefinition | None = field(default=None, repr=False)
+
+    @property
+    def usable(self) -> bool:
+        return self.report.status in ("validated", "partial") and self.package is not None
+
+
+def reconstruct_hf_model(
+    arrays: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    source_dtypes: Mapping[str, str] | None = None,
+    name: str | None = None,
+    source_hash: str | None = None,
+    on_progress: Any | None = None,
+) -> ReconstructionResult:
+    """Build and validate a graph, or return a precise unsupported/failed report."""
+    progress: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    warnings: list[str] = []
+    missing: list[str] = []
+    extra: list[str] = []
+    shape_errors: list[str] = []
+    reasons: list[str] = []
+
+    def step(stage: str, status: str, message: str) -> None:
+        progress.append({"stage": stage, "status": status, "message": message})
+        if on_progress is not None:
+            on_progress(stage, status, message)
+
+    model_type = str(config.get("model_type") or "").lower()
+    architectures = [str(a) for a in (config.get("architectures") or [])]
+    architecture = architectures[0] if architectures else (model_type or None)
+    if model_type == "llama":
+        return _reconstruct_llama(
+            arrays,
+            config,
+            architecture=architecture,
+            source_dtypes=source_dtypes,
+            name=name,
+            source_hash=source_hash,
+            on_progress=on_progress,
+        )
+    if model_type not in ("gpt2", "gpt2lmhead"):
+        reason = (
+            f"architecture adapter for model_type '{model_type or 'unknown'}' is not implemented; "
+            "no graph was guessed"
+        )
+        step("architecture", "unsupported", reason)
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder" if model_type else None,
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[reason],
+                warnings=[],
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[reason],
+            )
+        )
+
+    try:
+        spec = _gpt2_spec(config, warnings)
+    except ValueError as exc:
+        step("config", "unsupported", str(exc))
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[str(exc)],
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[str(exc)],
+            )
+        )
+    step("config", "complete", "GPT-2 configuration validated against the supported adapter")
+
+    try:
+        definition = build_architecture("transformer_decoder", spec)
+    except UzenError as exc:
+        step("architecture", "failed", str(exc))
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="failed",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[str(exc)],
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[f"the NIR transformer builder rejected the configuration: {exc}"],
+            )
+        )
+    step("architecture", "complete", "NIR transformer graph built from explicit GPT-2 fields")
+
+    canonical, mapping, missing, extra, shape_errors, unresolved = _gpt2_tensors(
+        arrays, spec, definition, unresolved, warnings
+    )
+    step(
+        "tensor_mapping",
+        "complete" if not missing and not shape_errors else "failed",
+        f"mapped {len(mapping)} tensors; {len(missing)} missing, {len(shape_errors)} shape errors, "
+        f"{len(extra)} unmapped source tensors",
+    )
+
+    if missing or shape_errors:
+        reasons.extend(
+            [
+                "all NIR parameters must be mapped from source tensors before a graph can be validated",
+                "missing tensors are reported, never filled with guessed values",
+            ]
+        )
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    package = WeightPackage.from_arrays(
+        canonical,
+        name=name or "imported_model",
+        family="transformer_decoder",
+        family_spec=spec,
+        metadata={
+            "reconstruction": {
+                "architecture": architecture,
+                "source_hash": source_hash,
+                "tensor_mapping": mapping,
+                "graph": definition.graph.to_dict(),
+                "adapter": "gpt2",
+            },
+            "source_hash": source_hash,
+        },
+        source_dtypes={
+            target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
+            for target, item in ((m["target"], m) for m in mapping)
+        },
+    )
+    validation = definition.graph.validate(package)
+    step(
+        "graph_validation",
+        "complete" if validation.ok else "failed",
+        f"graph validation {'passed' if validation.ok else 'failed'} with {validation.num_nodes} nodes",
+    )
+    validation_doc = {
+        "ok": validation.ok,
+        "errors": list(validation.errors),
+        "warnings": list(validation.warnings),
+        "num_nodes": validation.num_nodes,
+        "num_params": validation.num_params,
+        "param_names": list(validation.param_names),
+        "order": list(validation.order),
+    }
+    if not validation.ok:
+        reasons.append("graph validation failed; no validated artifact should be published")
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="failed",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=definition.graph.to_dict(),
+                graph_summary=definition.graph.summary(),
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=validation_doc,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    execution = _execute(definition, package, spec)
+    step(
+        "forward_execution",
+        execution.get("status", "failed"),
+        execution.get("message", "forward pass completed"),
+    )
+    if extra:
+        unresolved.append(
+            "source tensors not represented by the NIR graph: " + ", ".join(extra[:12])
+        )
+    status = "validated" if execution.get("status") == "passed" and not extra and not unresolved else "partial"
+    if status == "partial":
+        reasons.append(
+            "the graph executes, but some source tensors or configuration details remain unresolved"
+        )
+    else:
+        reasons.append("all source tensors mapped, graph validated, and a forward pass produced finite logits")
+    if execution.get("status") != "passed":
+        status = "failed"
+        reasons.append("forward execution failed; the graph is not marked validated")
+    report = ReconstructionReport(
+        status=status,
+        architecture=architecture,
+        family="transformer_decoder",
+        spec=spec,
+        graph=definition.graph.to_dict(),
+        graph_summary=definition.graph.summary(),
+        tensor_mapping=mapping,
+        missing=missing,
+        extra=extra,
+        shape_errors=shape_errors,
+        unresolved=unresolved,
+        warnings=warnings,
+        validation=validation_doc,
+        execution=execution,
+        source_tensor_count=len(arrays),
+        mapped_tensor_count=len(canonical),
+        progress=progress,
+        reasons=reasons,
+    )
+    if status == "failed":
+        return ReconstructionResult(report=report, package=None, definition=definition)
+    return ReconstructionResult(report=report, package=package, definition=definition)
+
+
+def _gpt2_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]:
+    try:
+        d_model = int(config["n_embd"])
+        n_heads = int(config["n_head"])
+        n_layers = int(config["n_layer"])
+        vocab_size = int(config["vocab_size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"GPT-2 configuration is missing a required integer field: {exc}") from exc
+    max_seq = int(config.get("n_positions") or config.get("n_ctx") or 0)
+    n_inner = config.get("n_inner")
+    d_ff = int(n_inner) if n_inner is not None else 4 * d_model
+    if d_model <= 0 or n_heads <= 0 or n_layers <= 0 or vocab_size <= 0 or max_seq <= 0 or d_ff <= 0:
+        raise ValueError("GPT-2 dimensions, layers, vocabulary and context length must be positive")
+    if d_model % n_heads != 0:
+        raise ValueError(f"n_embd={d_model} is not divisible by n_head={n_heads}")
+    activation = str(config.get("activation_function") or config.get("hidden_act") or "gelu")
+    if activation not in ("gelu", "gelu_new", "relu", "silu"):
+        raise ValueError(f"activation '{activation}' has no explicit NIR mapping")
+    if activation == "gelu_new":
+        warnings.append(
+            "activation_function='gelu_new' mapped to NIR 'gelu' (both use the tanh approximation)"
+        )
+    if config.get("scale_attn_weights") is False:
+        raise ValueError("GPT-2 scale_attn_weights=false is not representable by the current attention operator")
+    if config.get("position_embedding_type") not in (None, "absolute"):
+        raise ValueError("only absolute GPT-2 position embeddings are supported")
+    tie = bool(config.get("tie_word_embeddings", True))
+    if config.get("layer_norm_epsilon") not in (None, 1e-5, 1e-05):
+        warnings.append(
+            "layer_norm_epsilon differs from the NIR transformer's fixed 1e-5; "
+            "the epsilon is not silently changed"
+        )
+    for key in ("attn_pdrop", "embd_pdrop", "resid_pdrop", "hidden_dropout_prob"):
+        if config.get(key):
+            warnings.append(f"{key}={config.get(key)} is a training-time dropout; inference omits it")
+    if config.get("type_vocab_size", 1) not in (None, 1):
+        warnings.append("type_vocab_size is present but this GPT-2 adapter does not use token-type embeddings")
+    return {
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "n_layers": n_layers,
+        "d_ff": d_ff,
+        "vocab_size": vocab_size,
+        "max_seq_len": max_seq,
+        "norm": "layernorm",
+        "activation": "gelu" if activation == "gelu_new" else activation,
+        "tie_embeddings": tie,
+    }
+
+
+def _gpt2_tensors(
+    arrays: Mapping[str, np.ndarray],
+    spec: Mapping[str, Any],
+    definition: ArchitectureDefinition,
+    unresolved: list[str],
+    warnings: list[str],
+) -> tuple[
+    dict[str, np.ndarray],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    expected = dict(definition.parameter_shapes)
+    canonical: dict[str, np.ndarray] = {}
+    mapping: list[dict[str, Any]] = []
+    missing: list[str] = []
+    shape_errors: list[str] = []
+    used: set[str] = set()
+    tie = bool(spec["tie_embeddings"])
+
+    def add(target: str, source: str | None, transform: str = "identity", note: str = "") -> None:
+        if target not in expected:
+            shape_errors.append(f"adapter produced unexpected target '{target}'")
+            return
+        if source is None or source not in arrays:
+            missing.append(target)
+            mapping.append(
+                {
+                    "target": target,
+                    "source": source,
+                    "transform": transform,
+                    "status": "missing",
+                    "expected_shape": list(expected[target]),
+                    "note": note,
+                }
+            )
+            return
+        arr = arrays[source]
+        transformed = np.swapaxes(arr, -1, -2) if transform == "transpose" else arr
+        shape = [int(d) for d in transformed.shape]
+        status = "mapped"
+        if tuple(shape) != tuple(expected[target]):
+            status = "shape_error"
+            shape_errors.append(
+                f"{target}: source {source} shape {shape} != expected {list(expected[target])}"
+            )
+        if status == "mapped":
+            canonical[target] = np.ascontiguousarray(transformed)
+            used.add(source)
+        mapping.append(
+            {
+                "target": target,
+                "source": source,
+                "transform": transform,
+                "status": status,
+                "source_shape": [int(d) for d in arr.shape],
+                "expected_shape": list(expected[target]),
+                "actual_shape": shape,
+                "dtype": dtype_name(arr.dtype),
+                "note": note,
+            }
+        )
+
+    add("embed.weight", "transformer.wte.weight")
+    add("pos_embed.weight", "transformer.wpe.weight")
+    add("ln_f.weight", "transformer.ln_f.weight")
+    add("ln_f.bias", "transformer.ln_f.bias")
+    wte = arrays.get("transformer.wte.weight")
+    lm_head = arrays.get("lm_head.weight")
+    if tie:
+        if lm_head is not None:
+            if wte is not None and lm_head.shape == wte.shape and not np.array_equal(lm_head, wte):
+                unresolved.append(
+                    "tied embedding tensors transformer.wte.weight and lm_head.weight differ; "
+                    "the checkpoint cannot be represented as a tied graph"
+                )
+            add("lm_head.weight", "lm_head.weight", note="tied LM head")
+        else:
+            add("lm_head.weight", "transformer.wte.weight", "tied_embedding", "LM head tied to word embedding")
+    else:
+        add("lm_head.weight", "lm_head.weight")
+        add("lm_head.bias", "lm_head.bias")
+
+    for layer in range(int(spec["n_layers"])):
+        src = f"transformer.h.{layer}"
+        dst = f"layers.{layer}"
+        add(f"{dst}.ln1.weight", f"{src}.ln_1.weight")
+        add(f"{dst}.ln1.bias", f"{src}.ln_1.bias")
+        add(f"{dst}.qkv.weight", f"{src}.attn.c_attn.weight", "transpose", "GPT-2 Conv1D (in,out) -> NIR (out,in)")
+        add(f"{dst}.qkv.bias", f"{src}.attn.c_attn.bias")
+        add(f"{dst}.attn_out.weight", f"{src}.attn.c_proj.weight", "transpose", "GPT-2 Conv1D (in,out) -> NIR (out,in)")
+        add(f"{dst}.attn_out.bias", f"{src}.attn.c_proj.bias")
+        add(f"{dst}.ln2.weight", f"{src}.ln_2.weight")
+        add(f"{dst}.ln2.bias", f"{src}.ln_2.bias")
+        add(f"{dst}.mlp_up.weight", f"{src}.mlp.c_fc.weight", "transpose", "GPT-2 Conv1D (in,out) -> NIR (out,in)")
+        add(f"{dst}.mlp_up.bias", f"{src}.mlp.c_fc.bias")
+        add(f"{dst}.mlp_down.weight", f"{src}.mlp.c_proj.weight", "transpose", "GPT-2 Conv1D (in,out) -> NIR (out,in)")
+        add(f"{dst}.mlp_down.bias", f"{src}.mlp.c_proj.bias")
+
+    extra = sorted(set(arrays) - used)
+    for name in extra:
+        unresolved.append(f"source tensor '{name}' is not represented by the reconstructed GPT-2 graph")
+    return canonical, mapping, sorted(set(missing)), extra, shape_errors, unresolved
+
+
+def _execute(
+    definition: ArchitectureDefinition, package: WeightPackage, spec: Mapping[str, Any]
+) -> dict[str, Any]:
+    seq = min(4, int(spec["max_seq_len"]))
+    inputs = definition.sample_inputs(batch=1, seq=seq, seed=0)
+    try:
+        result = execute(definition.graph, inputs, package, check_finite=True, validate_types=True)
+        logits = result.output("logits")
+        expected = (1, seq, int(spec["vocab_size"]))
+        if tuple(logits.shape) != expected:
+            return {
+                "status": "failed",
+                "message": f"logits shape {tuple(logits.shape)} != expected {expected}",
+                "inputs": {k: list(v.shape) for k, v in inputs.items()},
+            }
+        return {
+            "status": "passed",
+            "message": "forward pass produced finite logits with the expected shape",
+            "inputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in inputs.items()},
+            "outputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in result.outputs.items()},
+            "num_ops": result.num_ops,
+            "sample_sequence_length": seq,
+        }
+    except Exception as exc:  # execution failure is part of the report, not hidden
+        return {
+            "status": "failed",
+            "message": str(exc),
+            "inputs": {k: list(v.shape) for k, v in inputs.items()},
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Llama adapter: explicit RoPE + GQA + SwiGLU graph
+# --------------------------------------------------------------------------- #
+
+
+def _reconstruct_llama(
+    arrays: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    architecture: str | None,
+    source_dtypes: Mapping[str, str] | None,
+    name: str | None,
+    source_hash: str | None,
+    on_progress: Any | None = None,
+) -> ReconstructionResult:
+    progress: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    warnings: list[str] = []
+    missing: list[str] = []
+    extra: list[str] = []
+    shape_errors: list[str] = []
+    reasons: list[str] = []
+
+    def step(stage: str, status: str, message: str) -> None:
+        progress.append({"stage": stage, "status": status, "message": message})
+        if on_progress is not None:
+            on_progress(stage, status, message)
+
+    try:
+        spec = _llama_spec(config, warnings)
+    except ValueError as exc:
+        step("config", "unsupported", str(exc))
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[str(exc)],
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[str(exc)],
+            )
+        )
+    step("config", "complete", "Llama/RoPE/GQA configuration validated")
+
+    definition = _build_llama_definition(spec)
+    step("architecture", "complete", "explicit Llama NIR graph with RoPE, GQA and SwiGLU built")
+    canonical, mapping, missing, extra, shape_errors, unresolved = _llama_tensors(
+        arrays, spec, definition, unresolved
+    )
+    step(
+        "tensor_mapping",
+        "complete" if not missing and not shape_errors else "failed",
+        f"mapped {len(mapping)} tensors; {len(missing)} missing, {len(shape_errors)} shape errors, "
+        f"{len(extra)} unmapped source tensors",
+    )
+    if missing or shape_errors:
+        reasons.append("all Llama NIR parameters must be present with expected shapes; none are invented")
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    package = WeightPackage.from_arrays(
+        canonical,
+        name=name or "llama_model",
+        family="transformer_decoder",
+        family_spec=spec,
+        metadata={
+            "reconstruction": {
+                "architecture": architecture,
+                "adapter": "llama",
+                "source_hash": source_hash,
+                "tensor_mapping": mapping,
+                "graph": definition.graph.to_dict(),
+            },
+            "source_hash": source_hash,
+        },
+        source_dtypes={
+            target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
+            for target, item in ((m["target"], m) for m in mapping)
+        },
+    )
+    validation = definition.graph.validate(package)
+    validation_doc = {
+        "ok": validation.ok,
+        "errors": list(validation.errors),
+        "warnings": list(validation.warnings),
+        "num_nodes": validation.num_nodes,
+        "num_params": validation.num_params,
+        "param_names": list(validation.param_names),
+        "order": list(validation.order),
+    }
+    step(
+        "graph_validation",
+        "complete" if validation.ok else "failed",
+        f"graph validation {'passed' if validation.ok else 'failed'} with {validation.num_nodes} nodes",
+    )
+    if not validation.ok:
+        reasons.append("Llama graph validation failed; no validated artifact should be published")
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="failed",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=definition.graph.to_dict(),
+                graph_summary=definition.graph.summary(),
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=validation_doc,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    execution = _execute_llama(definition, package, spec)
+    step(
+        "forward_execution",
+        execution.get("status", "failed"),
+        execution.get("message", "forward pass completed"),
+    )
+    if extra:
+        unresolved.append(
+            "source tensors not represented by the Llama graph: " + ", ".join(extra[:12])
+        )
+    status = "validated" if execution.get("status") == "passed" and not extra and not unresolved else "partial"
+    if execution.get("status") != "passed":
+        status = "failed"
+        reasons.append("Llama forward execution failed; the graph is not marked validated")
+    elif status == "partial":
+        reasons.append("Llama graph executes, but some source tensors remain unresolved")
+    else:
+        reasons.append("all Llama tensors mapped, graph validated, and forward execution produced finite logits")
+    report = ReconstructionReport(
+        status=status,
+        architecture=architecture,
+        family="transformer_decoder",
+        spec=spec,
+        graph=definition.graph.to_dict(),
+        graph_summary=definition.graph.summary(),
+        tensor_mapping=mapping,
+        missing=missing,
+        extra=extra,
+        shape_errors=shape_errors,
+        unresolved=unresolved,
+        warnings=warnings,
+        validation=validation_doc,
+        execution=execution,
+        source_tensor_count=len(arrays),
+        mapped_tensor_count=len(canonical),
+        progress=progress,
+        reasons=reasons,
+    )
+    if status == "failed":
+        return ReconstructionResult(report=report, package=None, definition=definition)
+    return ReconstructionResult(report=report, package=package, definition=definition)
+
+
+def _llama_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]:
+    try:
+        hidden = int(config["hidden_size"])
+        n_heads = int(config["num_attention_heads"])
+        n_layers = int(config["num_hidden_layers"])
+        intermediate = int(config["intermediate_size"])
+        vocab = int(config["vocab_size"])
+        max_seq = int(config["max_position_embeddings"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Llama configuration is missing a required integer field: {exc}") from exc
+    n_kv = int(config.get("num_key_value_heads", n_heads))
+    head_dim = int(config.get("head_dim") or hidden // n_heads)
+    if min(hidden, n_heads, n_layers, intermediate, vocab, max_seq, n_kv, head_dim) <= 0:
+        raise ValueError("Llama dimensions, layers, vocabulary and context length must be positive")
+    if n_heads % n_kv != 0:
+        raise ValueError(f"num_attention_heads={n_heads} must be divisible by num_key_value_heads={n_kv}")
+    if config.get("attention_bias"):
+        raise ValueError("attention_bias=true has no explicit Llama NIR mapping")
+    if config.get("mlp_bias"):
+        raise ValueError("mlp_bias=true has no explicit Llama NIR mapping")
+    if config.get("rope_scaling") is not None:
+        raise ValueError("rope_scaling is not implemented; no scaled-RoPE graph was guessed")
+    activation = str(config.get("hidden_act") or "silu")
+    if activation != "silu":
+        raise ValueError(f"hidden_act='{activation}' is not supported; Llama adapter implements SwiGLU with silu")
+    eps = float(config.get("rms_norm_eps", 1e-6))
+    theta = float(config.get("rope_theta", 10000.0))
+    if eps <= 0 or theta <= 0:
+        raise ValueError("rms_norm_eps and rope_theta must be positive")
+    if config.get("attention_dropout"):
+        warnings.append("attention_dropout is a training-time setting; inference omits it")
+    if config.get("pretraining_tp", 1) not in (1, None):
+        raise ValueError("pretraining_tp != 1 is a tensor-parallel layout and is not supported")
+    return {
+        "architecture": "llama",
+        "hidden_size": hidden,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv,
+        "head_dim": head_dim,
+        "n_layers": n_layers,
+        "intermediate_size": intermediate,
+        "vocab_size": vocab,
+        "max_seq_len": max_seq,
+        "rms_norm_eps": eps,
+        "rope_theta": theta,
+        "activation": "silu",
+        "tie_embeddings": bool(config.get("tie_word_embeddings", False)),
+    }
+
+
+def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
+    d = int(spec["hidden_size"])
+    heads = int(spec["n_heads"])
+    kv_heads = int(spec["n_kv_heads"])
+    head_dim = int(spec["head_dim"])
+    q_dim = heads * head_dim
+    kv_dim = kv_heads * head_dim
+    eps = float(spec["rms_norm_eps"])
+    theta = float(spec["rope_theta"])
+    layers = int(spec["n_layers"])
+    intermediate = int(spec["intermediate_size"])
+    vocab = int(spec["vocab_size"])
+    g = Graph(name=f"llama_L{layers}", metadata={"family": "transformer_decoder", "architecture": "llama", "spec": dict(spec)})
+    g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+    g.add_input("positions", TensorType.of(("B", "T"), "int64"))
+    sh: dict[str, tuple[int, ...]] = {
+        "embed.weight": (vocab, d),
+        "lm_head.weight": (vocab, d),
+        "norm.weight": (d,),
+    }
+    cur = g.add_node("embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"})
+
+    def split_heads(x: Ref, layer: int, name: str, heads_count: int) -> Ref:
+        reshaped = g.add_node(
+            f"l{layer}_{name}_reshape",
+            "reshape",
+            {"x": x},
+            {"shape": ["B", "T", heads_count, head_dim]},
+        )
+        return g.add_node(
+            f"l{layer}_{name}_heads",
+            "transpose",
+            {"x": reshaped},
+            {"perm": [0, 2, 1, 3]},
+        )
+
+    for layer in range(layers):
+        p = f"layers.{layer}"
+        sh[f"{p}.input_norm.weight"] = (d,)
+        sh[f"{p}.post_norm.weight"] = (d,)
+        sh[f"{p}.q_proj.weight"] = (q_dim, d)
+        sh[f"{p}.k_proj.weight"] = (kv_dim, d)
+        sh[f"{p}.v_proj.weight"] = (kv_dim, d)
+        sh[f"{p}.o_proj.weight"] = (d, q_dim)
+        sh[f"{p}.gate_proj.weight"] = (intermediate, d)
+        sh[f"{p}.up_proj.weight"] = (intermediate, d)
+        sh[f"{p}.down_proj.weight"] = (d, intermediate)
+        norm1 = g.add_node(
+            f"l{layer}_input_norm",
+            "rmsnorm",
+            {"x": cur},
+            {"weight": f"param:{p}.input_norm.weight", "eps": eps},
+        )
+        q = g.add_node(
+            f"l{layer}_q_proj",
+            "linear",
+            {"x": norm1},
+            {"weight": f"param:{p}.q_proj.weight"},
+        )
+        k = g.add_node(
+            f"l{layer}_k_proj",
+            "linear",
+            {"x": norm1},
+            {"weight": f"param:{p}.k_proj.weight"},
+        )
+        v = g.add_node(
+            f"l{layer}_v_proj",
+            "linear",
+            {"x": norm1},
+            {"weight": f"param:{p}.v_proj.weight"},
+        )
+        qh = split_heads(q, layer, "q", heads)
+        kh = split_heads(k, layer, "k", kv_heads)
+        vh = split_heads(v, layer, "v", kv_heads)
+        qr = g.add_node(
+            f"l{layer}_q_rope",
+            "rope",
+            {"x": qh, "positions": Ref("input:positions")},
+            {"theta": theta},
+        )
+        kr = g.add_node(
+            f"l{layer}_k_rope",
+            "rope",
+            {"x": kh, "positions": Ref("input:positions")},
+            {"theta": theta},
+        )
+        kr = g.add_node(
+            f"l{layer}_k_repeat",
+            "repeat_kv",
+            {"x": kr},
+            {"n_heads": heads},
+        )
+        vr = g.add_node(
+            f"l{layer}_v_repeat",
+            "repeat_kv",
+            {"x": vh},
+            {"n_heads": heads},
+        )
+        attn = g.add_node(
+            f"l{layer}_attn",
+            "attention",
+            {"q": qr, "k": kr, "v": vr},
+            {"causal": True, "scale": "auto"},
+        )
+        merged = g.add_node(f"l{layer}_merge", "merge_heads", {"x": attn}, {"n_heads": heads})
+        proj = g.add_node(
+            f"l{layer}_o_proj",
+            "linear",
+            {"x": merged},
+            {"weight": f"param:{p}.o_proj.weight"},
+        )
+        cur = g.add_node(f"l{layer}_res1", "add", {"a": cur, "b": proj})
+        norm2 = g.add_node(
+            f"l{layer}_post_norm",
+            "rmsnorm",
+            {"x": cur},
+            {"weight": f"param:{p}.post_norm.weight", "eps": eps},
+        )
+        gate = g.add_node(
+            f"l{layer}_gate",
+            "linear",
+            {"x": norm2},
+            {"weight": f"param:{p}.gate_proj.weight"},
+        )
+        gate = g.add_node(f"l{layer}_silu", "silu", {"x": gate})
+        up = g.add_node(
+            f"l{layer}_up",
+            "linear",
+            {"x": norm2},
+            {"weight": f"param:{p}.up_proj.weight"},
+        )
+        gated = g.add_node(f"l{layer}_gated", "mul", {"a": gate, "b": up})
+        down = g.add_node(
+            f"l{layer}_down",
+            "linear",
+            {"x": gated},
+            {"weight": f"param:{p}.down_proj.weight"},
+        )
+        cur = g.add_node(f"l{layer}_res2", "add", {"a": cur, "b": down})
+
+    final = g.add_node(
+        "final_norm",
+        "rmsnorm",
+        {"x": cur},
+        {"weight": "param:norm.weight", "eps": eps},
+    )
+    logits = g.add_node(
+        "lm_head",
+        "linear",
+        {"x": final},
+        {"weight": "param:lm_head.weight"},
+    )
+    g.set_output("logits", logits)
+    g.set_output("hidden", final)
+    return ArchitectureDefinition(
+        family="transformer_decoder",
+        spec=dict(spec),
+        graph=g,
+        parameter_shapes=sh,
+        default_inputs={"tokens": ("B", "T"), "positions": ("B", "T")},
+        input_dtypes={"tokens": "int64", "positions": "int64"},
+    )
+
+
+def _llama_tensors(
+    arrays: Mapping[str, np.ndarray],
+    spec: Mapping[str, Any],
+    definition: ArchitectureDefinition,
+    unresolved: list[str],
+) -> tuple[
+    dict[str, np.ndarray],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    expected = dict(definition.parameter_shapes)
+    canonical: dict[str, np.ndarray] = {}
+    mapping: list[dict[str, Any]] = []
+    missing: list[str] = []
+    shape_errors: list[str] = []
+    used: set[str] = set()
+    tie = bool(spec["tie_embeddings"])
+
+    def add(target: str, source: str | None, note: str = "") -> None:
+        if target not in expected:
+            shape_errors.append(f"adapter produced unexpected target '{target}'")
+            return
+        if source is None or source not in arrays:
+            missing.append(target)
+            mapping.append({"target": target, "source": source, "transform": "identity", "status": "missing", "expected_shape": list(expected[target]), "note": note})
+            return
+        arr = arrays[source]
+        shape = [int(v) for v in arr.shape]
+        status = "mapped"
+        if tuple(shape) != tuple(expected[target]):
+            status = "shape_error"
+            shape_errors.append(f"{target}: source {source} shape {shape} != expected {list(expected[target])}")
+        if status == "mapped":
+            canonical[target] = np.ascontiguousarray(arr)
+            used.add(source)
+        mapping.append({"target": target, "source": source, "transform": "identity", "status": status, "source_shape": shape, "expected_shape": list(expected[target]), "dtype": dtype_name(arr.dtype), "note": note})
+
+    add("embed.weight", "model.embed_tokens.weight")
+    add("norm.weight", "model.norm.weight")
+    lm_head = arrays.get("lm_head.weight")
+    if tie:
+        if lm_head is not None:
+            if "model.embed_tokens.weight" in arrays and lm_head.shape == arrays["model.embed_tokens.weight"].shape and not np.array_equal(lm_head, arrays["model.embed_tokens.weight"]):
+                unresolved.append("tied embed_tokens/lm_head tensors differ; no tied Llama graph is claimed")
+            add("lm_head.weight", "lm_head.weight", "tied LM head")
+        else:
+            add("lm_head.weight", "model.embed_tokens.weight", "LM head tied to embedding")
+    else:
+        add("lm_head.weight", "lm_head.weight")
+
+    for layer in range(int(spec["n_layers"])):
+        src = f"model.layers.{layer}"
+        dst = f"layers.{layer}"
+        add(f"{dst}.input_norm.weight", f"{src}.input_layernorm.weight")
+        add(f"{dst}.post_norm.weight", f"{src}.post_attention_layernorm.weight")
+        add(f"{dst}.q_proj.weight", f"{src}.self_attn.q_proj.weight")
+        add(f"{dst}.k_proj.weight", f"{src}.self_attn.k_proj.weight")
+        add(f"{dst}.v_proj.weight", f"{src}.self_attn.v_proj.weight")
+        add(f"{dst}.o_proj.weight", f"{src}.self_attn.o_proj.weight")
+        add(f"{dst}.gate_proj.weight", f"{src}.mlp.gate_proj.weight")
+        add(f"{dst}.up_proj.weight", f"{src}.mlp.up_proj.weight")
+        add(f"{dst}.down_proj.weight", f"{src}.mlp.down_proj.weight")
+
+    extra = sorted(set(arrays) - used)
+    for name in extra:
+        unresolved.append(f"source tensor '{name}' is not represented by the Llama graph")
+    return canonical, mapping, sorted(set(missing)), extra, shape_errors, unresolved
+
+
+def _execute_llama(
+    definition: ArchitectureDefinition, package: WeightPackage, spec: Mapping[str, Any]
+) -> dict[str, Any]:
+    seq = min(4, int(spec["max_seq_len"]))
+    tokens = np.arange(seq, dtype=np.int64).reshape(1, seq)
+    positions = np.arange(seq, dtype=np.int64).reshape(1, seq)
+    inputs = {"tokens": tokens, "positions": positions}
+    try:
+        result = execute(definition.graph, inputs, package, check_finite=True, validate_types=True)
+        logits = result.output("logits")
+        expected = (1, seq, int(spec["vocab_size"]))
+        if tuple(logits.shape) != expected:
+            return {"status": "failed", "message": f"logits shape {tuple(logits.shape)} != expected {expected}", "inputs": {k: list(v.shape) for k, v in inputs.items()}}
+        return {
+            "status": "passed",
+            "message": "Llama forward pass produced finite logits with the expected shape",
+            "inputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in inputs.items()},
+            "outputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in result.outputs.items()},
+            "num_ops": result.num_ops,
+            "sample_sequence_length": seq,
+        }
+    except Exception as exc:
+        return {"status": "failed", "message": str(exc), "inputs": {k: list(v.shape) for k, v in inputs.items()}}

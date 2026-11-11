@@ -164,11 +164,17 @@ class Uzen:
         family: str | None = None,
         revision: str | None = None,
         repo_id: str | None = None,
+        on_progress: Any | None = None,
     ) -> dict[str, Any]:
         """Import an HF directory/file/repository and return the compatibility report."""
         if self.local:
             record, report = self.service.import_model(
-                source, name=name, family=family, revision=revision, repo_id=repo_id
+                source,
+                name=name,
+                family=family,
+                revision=revision,
+                repo_id=repo_id,
+                on_progress=on_progress,
             )
             return {
                 "artifact_id": record.artifact_id,

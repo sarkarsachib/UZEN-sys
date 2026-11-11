@@ -35,10 +35,11 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
-| Hugging Face / safetensors import (local directories, sharded checkpoints, optional Hub download, explicit compatibility reports) | **implemented — weights and metadata only; graph reconstruction is `not_implemented`** |
+| Hugging Face / safetensors import (local directories, sharded checkpoints, optional Hub download, explicit compatibility reports) | **implemented** |
+| GPT-2 and Llama HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and GPT-2/Llama reference-logit parity | **implemented for the explicit GPT-2 and Llama adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; other architectures are reported `unsupported`** |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
-| Torch-CPU NIR execution (all 39 operators, parity-tested against NumPy) | **implemented** |
+| Torch-CPU NIR execution (NumPy parity; `rope`/`repeat_kv` currently use the explicit NumPy fallback) | **implemented** |
 | GGUF v3 adapter + GGML type registry (F32/F16, Q4/Q5/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K decode, Q8_0 encode, payload-free inspection) | **implemented** |
 | ONNX interchange (export/import of the supported NIR subset) | **implemented** (requires the `onnx` extra; validated with `onnx.checker`) |
 | Sparse-dispatch MoE (only routed tokens are computed per expert) | **implemented** |
@@ -62,6 +63,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[api,dev]' # REST API + test tooling
 .venv/bin/pip install -e '.[onnx]'    # optional: ONNX interchange
 .venv/bin/pip install -e '.[hf]'      # optional: Hugging Face Hub download
+.venv/bin/pip install -e '.[hf-reference]'  # optional: Hugging Face logits parity (also install torch)
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu  # optional CPU-only adapter
 ```
 
@@ -129,7 +131,8 @@ curl -s -X POST localhost:8080/v1/jobs -H 'content-type: application/json' \
 exposes deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
 `uzen.generate_weights`, `uzen.evaluate_candidate`, `uzen.inspect_provenance`, and
 others. Each tool enforces task scope and STRICT_PLUS; an AI client cannot widen scope
-or request a prohibited effect.
+or request a prohibited effect. A `tools/call` with `params._meta.progressToken` emits
+real JSON-RPC `notifications/progress` messages during import, incrementing per stage.
 
 ## The two engineering domains
 

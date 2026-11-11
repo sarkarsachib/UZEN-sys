@@ -138,41 +138,75 @@ class JobService:
         family: str | None = None,
         revision: str | None = None,
         repo_id: str | None = None,
+        on_progress: Any | None = None,
     ) -> tuple[ArtifactRecord, dict[str, Any]]:
         """Import a Hugging Face/safetensors checkpoint and return its compatibility report."""
         from uzen.core.wie.importer import ModelImporter
 
         result = ModelImporter().import_source(
-            source, name=name, family=family, revision=revision, repo_id=repo_id
+            source,
+            name=name,
+            family=family,
+            revision=revision,
+            repo_id=repo_id,
+            on_progress=on_progress,
         )
         package = result.require_ok()
+        artifact_package = result.artifact_package or package
         report = result.report.to_dict()
+        reconstruction = result.reconstruction.report if result.reconstruction is not None else None
+        graph_doc = (
+            reconstruction.graph
+            if reconstruction is not None and reconstruction.graph_reconstructed
+            else None
+        )
+        metadata: dict[str, Any] = {
+            "source_path": str(source),
+            "import_report": report,
+        }
+        if graph_doc is not None:
+            metadata["graph"] = graph_doc
         record = self.store.put(
-            package,
+            artifact_package,
             operation="import",
             reuse_existing=True,
-            metadata={"source_path": str(source), "import_report": report},
-            note="imported Hugging Face/safetensors checkpoint (immutable origin)",
+            metadata=metadata,
+            note=(
+                "imported HF/safetensors checkpoint with validated NIR reconstruction"
+                if graph_doc is not None
+                else "imported HF/safetensors checkpoint (immutable source tensor names)"
+            ),
         )
         self.db.index_artifact(
             artifact_id=record.artifact_id,
             path=str(record.path),
-            name=package.name,
-            family=package.family,
+            name=artifact_package.name,
+            family=artifact_package.family,
             operation="import",
-            numel=package.numel(),
-            num_tensors=len(package),
+            numel=artifact_package.numel(),
+            num_tensors=len(artifact_package),
         )
         if result.report.family not in (None, "unknown", "generic"):
+            reconstruction_summary = None
+            if reconstruction is not None:
+                reconstruction_summary = {
+                    "status": reconstruction.status,
+                    "architecture": reconstruction.architecture,
+                    "family": reconstruction.family,
+                    "graph_reconstructed": reconstruction.graph_reconstructed,
+                    "execution_validated": reconstruction.execution_validated,
+                    "unresolved": reconstruction.unresolved,
+                }
             self.db.register_model(
                 artifact_id=record.artifact_id,
-                family=package.family,
+                family=artifact_package.family,
                 spec={
                     "import": {
                         "source_kind": result.report.source_kind,
                         "source_hash": result.report.source_hash,
                         "revision": result.report.revision,
                         "compatibility": result.report.compatibility.to_dict(),
+                        "reconstruction": reconstruction_summary,
                     }
                 },
             )

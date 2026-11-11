@@ -23,8 +23,8 @@ ARRAYS = {
 }
 
 CONFIG = {
-    "architectures": ["LlamaForCausalLM"],
-    "model_type": "llama",
+    "architectures": ["MptForCausalLM"],
+    "model_type": "mpt",
     "hidden_size": 8,
     "num_hidden_layers": 1,
     "num_attention_heads": 2,
@@ -76,9 +76,11 @@ def test_hf_directory_import_reports_complete_weights_but_no_reconstruction(tmp_
     assert report.compatibility.config == "parsed"
     assert report.compatibility.tokenizer == "present"
     assert report.compatibility.architecture == "recognized"
-    assert report.compatibility.reconstruction == "not_implemented"
+    assert report.compatibility.reconstruction == "unsupported"
     assert report.compatibility.execution == "not_run"
     assert report.compatibility.overall == "ready_for_reconstruction"
+    assert report.reconstruction["status"] == "unsupported"
+    assert report.reconstruction["graph"] is None
     assert report.license["declared"] == "apache-2.0"
     assert report.tokenizer["vocab_size"] == 3
     assert report.source_hash
@@ -202,7 +204,7 @@ def test_sdk_import_model_exposes_report(tmp_path):
     imported = client.import_model(root)
     assert imported["artifact_id"]
     assert imported["compatibility"]["weights"] == "complete"
-    assert imported["compatibility"]["reconstruction"] == "not_implemented"
+    assert imported["compatibility"]["reconstruction"] == "unsupported"
     assert imported["report"]["understanding"]["graph_reconstructed"] is False
 
 

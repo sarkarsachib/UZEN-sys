@@ -35,7 +35,34 @@ def _text(payload: Any) -> dict[str, Any]:
 class MCPServer:
     def __init__(self, *, root: str | Path = "./uzen-workspace") -> None:
         self.client = Uzen(root=root)
+        self._progress_callback: Callable[[str, str, str], None] | None = None
         self.tools: dict[str, tuple[dict[str, Any], Callable[[Mapping[str, Any]], Any]]] = {
+            "uzen.import_model": (
+                {
+                    "description": (
+                        "Import a local Hugging Face directory/file or a Hub repo id, return a "
+                        "machine-readable compatibility/reconstruction report, and stage progress "
+                        "for each import stage. Unsupported architectures are reported, not guessed."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string", "description": "local path or Hub repo id"},
+                            "path": {"type": "string", "description": "alias for a local path"},
+                            "repo_id": {"type": "string", "description": "Hub repository id"},
+                            "revision": {"type": "string", "description": "Hub revision/branch/tag"},
+                            "name": {"type": "string"},
+                            "family": {"type": "string"},
+                        },
+                        "anyOf": [
+                            {"required": ["source"]},
+                            {"required": ["path"]},
+                            {"required": ["repo_id"]},
+                        ],
+                    },
+                },
+                self._import_model,
+            ),
             "uzen.inspect_model": (
                 {
                     "description": "Inspect a checkpoint or artifact: tensors, dtypes, roles, statistics, family hypothesis.",
@@ -222,7 +249,12 @@ class MCPServer:
     # JSON-RPC
     # ------------------------------------------------------------------ #
 
-    def handle(self, message: Mapping[str, Any]) -> dict[str, Any] | None:
+    def handle(
+        self,
+        message: Mapping[str, Any],
+        *,
+        emit: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
         method = message.get("method")
         msg_id = message.get("id")
         params = message.get("params") or {}
@@ -261,6 +293,27 @@ class MCPServer:
             if entry is None:
                 return _error(msg_id, -32602, f"unknown tool '{name}'")
             schema, fn = entry
+            progress_token = (params.get("_meta") or {}).get("progressToken")
+            self._progress_callback = None
+            if emit is not None and progress_token is not None:
+                counter = 0
+
+                def on_progress(stage: str, status: str, progress_message: str) -> None:
+                    nonlocal counter
+                    counter += 1
+                    emit(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": progress_token,
+                                "progress": counter,
+                                "message": f"{stage} [{status}]: {progress_message}",
+                            },
+                        }
+                    )
+
+                self._progress_callback = on_progress
             try:
                 payload = fn(arguments)
             except UzenError as exc:
@@ -275,6 +328,8 @@ class MCPServer:
                         ],
                     },
                 )
+            finally:
+                self._progress_callback = None
             return _result(msg_id, _text(payload))
         if method in ("resources/list",):
             return _result(msg_id, {"resources": []})
@@ -285,6 +340,23 @@ class MCPServer:
     # ------------------------------------------------------------------ #
     # tool implementations
     # ------------------------------------------------------------------ #
+
+    def _import_model(self, args: Mapping[str, Any]) -> Any:
+        source = args.get("source") or args.get("path") or args.get("repo_id")
+        if not source:
+            raise UzenError("provide source, path or repo_id")
+        return self.client.import_model(
+            str(source),
+            name=args.get("name"),
+            family=args.get("family"),
+            revision=args.get("revision"),
+            repo_id=args.get("repo_id"),
+            on_progress=self._progress,
+        )
+
+    def _progress(self, stage: str, status: str, message: str) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(stage, status, message)
 
     def _inspect_model(self, args: Mapping[str, Any]) -> Any:
         if args.get("artifact_id"):
@@ -485,7 +557,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if message is None:
             return 0
-        response = server.handle(message)
+        response = server.handle(
+            message,
+            emit=lambda payload: _write_message(stdout, payload, framed=args.framed),
+        )
         if response is not None:
             _write_message(stdout, response, framed=args.framed)
 

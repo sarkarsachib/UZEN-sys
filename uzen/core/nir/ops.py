@@ -382,6 +382,73 @@ def _merge_heads_run(inputs, params, bound):
     return [np.transpose(x, (0, 2, 1, 3)).reshape(b, t, h * dh)]
 
 
+def _rope_infer(inputs, params, bound):
+    if len(inputs) != 2:
+        raise InvalidOperationParameters("rope requires (x, positions)")
+    x, positions = inputs
+    if x.rank != 4:
+        raise InvalidOperationParameters("rope expects (batch, heads, seq, head_dim)")
+    if positions.rank not in (1, 2):
+        raise InvalidOperationParameters("rope positions must be rank 1 or 2")
+    if isinstance(x.shape[-1], int) and x.shape[-1] % 2 != 0:
+        raise InvalidOperationParameters("rope requires an even head dimension")
+    theta = _param_float(params, "theta", 10000.0)
+    if theta <= 0:
+        raise InvalidOperationParameters("rope theta must be positive")
+    return [_same(x.shape, _float_dtype(x))]
+
+
+def _rope_run(inputs, params, bound):
+    x, positions = inputs
+    if positions.dtype.kind not in "iu":
+        raise InvalidOperationParameters("rope positions must be integer")
+    bsz, _heads, seq, dim = x.shape
+    if positions.ndim == 1:
+        pos = positions.reshape(1, -1)
+    else:
+        pos = positions
+    if pos.shape[0] not in (1, bsz) or pos.shape[1] != seq:
+        raise ShapeMismatch(
+            f"rope positions {positions.shape} do not match (batch={bsz}, seq={seq})"
+        )
+    if dim % 2:
+        raise InvalidOperationParameters("rope requires an even head dimension")
+    theta = float(params.get("theta", 10000.0))
+    inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
+    freqs = np.concatenate([inv_freq, inv_freq], axis=0)
+    angles = pos.astype(np.float64)[:, None, :, None] * freqs[None, None, None, :]
+    cos = np.cos(angles)
+    sin = np.sin(angles)
+    x1 = x[..., : dim // 2]
+    x2 = x[..., dim // 2 :]
+    rotated = np.concatenate([-x2, x1], axis=-1)
+    return [(x.astype(np.float64) * cos + rotated.astype(np.float64) * sin).astype(x.dtype, copy=False)]
+
+
+def _repeat_kv_infer(inputs, params, bound):
+    x = inputs[0]
+    if x.rank != 4:
+        raise InvalidOperationParameters("repeat_kv expects (batch, kv_heads, seq, head_dim)")
+    heads = _param_int(params, "n_heads", 0)
+    kv_heads = x.shape[1]
+    if heads <= 0 or not isinstance(kv_heads, int) or kv_heads <= 0 or heads % kv_heads != 0:
+        raise InvalidOperationParameters(
+            f"repeat_kv requires n_heads divisible by kv_heads, got n_heads={heads}, kv_heads={kv_heads}"
+        )
+    return [TensorType((x.shape[0], heads, x.shape[2], x.shape[3]), _float_dtype(x))]
+
+
+def _repeat_kv_run(inputs, params, bound):
+    x = inputs[0]
+    heads = int(params["n_heads"])
+    kv_heads = x.shape[1]
+    if heads % kv_heads != 0:
+        raise InvalidOperationParameters(
+            f"repeat_kv requires n_heads divisible by kv_heads, got {heads} and {kv_heads}"
+        )
+    return [np.repeat(x, heads // kv_heads, axis=1)]
+
+
 def _attention_infer(inputs, params, bound):
     if len(inputs) != 3:
         raise InvalidOperationParameters("attention requires (q, k, v)")
@@ -1006,6 +1073,8 @@ _reg("tanh", 1, 1, _unary_infer, _activate(np.tanh), "hyperbolic tangent", "acti
 _reg("sigmoid", 1, 1, _unary_infer, _activate(lambda x: 1.0 / (1.0 + np.exp(-x))), "logistic sigmoid", "activation")
 _reg("softmax", 1, 1, _softmax_infer, _softmax_run, "numerically stable softmax", "activation")
 _reg("split_qkv", 1, 1, _split_qkv_infer, _split_qkv_run, "fused QKV projection -> three head tensors", "attention")
+_reg("rope", 2, 2, _rope_infer, _rope_run, "rotary position embedding (Llama rotate-half)", "attention", ports=("x", "positions"))
+_reg("repeat_kv", 1, 1, _repeat_kv_infer, _repeat_kv_run, "repeat grouped-query KV heads to query-head count", "attention")
 _reg("merge_heads", 1, 1, _merge_heads_infer, _merge_heads_run, "merge attention heads back to model width", "attention")
 _reg("attention", 3, 3, _attention_infer, _attention_run, "scaled dot-product attention (optional causal mask)", "attention", ports=("q", "k", "v"))
 _reg("reshape", 1, 1, _reshape_infer, _reshape_run, "shape transformation (symbolic dims allowed)", "structure")
