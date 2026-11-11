@@ -17,9 +17,8 @@ import os
 import numpy as np
 import pytest
 
-from uzen.core.nir.executor import execute
 from uzen.core.wie.importer import ModelImporter
-from uzen.core.wie.parity import compare_gpt2_logits
+from uzen.core.wie.parity import compare_gpt2_logits, compare_llama_logits
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("UZEN_LIVE_HF") != "1",
@@ -138,21 +137,21 @@ def test_live_tiny_llama_matches_huggingface_logits():
     pytest.importorskip("huggingface_hub")
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
-    import torch
-    from transformers import LlamaForCausalLM
 
     result = ModelImporter().import_source(
         "hf-internal-testing/tiny-random-LlamaForCausalLM", revision="main"
     )
-    tokens = np.array([[0, 1, 2, 3]], dtype=np.int64)
-    nir = execute(
+    parity = compare_llama_logits(
         result.reconstruction.definition.graph,
-        {"tokens": tokens, "positions": np.arange(4, dtype=np.int64).reshape(1, 4)},
         result.artifact_package,
-    ).output("logits")
-    model = LlamaForCausalLM.from_pretrained(result.report.source, local_files_only=True).eval()
-    with torch.no_grad():
-        reference = model(input_ids=torch.as_tensor(tokens)).logits.detach().cpu().numpy()
-    assert nir.shape == reference.shape == (1, 4, 32000)
-    assert np.allclose(nir, reference, atol=1e-5, rtol=1e-5)
-    assert float(np.abs(nir - reference).max()) <= 1e-5
+        result.report.source,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["tolerances"] == {"atol": 1e-5, "rtol": 1e-5}
+    assert parity["positions"] == [[0, 1, 2, 3]]
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+    assert parity["actual_shape"] == parity["reference_shape"] == [1, 4, 32000]

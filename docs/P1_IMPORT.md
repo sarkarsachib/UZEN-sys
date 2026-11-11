@@ -128,8 +128,11 @@ graph input and the configured `rope_theta`. The graph is rotate-half, matching
 A live check imports `hf-internal-testing/tiny-random-LlamaForCausalLM`
 (21 tensors), reconstructs 53 nodes, validates them, and executes finite
 `(1, 4, 32000)` logits. Its logits also match `transformers.LlamaForCausalLM`
-at `atol=1e-5`, with a measured max absolute error of **8.94e-8**. This is a
-validation of the explicit tiny fixture, not a claim of universal Llama support.
+at `atol=1e-5`, with a measured max absolute error of **8.94e-8**. The reusable
+`compare_llama_logits()` helper accepts explicit `positions`, passes them to
+both runtimes, and records the tokens, positions, shapes, tolerances and errors.
+This is a validation of the explicit tiny fixture, not a claim of universal
+Llama support.
 
 ## MCP progress
 
