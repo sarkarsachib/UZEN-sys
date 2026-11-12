@@ -29,10 +29,13 @@ from uzen.core.vel.verify import verify
 from uzen.core.wie.inspector import WeightIntelligenceEngine
 from uzen.core.wie.model_execution import (
     ModelExecution,
+    ModelTextExecution,
     compare_executions,
     execute_stored_model,
+    execute_stored_text,
     graph_from_manifest,
 )
+from uzen.core.wie.tokenization import store_tokenizer
 from uzen.engines.mar.engine import ModelArchitectureResearch
 from uzen.engines.war.engine import WeightArchitectureResearch
 from uzen.engines.wge.engine import WeightGenerationEngine
@@ -172,10 +175,22 @@ class JobService:
         }
         if graph_doc is not None:
             metadata["graph"] = graph_doc
+        tokenizer_spec = None
+        if result.tokenizer_json is not None:
+            tokenizer_spec = store_tokenizer(self.root, result.tokenizer_json)
+            metadata["tokenizer"] = tokenizer_spec
+        # A tokenizer changes what the model can execute, so imports with one are
+        # distinct from tokenizer-less imports of identical tensors.
+        import_operations = (
+            [{"op": "tokenizer.attach", "kind": tokenizer_spec["kind"], "sha256": tokenizer_spec["sha256"]}]
+            if tokenizer_spec is not None
+            else []
+        )
         record = self.store.put(
             artifact_package,
             operation="import",
             reuse_existing=True,
+            operations=import_operations,
             metadata=metadata,
             note=(
                 "imported HF/safetensors checkpoint with validated NIR reconstruction"
@@ -236,6 +251,23 @@ class JobService:
             self.artifact_manifest(artifact_id),
             artifact_id=artifact_id,
             tokens=tokens,
+            positions=positions,
+        )
+
+    def forward_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    ) -> ModelTextExecution:
+        """Run text through the stored tokenizer and reconstructed model graph."""
+        return execute_stored_text(
+            self.get_package(artifact_id),
+            self.artifact_manifest(artifact_id),
+            root=self.root,
+            artifact_id=artifact_id,
+            text=text,
             positions=positions,
         )
 

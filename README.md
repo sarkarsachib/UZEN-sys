@@ -38,6 +38,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Hugging Face / safetensors import (local directories, sharded checkpoints, optional Hub download, explicit compatibility reports) | **implemented** |
 | GPT-2 and Llama HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and GPT-2/Llama reference-logit parity | **implemented for the explicit GPT-2 and Llama adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; other architectures are reported `unsupported`** |
 | Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama graphs; per-output tolerances and error metrics) |
+| Tokenizer-backed text inference for imported GPT-2/Llama artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
 | Torch-CPU NIR execution (NumPy parity; `rope`/`repeat_kv` currently use the explicit NumPy fallback) | **implemented** |
@@ -63,6 +64,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .            # core: numpy + pydantic
 .venv/bin/pip install -e '.[api,dev]' # REST API + test tooling
 .venv/bin/pip install -e '.[onnx]'    # optional: ONNX interchange
+.venv/bin/pip install -e '.[tokenizer]' # optional: text inference from tokenizer.json
 .venv/bin/pip install -e '.[hf]'      # optional: Hugging Face Hub download
 .venv/bin/pip install -e '.[hf-reference]'  # optional: Hugging Face logits parity (also install torch)
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu  # optional CPU-only adapter
@@ -106,6 +108,7 @@ uzen import ./tiny-hf-model --revision main
 uzen import --repo-id org/model-name --revision main
 uzen modify <artifact_id> interpolate --other <artifact_id> --param t=0.5
 uzen forward <artifact_id> --tokens '[[0,1,2,3]]'
+uzen forward <artifact_id> --text 'hello world'
 uzen compare-models <source_id> <candidate_id> --tokens '[[0,1,2,3]]'
 uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
 uzen serve --host 0.0.0.0 --port 8080

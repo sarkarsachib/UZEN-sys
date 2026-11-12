@@ -33,6 +33,39 @@ operation count. `include_values=True` additionally returns the output arrays.
 An artifact without a stored graph is refused with
 `operation.invalid_parameters`; no architecture is guessed.
 
+## Tokenizer-backed text inference
+
+An import that finds a valid `tokenizer.json` stores it in a content-addressed
+sidecar under `<workspace>/tokenizers/<sha256>/tokenizer.json` and records the
+SHA-256, model type and vocabulary size in the artifact manifest. The sidecar is
+independent of the original model directory, so inference still works after the
+source directory is moved or removed. Imports with different tokenizer documents
+receive different artifact ids even when their tensors are identical.
+
+```python
+text_result = client.forward_text(
+    imported["artifact_id"],
+    text="hello world",
+    include_values=True,
+)
+text_result["token_ids"]
+text_result["tokens"]
+text_result["decoded_text"]
+text_result["outputs"]["logits"]
+```
+
+Text is encoded by the real Hugging Face `tokenizers` runtime, not a toy
+substitute. Install the optional extra with `pip install 'uzen[tokenizer]'`.
+If it is absent, text inference raises `runtime.unavailable`; token-ID execution
+continues to work. GPT-2 byte-level BPE and Llama SentencePiece-style BPE are
+handled by the same `tokenizer.json` path, including special tokens and the
+tokenizer's own decoder. Weight-only modifications copy the tokenizer reference,
+so modified artifacts keep text inference.
+
+The REST endpoint is `POST /v1/models/{artifact_id}/forward-text`, the CLI form is
+`uzen forward ARTIFACT_ID --text 'hello world'`, and MCP exposes
+`uzen.forward_text`.
+
 ## Modifying a real model
 
 Weight-only modifications preserve the parent graph metadata and provenance
@@ -100,8 +133,11 @@ MCP:
 
 * Execution is for causal-LM graphs with `tokens` and optional `positions`
   inputs, which are the graphs produced by the current GPT-2/Llama adapters.
-* There is no tokenizer execution yet; callers supply token IDs.
+* Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
+  `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
 * There is no KV cache; each forward pass recomputes the supplied sequence.
+* Text inference runs a forward pass and returns logits; autoregressive text
+  generation/sampling is not implemented.
 * A modification that changes parameter structure is not comparable as the same
   model and is refused by `compare_models` rather than coerced.
 * Numerical closeness is evidence for the stated inputs and tolerances, not a

@@ -152,7 +152,9 @@ notifications loses no diagnostic information.
 * BF16 source tensors retain their source dtype label while being widened for the
   numerical substrate.
 * Tokenizer files are parsed as data only. No tokenizer code, custom model code or
-  pickle is executed.
+  pickle is executed. A valid `tokenizer.json` can later be loaded by the optional
+  `tokenizers` runtime for text inference; other tokenizer formats are reported
+  without being approximated.
 * A license is reported when found in model-card frontmatter or `config.json`;
   otherwise it is explicitly `unknown`. Importing a checkpoint does not change or
   infer its license.
@@ -162,4 +164,7 @@ notifications loses no diagnostic information.
   are reported as unsupported rather than approximated.
 * GPT-2 and Llama reference-logit parity is checked only in the gated live tests
   against the tiny public fixtures. It is not a guarantee for every checkpoint.
-* Tokenizer execution and Milestone A remain future work.
+* Text inference requires a `tokenizer.json` payload and the optional `uzen[tokenizer]`
+  runtime. `vocab.json`/`merges.txt`-only and `tokenizer.model`-only artifacts are
+  imported and reported, but text inference refuses them explicitly.
+* Milestone A remains future work.

@@ -196,6 +196,7 @@ class ModelImportResult:
     package: WeightPackage | None = None
     reconstruction: Any | None = None
     artifact_package: WeightPackage | None = None
+    tokenizer_json: bytes | None = None
 
     @property
     def ok(self) -> bool:
@@ -640,6 +641,15 @@ class ModelImporter:
 
         _notify(on_progress, "config", config_status, "configuration parsed as data")
         tokenizer = _tokenizer_metadata(root, config)
+        tokenizer_json: bytes | None = None
+        tokenizer_document = root / "tokenizer.json"
+        if tokenizer.get("status") == "present" and tokenizer_document.is_file():
+            try:
+                candidate = tokenizer_document.read_bytes()
+                if isinstance(json.loads(candidate.decode("utf-8")), dict):
+                    tokenizer_json = candidate
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                tokenizer_json = None
         for entry in tokenizer.get("files", []):
             files.append(SourceFile(**entry))
 
@@ -914,8 +924,14 @@ class ModelImporter:
                 package=package,
                 reconstruction=reconstruction_result,
                 artifact_package=canonical or package,
+                tokenizer_json=tokenizer_json,
             )
-        return ModelImportResult(report=report, package=None, reconstruction=reconstruction_result)
+        return ModelImportResult(
+            report=report,
+            package=None,
+            reconstruction=reconstruction_result,
+            tokenizer_json=tokenizer_json,
+        )
 
     # ------------------------------------------------------------------ #
     # shard loading

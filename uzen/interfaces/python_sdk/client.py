@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from uzen.core.nws.tensors import WeightPackage
-from uzen.core.wie.model_execution import ModelExecution
+from uzen.core.wie.model_execution import ModelExecution, ModelTextExecution
 from uzen.errors import UzenError
 from uzen.jobs.service import JobService
 
@@ -46,6 +46,19 @@ def _execution_payload(execution: ModelExecution, *, include_values: bool) -> di
             }
             for name in execution.outputs
         }
+    return payload
+
+
+def _text_execution_payload(result: ModelTextExecution, *, include_values: bool) -> dict[str, Any]:
+    payload = _execution_payload(result.execution, include_values=include_values)
+    payload.update(
+        {
+            "text": result.text,
+            "decoded_text": result.decoded_text,
+            "token_ids": [list(result.token_ids)],
+            "tokens": [list(result.tokens)],
+        }
+    )
     return payload
 
 
@@ -269,6 +282,30 @@ class Uzen:
             artifact_id, tokens=tokens, positions=positions
         )
         return _execution_payload(execution, include_values=include_values)
+
+    def forward_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        include_values: bool = False,
+    ) -> dict[str, Any]:
+        """Tokenize text with the artifact's stored tokenizer and run its graph."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/forward-text",
+                {
+                    "text": text,
+                    "positions": positions,
+                    "include_values": include_values,
+                },
+            )
+        result = self.service.forward_text(
+            artifact_id, text=text, positions=positions
+        )
+        return _text_execution_payload(result, include_values=include_values)
 
     def compare_models(
         self,

@@ -12,6 +12,7 @@ Examples::
     uzen inspect model.safetensors --full
     uzen import model.safetensors --family transformer_decoder
     uzen modify ARTIFACT_ID interpolate --other OTHER_ID --param t=0.5
+    uzen forward ARTIFACT_ID --text 'hello world'
     uzen generate --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen evaluate ARTIFACT_ID --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen align A B --method procrustes
@@ -126,7 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     fwd = sub.add_parser("forward", help="execute a stored reconstructed model graph")
     fwd.add_argument("artifact_id")
-    fwd.add_argument("--tokens", required=True, help="JSON token matrix, e.g. '[[0,1,2,3]]'")
+    fwd_input = fwd.add_mutually_exclusive_group(required=True)
+    fwd_input.add_argument("--tokens", help="JSON token matrix, e.g. '[[0,1,2,3]]'")
+    fwd_input.add_argument("--text", help="text encoded with the artifact's stored tokenizer")
     fwd.add_argument("--positions", help="JSON position matrix; defaults to arange")
     fwd.add_argument("--values", action="store_true", help="include output values")
 
@@ -323,14 +326,25 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "forward":
-        _emit(
-            _client(args).forward_model(
-                args.artifact_id,
-                tokens=_json_arg(args.tokens),
-                positions=_json_arg(args.positions),
-                include_values=args.values,
+        client = _client(args)
+        if args.text is not None:
+            _emit(
+                client.forward_text(
+                    args.artifact_id,
+                    text=args.text,
+                    positions=_json_arg(args.positions),
+                    include_values=args.values,
+                )
             )
-        )
+        else:
+            _emit(
+                client.forward_model(
+                    args.artifact_id,
+                    tokens=_json_arg(args.tokens),
+                    positions=_json_arg(args.positions),
+                    include_values=args.values,
+                )
+            )
         return 0
 
     if cmd == "compare-models":

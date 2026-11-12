@@ -106,6 +106,24 @@ def test_live_tiny_gpt2_matches_huggingface_logits():
     assert parity["actual_shape"] == parity["reference_shape"] == [1, 4, 1000]
 
 
+def test_live_tiny_gpt2_tokenizer_text_inference(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("tokenizers")
+    from uzen.interfaces.python_sdk.client import Uzen
+
+    client = Uzen(root=tmp_path / "gpt2-text-workspace")
+    imported = client.import_model("hf-internal-testing/tiny-random-GPT2", revision="main")
+    artifact_id = imported["artifact_id"]
+    assert client.artifact(artifact_id)["metadata"]["tokenizer"]["sha256"]
+
+    result = client.forward_text(artifact_id, text="Hello world", include_values=True)
+    token_ids = result["token_ids"][0]
+    assert result["tokens"][0]
+    assert result["decoded_text"]
+    assert result["outputs"]["logits"]["shape"] == [1, len(token_ids), 1000]
+    assert np.isfinite(np.asarray(result["outputs"]["logits"]["values"])).all()
+
+
 def test_live_tiny_llama_import_reconstruction_and_execution():
     pytest.importorskip("huggingface_hub")
     repo_id = "hf-internal-testing/tiny-random-LlamaForCausalLM"
@@ -131,6 +149,26 @@ def test_live_tiny_llama_import_reconstruction_and_execution():
     assert result.artifact_package is not None
     assert "layers.0.q_proj.weight" in result.artifact_package
     assert "model.layers.0.self_attn.q_proj.weight" in result.package
+
+
+def test_live_tiny_llama_tokenizer_text_inference(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("tokenizers")
+    from uzen.interfaces.python_sdk.client import Uzen
+
+    client = Uzen(root=tmp_path / "llama-text-workspace")
+    imported = client.import_model(
+        "hf-internal-testing/tiny-random-LlamaForCausalLM", revision="main"
+    )
+    artifact_id = imported["artifact_id"]
+    assert client.artifact(artifact_id)["metadata"]["tokenizer"]["sha256"]
+
+    result = client.forward_text(artifact_id, text="Hello world", include_values=True)
+    token_ids = result["token_ids"][0]
+    assert result["tokens"][0]
+    assert result["decoded_text"]
+    assert result["outputs"]["logits"]["shape"] == [1, len(token_ids), 32000]
+    assert np.isfinite(np.asarray(result["outputs"]["logits"]["values"])).all()
 
 
 def test_live_tiny_llama_matches_huggingface_logits():

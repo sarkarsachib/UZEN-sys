@@ -49,6 +49,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/architectures/research` | compare architecture variants |
 | POST | `/v1/models/import` | import a local HF directory/file or `repo_id` + `revision`; returns the compatibility report, reconstruction status, graph and progress |
 | POST | `/v1/models/{id}/forward` | execute a stored reconstructed model graph on tokens/positions |
+| POST | `/v1/models/{id}/forward-text` | tokenize text with the artifact's stored `tokenizer.json`, then execute the graph |
 | POST | `/v1/models/compare` | compare source and weight-modified model outputs with recorded tolerances |
 | GET | `/v1/models` | model registry |
 | GET | `/v1/weights` | weight artifact registry |
@@ -111,6 +112,7 @@ local.inspect(path)                     # WIE report (no pickle)
 local.import_weights(path, family=...)  # artifact id
 local.import_model(path_or_repo_id, revision="main")  # artifact id, compatibility, graph/reconstruction report
 local.forward_model(artifact_id, tokens=[[0, 1, 2, 3]])
+local.forward_text(artifact_id, text="hello world")
 local.compare_models(source_id, candidate_id, tokens=[[0, 1, 2, 3]])
 local.analyze(artifact_id)
 local.generate(family=..., spec=..., seed=0)
@@ -126,13 +128,14 @@ local.operations(); local.policy(); local.families()
 
 `uzen --help` lists groups: `ops`, `policy`, `families`, `inspect`, `import`,
 `analyze`, `modify`, `generate`, `evaluate`, `forward`, `compare-models`, `align`,
-`research`, `artifacts`, `job`, `serve`, `worker`, `mcp`, `sdk`. Errors print
-`{"error": {...}}` to stderr and exit 2.
+`research`, `artifacts`, `job`, `serve`, `worker`, `mcp`, `sdk`. `uzen forward` accepts
+exactly one of `--tokens` or `--text`; `--text` uses the imported tokenizer. Errors
+print `{"error": {...}}` to stderr and exit 2.
 
 ## MCP
 
-Tools: `uzen.import_model`, `uzen.forward_model`, `uzen.compare_models`,
-`uzen.inspect_model`, `uzen.analyze_weights`, `uzen.plan_engineering`,
+Tools: `uzen.import_model`, `uzen.forward_model`, `uzen.forward_text`,
+`uzen.compare_models`, `uzen.inspect_model`, `uzen.analyze_weights`, `uzen.plan_engineering`,
 `uzen.generate_weights`, `uzen.modify_weights`, `uzen.reconstruct_weights`,
 `uzen.research_weight_architecture`, `uzen.research_model_architecture`,
 `uzen.modify_architecture`, `uzen.create_model`, `uzen.evaluate_candidate`,

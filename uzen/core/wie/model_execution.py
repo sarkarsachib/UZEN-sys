@@ -10,6 +10,7 @@ missing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -17,6 +18,7 @@ import numpy as np
 from uzen.core.nir.executor import execute
 from uzen.core.nir.graph import Graph
 from uzen.core.nws.tensors import WeightPackage
+from uzen.core.wie.tokenization import encode_text, tokenizer_spec_from_manifest
 from uzen.errors import GraphValidationError, InvalidOperationParameters
 
 
@@ -50,6 +52,15 @@ class ModelExecution:
             },
             "num_ops": self.num_ops,
         }
+
+
+@dataclass(frozen=True)
+class ModelTextExecution:
+    text: str
+    decoded_text: str
+    token_ids: tuple[int, ...]
+    tokens: tuple[str, ...]
+    execution: ModelExecution
 
 
 def graph_from_manifest(manifest: Mapping[str, Any]) -> Graph:
@@ -131,6 +142,34 @@ def execute_stored_model(
         inputs=inputs,
         outputs=dict(result.outputs),
         num_ops=result.num_ops,
+    )
+
+
+def execute_stored_text(
+    package: WeightPackage,
+    manifest: Mapping[str, Any],
+    *,
+    root: str | Path,
+    artifact_id: str,
+    text: str,
+    positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+) -> ModelTextExecution:
+    """Tokenize text with the artifact's stored tokenizer, then execute its graph."""
+    spec = tokenizer_spec_from_manifest(manifest)
+    encoded = encode_text(root, spec, text)
+    execution = execute_stored_model(
+        package,
+        manifest,
+        artifact_id=artifact_id,
+        tokens=[encoded.token_ids],
+        positions=positions,
+    )
+    return ModelTextExecution(
+        text=encoded.text,
+        decoded_text=encoded.decoded_text,
+        token_ids=encoded.token_ids,
+        tokens=encoded.tokens,
+        execution=execution,
     )
 
 

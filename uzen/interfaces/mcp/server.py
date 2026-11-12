@@ -88,6 +88,28 @@ class MCPServer:
                 },
                 self._forward_model,
             ),
+            "uzen.forward_text": (
+                {
+                    "description": (
+                        "Tokenize text with the imported artifact's stored tokenizer and run "
+                        "its reconstructed GPT-2/Llama graph. No training or gradients."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "include_values": {"type": "boolean"},
+                        },
+                        "required": ["artifact_id", "text"],
+                    },
+                },
+                self._forward_text,
+            ),
             "uzen.compare_models": (
                 {
                     "description": (
@@ -414,6 +436,14 @@ class MCPServer:
         return self.client.forward_model(
             str(args["artifact_id"]),
             tokens=args["tokens"],
+            positions=args.get("positions"),
+            include_values=bool(args.get("include_values", False)),
+        )
+
+    def _forward_text(self, args: Mapping[str, Any]) -> Any:
+        return self.client.forward_text(
+            str(args["artifact_id"]),
+            text=str(args["text"]),
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
         )

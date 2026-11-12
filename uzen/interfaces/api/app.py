@@ -273,6 +273,20 @@ def create_app(
             include_values=bool(payload.get("include_values", False)),
         )
 
+    @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward-text")
+    def forward_text(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        if "text" not in payload or not isinstance(payload["text"], str):
+            raise HTTPException(400, detail={"code": "request.invalid", "message": "provide text"})
+        client = Uzen(root=service.root)
+        return client.forward_text(
+            artifact_id,
+            text=payload["text"],
+            positions=payload.get("positions"),
+            include_values=bool(payload.get("include_values", False)),
+        )
+
     @app.post(f"/{API_VERSION}/models/compare")
     def compare_models(payload: dict[str, Any], _: None = Depends(require_auth)):
         from uzen.interfaces.python_sdk.client import Uzen
