@@ -41,7 +41,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Tokenizer-backed text inference for imported GPT-2/Llama artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
-| Torch-CPU NIR execution (NumPy parity; `rope`/`repeat_kv` currently use the explicit NumPy fallback) | **implemented** |
+| Torch-CPU NIR execution (all 41 operators, parity-tested against NumPy) | **implemented** |
 | GGUF v3 adapter + GGML type registry (F32/F16, Q4/Q5/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K decode, Q8_0 encode, payload-free inspection) | **implemented** |
 | ONNX interchange (export/import of the supported NIR subset) | **implemented** (requires the `onnx` extra; validated with `onnx.checker`) |
 | Sparse-dispatch MoE (only routed tokens are computed per expert) | **implemented** |

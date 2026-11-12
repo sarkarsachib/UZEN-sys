@@ -7,8 +7,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from tests.test_llama_reconstruction import _write_llama  # noqa: E402
 from uzen.core.nir.executor import execute  # noqa: E402
+from uzen.core.nir.graph import Graph  # noqa: E402
+from uzen.core.nir.types import Ref, TensorType  # noqa: E402
 from uzen.core.nws.families import build_architecture  # noqa: E402
+from uzen.core.nws.tensors import WeightPackage  # noqa: E402
+from uzen.core.wie.importer import ModelImporter  # noqa: E402
 from uzen.errors import InvalidOperationParameters  # noqa: E402
 from uzen.runtimes.pytorch_runtime import PyTorchRuntime  # noqa: E402
 from uzen.runtimes.torch_executor import execute_torch, is_available  # noqa: E402
@@ -99,6 +104,63 @@ def test_invalid_backend_is_rejected():
         PyTorchRuntime(device="cpu").execute(
             definition.graph, inputs, package, backend="metal"
         )
+
+
+def test_torch_rope_matches_numpy_reference():
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((2, 3, 4, 6)).astype(np.float32)
+    positions = np.array([[0, 2, 3, 5]], dtype=np.int64)
+    graph = Graph(
+        name="rope-parity",
+        inputs={"x": TensorType.of((2, 3, 4, 6)), "positions": TensorType.of((1, 4), "int64")},
+    )
+    graph.add_node(
+        "rope",
+        "rope",
+        {"x": Ref("input:x"), "positions": Ref("input:positions")},
+        {"theta": 10000.0},
+    )
+    graph.set_output("y", Ref("rope"))
+    package = WeightPackage.from_arrays({})
+    inputs = {"x": x, "positions": positions}
+
+    expected = execute(graph, inputs, package).outputs["y"]
+    got = execute_torch(graph, inputs, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_torch_repeat_kv_matches_numpy_reference():
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((2, 2, 4, 5)).astype(np.float32)
+    graph = Graph(name="repeat-kv-parity", inputs={"x": TensorType.of((2, 2, 4, 5))})
+    graph.add_node("repeat_kv", "repeat_kv", {"x": Ref("input:x")}, {"n_heads": 4})
+    graph.set_output("y", Ref("repeat_kv"))
+    package = WeightPackage.from_arrays({})
+
+    expected = execute(graph, {"x": x}, package).outputs["y"]
+    got = execute_torch(graph, {"x": x}, package).outputs["y"]
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_torch_cpu_llama_graph_uses_native_kernels_and_matches_numpy(tmp_path):
+    root, _arrays = _write_llama(tmp_path / "torch-llama")
+    result = ModelImporter().import_source(root)
+    assert result.reconstruction is not None
+    definition = result.reconstruction.definition
+    inputs = {
+        "tokens": np.array([[0, 1, 2, 3]], dtype=np.int64),
+        "positions": np.arange(4, dtype=np.int64).reshape(1, 4),
+    }
+    expected = execute(definition.graph, inputs, result.artifact_package).outputs
+    runtime = PyTorchRuntime(device="cpu")
+    got = runtime.execute(
+        definition.graph, inputs, result.artifact_package, backend="torch"
+    )
+
+    assert runtime.last_backend == "torch"
+    assert runtime.last_fallback_reason is None
+    for name, value in expected.items():
+        np.testing.assert_allclose(got[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
 
 
 def test_executor_reports_availability():

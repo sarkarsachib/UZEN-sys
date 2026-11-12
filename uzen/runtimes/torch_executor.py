@@ -209,6 +209,54 @@ def _attention(inputs, params, bound):
     return [ctx.to(q.dtype)]
 
 
+def _rope(inputs, params, bound):
+    x, positions = inputs
+    if x.dim() != 4:
+        raise InvalidOperationParameters("rope expects (batch, heads, seq, head_dim)")
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise InvalidOperationParameters(
+            f"rope positions must be integer, got {_dtype_name(positions)}"
+        )
+    if positions.dim() == 1:
+        pos = positions.reshape(1, -1)
+    elif positions.dim() == 2:
+        pos = positions
+    else:
+        raise InvalidOperationParameters("rope positions must be rank 1 or 2")
+    bsz, _heads, seq, dim = x.shape
+    if pos.shape[0] not in (1, bsz) or pos.shape[1] != seq:
+        raise ShapeMismatch(
+            f"rope positions {tuple(positions.shape)} do not match (batch={bsz}, seq={seq})"
+        )
+    if dim % 2:
+        raise InvalidOperationParameters("rope requires an even head dimension")
+    theta = float(params.get("theta", 10000.0))
+    if theta <= 0:
+        raise InvalidOperationParameters("rope theta must be positive")
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=x.device) / dim))
+    freqs = torch.cat([inv_freq, inv_freq], dim=0)
+    angles = pos.to(torch.float64)[:, None, :, None] * freqs[None, None, None, :]
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    x1 = x[..., : dim // 2]
+    x2 = x[..., dim // 2 :]
+    rotated = torch.cat([-x2, x1], dim=-1)
+    return [(x.to(torch.float64) * cos + rotated.to(torch.float64) * sin).to(x.dtype)]
+
+
+def _repeat_kv(inputs, params, bound):
+    x = inputs[0]
+    if x.dim() != 4:
+        raise InvalidOperationParameters("repeat_kv expects (batch, kv_heads, seq, head_dim)")
+    heads = int(params["n_heads"])
+    kv_heads = x.shape[1]
+    if heads <= 0 or kv_heads <= 0 or heads % kv_heads != 0:
+        raise InvalidOperationParameters(
+            f"repeat_kv requires n_heads divisible by kv_heads, got n_heads={heads}, kv_heads={kv_heads}"
+        )
+    return [x.repeat_interleave(heads // kv_heads, dim=1)]
+
+
 def _split_qkv(inputs, params, bound):
     x = inputs[0]
     if x.dim() != 3:
@@ -472,6 +520,8 @@ _KERNELS: dict[str, Callable[..., list[Any]]] = {
         torch.softmax(i[0].to(torch.float64), dim=_axes(p.get("axis", -1), i[0].dim())[0]).to(i[0].dtype)
     ],
     "split_qkv": _split_qkv,
+    "rope": _rope,
+    "repeat_kv": _repeat_kv,
     "merge_heads": _merge_heads,
     "attention": _attention,
     "reshape": _reshape,

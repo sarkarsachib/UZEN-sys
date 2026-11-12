@@ -138,7 +138,7 @@ single-objective contract.
 | --- | --- |
 | NumPy reference (safetensors + npz, graph execution) | implemented |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
-| Torch-CPU NIR executor | implemented; parity-tested against the NumPy reference across all 12 architecture families. Torch kernels cover the existing operator set; `rope` and `repeat_kv` currently use the runtime's explicit, recorded NumPy fallback. |
+| Torch-CPU NIR executor (all 41 operators) | implemented; parity-tested against the NumPy reference across all 12 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
 | ONNX interchange for the NIR subset (export/import) | implemented when the `onnx` extra is installed; validated with `onnx.checker`, no embedded executor |
 | CUDA-native kernels | planned — UZEN never claims GPU acceleration it does not have |
