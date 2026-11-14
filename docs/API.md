@@ -47,7 +47,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | GET | `/v1/architectures/families` | supported families + specs |
 | POST | `/v1/architectures/synthesize` | build a model from a family spec |
 | POST | `/v1/architectures/research` | compare architecture variants |
-| POST | `/v1/models/import` | import a local HF directory/file or `repo_id` + `revision`; returns the compatibility report, reconstruction status, graph and progress |
+| POST | `/v1/models/import` | import a local HF directory/file, weights-only `.pt/.pth/.bin/.ckpt`, single-file `.onnx`, or `repo_id` + `revision`; returns the compatibility report or provenance report, plus graph/reconstruction status when available |
 | POST | `/v1/models/{id}/forward` | execute a stored reconstructed graph on tokens/positions; optional `capture` node ids or `["layers"]` |
 | POST | `/v1/models/{id}/forward-text` | tokenize text with the artifact's stored `tokenizer.json`, then execute the graph |
 | POST | `/v1/models/{id}/generate-text` | greedy autoregressive generation with EOS/context stopping |
@@ -110,7 +110,7 @@ local  = Uzen(root="./ws")
 remote = Uzen(base_url="http://localhost:8080", token="...")
 
 local.inspect(path)                     # WIE report (no pickle)
-local.import_weights(path, family=...)  # artifact id
+local.import_weights(path, family=...)  # artifact id, format + provenance report
 local.import_model(path_or_repo_id, revision="main")  # artifact id, compatibility, graph/reconstruction report
 local.forward_model(artifact_id, tokens=[[0, 1, 2, 3]], capture="layers")
 local.forward_text(artifact_id, text="hello world")

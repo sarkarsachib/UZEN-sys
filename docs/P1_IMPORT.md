@@ -19,8 +19,29 @@ equivalence to the source framework.
 | Single `.safetensors` file | implemented, with optional adjacent `config.json`, tokenizer and model card |
 | Multiple shards without an index | implemented with a warning; files are combined deterministically |
 | Hugging Face repository id (`org/model`) | implemented through the optional `huggingface_hub` dependency (`uzen[hf]`); no remote code is executed |
-| `.npz` / `.gguf` | not handled by this importer; the existing legacy artifact importer still supports them |
-| PyTorch pickle checkpoints | unsupported by design; pickles are never loaded |
+| `.pt`, `.pth`, `.bin`, `.ckpt` | weights-only state dicts imported through the PyTorch adapter (`torch.load(..., weights_only=True)`); arbitrary pickled objects are refused; no graph reconstruction |
+| `.onnx` | single-file ONNX models lifted into NIR with graph and weights stored; requires the `onnx` extra; external-data sidecars are refused so the recorded source hash covers every tensor |
+| `.npz` / `.gguf` | not handled by this HF importer; the legacy weights-only artifact importer still supports them (no architecture reconstruction) |
+
+## Unified artifact import
+
+`client.import_weights(path)`, `uzen import PATH` and
+`POST /v1/models/import` use the same content-addressed artifact pipeline:
+
+* directories and `.safetensors` files go through the HF/safetensors importer;
+* `.pt/.pth/.bin/.ckpt` state dicts go through the PyTorch adapter with
+  `weights_only=True`; no pickle object is unpickled;
+* single-file `.onnx` models are lifted into NIR and stored with their graph and
+  weights;
+* `.npz` and `.gguf` remain weights-only imports through the legacy adapter.
+
+Every imported artifact records `metadata.import_report` with the source path,
+format, source SHA-256, byte size, adapter, tensor count and whether a graph was
+reconstructed. The PyTorch and ONNX import operations include the format and hash
+in the artifact identity, so identical tensors imported from those different
+formats do not collapse into one provenance record. ONNX graph metadata is stored
+under `metadata.graph`; PyTorch state dicts do not carry a graph and are stored
+as weights only.
 
 ## Compatibility report
 
@@ -155,6 +176,11 @@ notifications loses no diagnostic information.
   pickle is executed. A valid `tokenizer.json` can later be loaded by the optional
   `tokenizers` runtime for text inference; other tokenizer formats are reported
   without being approximated.
+* PyTorch checkpoints are loaded only with `weights_only=True`; arbitrary pickled
+  objects are refused with `format.unsupported` rather than unpickled.
+* ONNX models with external tensor data are refused. Their sidecar files would not
+  be covered by the main-file SHA-256, so incomplete provenance is not recorded as
+  if it were complete.
 * A license is reported when found in model-card frontmatter or `config.json`;
   otherwise it is explicitly `unknown`. Importing a checkpoint does not change or
   infer its license.

@@ -35,7 +35,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
-| Hugging Face / safetensors import (local directories, sharded checkpoints, optional Hub download, explicit compatibility reports) | **implemented** |
+| Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
 | GPT-2 and Llama HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and GPT-2/Llama reference-logit parity | **implemented for the explicit GPT-2 and Llama adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; other architectures are reported `unsupported`** |
 | Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama graphs; per-output tolerances and error metrics) |
 | Per-layer activation capture and Hugging Face block-output parity | **implemented** (`capture="layers"` exposes `l<N>_res2` outputs; transformer forward hooks compare every layer, not just logits) |
@@ -106,6 +106,8 @@ uzen ops list --executable-only
 uzen policy show
 uzen inspect model.safetensors
 uzen import model.safetensors --family transformer_decoder
+uzen import model.pt --family transformer_decoder
+uzen import model.onnx
 uzen import ./tiny-hf-model --revision main
 uzen import --repo-id org/model-name --revision main
 uzen modify <artifact_id> interpolate --other <artifact_id> --param t=0.5

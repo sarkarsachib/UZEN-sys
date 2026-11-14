@@ -171,13 +171,18 @@ class Uzen:
                     path, name=name, family=family, revision=revision, repo_id=repo_id
                 )
             record = self.service.import_artifact(path, name=name, family=family)
-            return {
+            result = {
                 "artifact_id": record.artifact_id,
                 "name": record.manifest.name,
                 "family": record.manifest.family,
                 "num_tensors": record.num_tensors,
                 "checksum": record.manifest.checksum,
             }
+            import_report = record.manifest.metadata.get("import_report")
+            if isinstance(import_report, Mapping):
+                result["format"] = import_report.get("format")
+                result["import_report"] = dict(import_report)
+            return result
         return self._request(
             "POST",
             "/v1/models/import",

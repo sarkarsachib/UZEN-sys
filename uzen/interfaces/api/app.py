@@ -251,13 +251,18 @@ def create_app(
         record = service.import_artifact(
             source, name=payload.get("name"), family=payload.get("family")
         )
-        return {
+        response = {
             "artifact_id": record.artifact_id,
             "name": record.manifest.name,
             "family": record.manifest.family,
             "summary": record.manifest.summary,
             "checksum": record.manifest.checksum,
         }
+        import_report = record.manifest.metadata.get("import_report")
+        if isinstance(import_report, Mapping):
+            response["format"] = import_report.get("format")
+            response["import_report"] = dict(import_report)
+        return response
 
     @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward")
     def forward_model(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):

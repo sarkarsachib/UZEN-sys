@@ -43,15 +43,17 @@ from uzen.engines.war.engine import WeightArchitectureResearch
 from uzen.engines.wge.engine import WeightGenerationEngine
 from uzen.engines.wme.engine import WeightModificationEngine
 from uzen.errors import (
+    ArtifactIntegrityError,
     ArtifactNotFound,
     InvalidOperationParameters,
     JobNotFound,
     JobStateError,
+    UnsupportedFormat,
     UzenError,
 )
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
-from uzen.util.canonical import utc_now_iso
+from uzen.util.canonical import sha256_file, utc_now_iso
 
 
 class JobService:
@@ -90,6 +92,11 @@ class JobService:
         if p.is_dir():
             record, _report = self.import_model(p, name=name, family=family)
             return record
+        suffix = p.suffix.lower()
+        if suffix in (".pt", ".pth", ".bin", ".ckpt"):
+            return self._import_torch_checkpoint(p, name=name, family=family)
+        if suffix == ".onnx":
+            return self._import_onnx_model(p, name=name, family=family)
         report = self.wie.inspect_file(p)
         if report.format == "safetensors":
             from uzen.infrastructure.storage.safetensors_io import read_safetensors
@@ -107,21 +114,38 @@ class JobService:
         else:
             raise InvalidOperationParameters(f"unsupported import format '{report.format}'")
         guessed = report.family_guess.get("family", "generic")
+        source_hash = sha256_file(p)
         package = WeightPackage.from_arrays(
             arrays,
             name=name or p.stem,
             family=family or (guessed if guessed != "unknown" else "generic"),
             metadata={
                 "imported_from": str(p),
-                "source_sha256": report.metadata.get("sha256"),
+                "source_sha256": report.metadata.get("sha256") or source_hash,
                 "family_inference": report.family_guess,
             },
         )
+        import_report: dict[str, Any] = {
+            "format": report.format,
+            "source_kind": f"{report.format}_file",
+            "source": str(p),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": p.stat().st_size,
+            "adapter": "legacy_artifact_importer",
+            "graph_reconstructed": False,
+            "num_tensors": len(package),
+            "family_guess": report.family_guess,
+        }
         record = self.store.put(
             package,
             operation="import",
             reuse_existing=True,
-            metadata={"source_path": str(p), "family_guess": report.family_guess},
+            metadata={
+                "source_path": str(p),
+                "family_guess": report.family_guess,
+                "import_report": import_report,
+            },
             note="imported source artifact (immutable origin)",
         )
         self.db.index_artifact(
@@ -138,6 +162,175 @@ class JobService:
                 artifact_id=record.artifact_id,
                 family=package.family,
                 spec={"inferred": report.family_guess},
+            )
+        return record
+
+    def _import_torch_checkpoint(
+        self,
+        path: Path,
+        *,
+        name: str | None,
+        family: str | None,
+    ) -> ArtifactRecord:
+        """Import a PyTorch state dict without allowing arbitrary pickle execution."""
+        from uzen.runtimes.pytorch_runtime import PyTorchRuntime
+
+        source_hash = sha256_file(path)
+        package = PyTorchRuntime(device="cpu").load(path)
+        if sha256_file(path) != source_hash:
+            raise ArtifactIntegrityError(
+                "PyTorch checkpoint changed while it was being imported", path=str(path)
+            )
+        source_dtypes = {
+            key: meta.source_dtype
+            for key, meta in package.metas.items()
+            if meta.source_dtype is not None
+        }
+        package = WeightPackage.from_arrays(
+            package.tensors,
+            name=name or package.name,
+            family=family or package.family,
+            metadata={
+                **dict(package.metadata),
+                "imported_from": str(path),
+                "source_sha256": source_hash,
+            },
+            source_dtypes=source_dtypes,
+        )
+        import_report: dict[str, Any] = {
+            "format": "pytorch",
+            "source_kind": "pytorch_checkpoint",
+            "source": str(path),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": path.stat().st_size,
+            "adapter": "pytorch",
+            "weights_only": True,
+            "graph_reconstructed": False,
+            "num_tensors": len(package),
+            "source_dtypes": source_dtypes,
+        }
+        return self._store_imported_package(
+            package,
+            source=path,
+            source_hash=source_hash,
+            import_report=import_report,
+            note="imported PyTorch weights-only state dict (no graph reconstruction)",
+        )
+
+    def _import_onnx_model(
+        self,
+        path: Path,
+        *,
+        name: str | None,
+        family: str | None,
+    ) -> ArtifactRecord:
+        """Lift a supported ONNX model into NIR and store its graph and weights."""
+        import onnx
+
+        from uzen.runtimes.onnx_runtime import import_onnx
+
+        model = onnx.load(str(path), load_external_data=False)
+        if any(
+            initializer.data_location == onnx.TensorProto.EXTERNAL
+            for initializer in model.graph.initializer
+        ):
+            raise UnsupportedFormat(
+                "ONNX models with external tensor data are not imported because the "
+                "sidecar files would not be covered by the recorded source hash; "
+                "save the model as a single-file ONNX model first"
+            )
+        source_hash = sha256_file(path)
+        graph, package, onnx_metadata = import_onnx(model)
+        if sha256_file(path) != source_hash:
+            raise ArtifactIntegrityError(
+                "ONNX model changed while it was being imported", path=str(path)
+            )
+        source_dtypes = {
+            key: meta.source_dtype
+            for key, meta in package.metas.items()
+            if meta.source_dtype is not None
+        }
+        package = WeightPackage.from_arrays(
+            package.tensors,
+            name=name or package.name,
+            family=family or package.family,
+            metadata={
+                **dict(package.metadata),
+                "imported_from": str(path),
+                "source_sha256": source_hash,
+                "onnx": dict(onnx_metadata),
+            },
+            source_dtypes=source_dtypes,
+        )
+        graph.require_valid(package)
+        import_report: dict[str, Any] = {
+            "format": "onnx",
+            "source_kind": "onnx_model",
+            "source": str(path),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": path.stat().st_size,
+            "adapter": "onnx",
+            "graph_reconstructed": True,
+            "graph_name": graph.name,
+            "num_nodes": len(graph.nodes),
+            "num_tensors": len(package),
+            "onnx": dict(onnx_metadata),
+        }
+        return self._store_imported_package(
+            package,
+            source=path,
+            source_hash=source_hash,
+            import_report=import_report,
+            graph_doc=graph.to_dict(),
+            note="imported ONNX model with validated NIR graph",
+        )
+
+    def _store_imported_package(
+        self,
+        package: WeightPackage,
+        *,
+        source: Path,
+        source_hash: str,
+        import_report: Mapping[str, Any],
+        graph_doc: Mapping[str, Any] | None = None,
+        note: str,
+    ) -> ArtifactRecord:
+        metadata: dict[str, Any] = {
+            "source_path": str(source),
+            "import_report": dict(import_report),
+        }
+        if graph_doc is not None:
+            metadata["graph"] = dict(graph_doc)
+        record = self.store.put(
+            package,
+            operation="import",
+            reuse_existing=True,
+            operations=[
+                {
+                    "op": "import.source",
+                    "format": str(import_report["format"]),
+                    "sha256": source_hash,
+                }
+            ],
+            metadata=metadata,
+            note=note,
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=package.name,
+            family=package.family,
+            operation="import",
+            numel=package.numel(),
+            num_tensors=len(package),
+        )
+        if package.family not in (None, "unknown", "generic"):
+            self.db.register_model(
+                artifact_id=record.artifact_id,
+                family=package.family,
+                spec={"import": dict(import_report)},
             )
         return record
 
