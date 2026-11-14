@@ -29,11 +29,13 @@ from uzen.core.vel.verify import verify
 from uzen.core.wie.inspector import WeightIntelligenceEngine
 from uzen.core.wie.model_execution import (
     ModelExecution,
+    ModelGeneration,
     ModelTextExecution,
     compare_executions,
     execute_stored_model,
     execute_stored_text,
     graph_from_manifest,
+    greedy_generate,
 )
 from uzen.core.wie.tokenization import store_tokenizer
 from uzen.engines.mar.engine import ModelArchitectureResearch
@@ -273,6 +275,27 @@ class JobService:
             text=text,
             positions=positions,
             capture=capture,
+        )
+
+    def generate_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        max_new_tokens: int = 16,
+        eos_token_id: int | None = None,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    ) -> ModelGeneration:
+        """Greedily generate tokens from the stored tokenizer and model graph."""
+        return greedy_generate(
+            self.get_package(artifact_id),
+            self.artifact_manifest(artifact_id),
+            root=self.root,
+            artifact_id=artifact_id,
+            text=text,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            positions=positions,
         )
 
     def compare_models(

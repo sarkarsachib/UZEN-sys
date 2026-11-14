@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from uzen.core.nws.tensors import WeightPackage
-from uzen.core.wie.model_execution import ModelExecution, ModelTextExecution
+from uzen.core.wie.model_execution import ModelExecution, ModelGeneration, ModelTextExecution
 from uzen.errors import UzenError
 from uzen.jobs.service import JobService
 
@@ -317,6 +317,36 @@ class Uzen:
             artifact_id, text=text, positions=positions, capture=capture
         )
         return _text_execution_payload(result, include_values=include_values)
+
+    def generate_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        max_new_tokens: int = 16,
+        eos_token_id: int | None = None,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    ) -> dict[str, Any]:
+        """Generate text greedily with the artifact's stored tokenizer and graph."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/generate-text",
+                {
+                    "text": text,
+                    "max_new_tokens": max_new_tokens,
+                    "eos_token_id": eos_token_id,
+                    "positions": positions,
+                },
+            )
+        result: ModelGeneration = self.service.generate_text(
+            artifact_id,
+            text=text,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            positions=positions,
+        )
+        return result.summary()
 
     def compare_models(
         self,

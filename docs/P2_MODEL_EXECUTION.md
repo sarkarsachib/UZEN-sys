@@ -111,6 +111,33 @@ The REST endpoint is `POST /v1/models/{artifact_id}/forward-text`, the CLI form 
 `uzen forward ARTIFACT_ID --text 'hello world'`, and MCP exposes
 `uzen.forward_text`.
 
+## Greedy autoregressive generation
+
+`generate_text()` repeatedly executes the stored graph on the prompt plus every
+token generated so far, selecting the highest-logit token at the final position.
+This is deterministic greedy decoding, not sampling.
+
+```python
+generated = client.generate_text(
+    imported["artifact_id"],
+    text="hello world",
+    max_new_tokens=8,
+)
+generated["generated_text"]
+generated["full_text"]
+generated["generated_token_ids"]
+generated["stopped_reason"]  # eos_token | max_new_tokens | max_sequence_length
+```
+
+EOS is taken from an explicit `eos_token_id` or inferred from the tokenizer's
+declared special tokens. The context limit comes from the graph's stored
+`spec.max_seq_len` (or GPT-2's position-embedding shape); generation stops before
+exceeding it. Explicit prompt `positions` are extended by one per generated token.
+
+REST uses `POST /v1/models/{artifact_id}/generate-text`, the CLI uses
+`uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8`, and MCP
+exposes `uzen.generate_text`.
+
 ## Modifying a real model
 
 Weight-only modifications preserve the parent graph metadata and provenance
@@ -180,9 +207,12 @@ MCP:
   inputs, which are the graphs produced by the current GPT-2/Llama adapters.
 * Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
   `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
-* There is no KV cache; each forward pass recomputes the supplied sequence.
-* Text inference runs a forward pass and returns logits; autoregressive text
-  generation/sampling is not implemented.
+* There is no KV cache; each forward pass, including every generation step,
+  recomputes the supplied sequence.
+* Generation is greedy only; sampling, beam search and temperature controls are
+  not implemented.
+* Prompt and generated tokens are limited to the graph's stored maximum sequence
+  length.
 * A modification that changes parameter structure is not comparable as the same
   model and is refused by `compare_models` rather than coerced.
 * Numerical closeness is evidence for the stated inputs and tolerances, not a

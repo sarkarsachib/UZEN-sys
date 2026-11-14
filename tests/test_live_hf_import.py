@@ -152,6 +152,24 @@ def test_live_tiny_gpt2_tokenizer_text_inference(tmp_path):
     assert np.isfinite(np.asarray(result["outputs"]["logits"]["values"])).all()
 
 
+def test_live_tiny_gpt2_greedy_generation(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("tokenizers")
+    from uzen.interfaces.python_sdk.client import Uzen
+
+    client = Uzen(root=tmp_path / "gpt2-generation-workspace")
+    imported = client.import_model("hf-internal-testing/tiny-random-GPT2", revision="main")
+    result = client.generate_text(
+        imported["artifact_id"], text="Hello", max_new_tokens=2
+    )
+    assert 1 <= result["steps"] <= 2
+    assert result["stopped_reason"] in {"eos_token", "max_new_tokens"}
+    assert len(result["full_token_ids"]) == (
+        len(result["prompt_token_ids"]) + result["steps"]
+    )
+    assert isinstance(result["generated_text"], str)
+
+
 def test_live_tiny_llama_import_reconstruction_and_execution():
     pytest.importorskip("huggingface_hub")
     repo_id = "hf-internal-testing/tiny-random-LlamaForCausalLM"
@@ -197,6 +215,26 @@ def test_live_tiny_llama_tokenizer_text_inference(tmp_path):
     assert result["decoded_text"]
     assert result["outputs"]["logits"]["shape"] == [1, len(token_ids), 32000]
     assert np.isfinite(np.asarray(result["outputs"]["logits"]["values"])).all()
+
+
+def test_live_tiny_llama_greedy_generation(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("tokenizers")
+    from uzen.interfaces.python_sdk.client import Uzen
+
+    client = Uzen(root=tmp_path / "llama-generation-workspace")
+    imported = client.import_model(
+        "hf-internal-testing/tiny-random-LlamaForCausalLM", revision="main"
+    )
+    result = client.generate_text(
+        imported["artifact_id"], text="Hello", max_new_tokens=2
+    )
+    assert 1 <= result["steps"] <= 2
+    assert result["stopped_reason"] in {"eos_token", "max_new_tokens"}
+    assert len(result["full_token_ids"]) == (
+        len(result["prompt_token_ids"]) + result["steps"]
+    )
+    assert isinstance(result["generated_text"], str)
 
 
 def test_live_tiny_llama_matches_huggingface_logits():

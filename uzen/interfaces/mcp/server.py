@@ -126,6 +126,29 @@ class MCPServer:
                 },
                 self._forward_text,
             ),
+            "uzen.generate_text": (
+                {
+                    "description": (
+                        "Greedily generate text from an imported GPT-2/Llama artifact using "
+                        "its stored tokenizer and reconstructed graph. No training or gradients."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "max_new_tokens": {"type": "integer", "minimum": 1},
+                            "eos_token_id": {"type": "integer", "minimum": 0},
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                        },
+                        "required": ["artifact_id", "text"],
+                    },
+                },
+                self._generate_text,
+            ),
             "uzen.compare_models": (
                 {
                     "description": (
@@ -464,6 +487,15 @@ class MCPServer:
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
             capture=args.get("capture"),
+        )
+
+    def _generate_text(self, args: Mapping[str, Any]) -> Any:
+        return self.client.generate_text(
+            str(args["artifact_id"]),
+            text=str(args["text"]),
+            max_new_tokens=int(args.get("max_new_tokens", 16)),
+            eos_token_id=args.get("eos_token_id"),
+            positions=args.get("positions"),
         )
 
     def _compare_models(self, args: Mapping[str, Any]) -> Any:

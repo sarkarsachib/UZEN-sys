@@ -40,6 +40,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama graphs; per-output tolerances and error metrics) |
 | Per-layer activation capture and Hugging Face block-output parity | **implemented** (`capture="layers"` exposes `l<N>_res2` outputs; transformer forward hooks compare every layer, not just logits) |
 | Tokenizer-backed text inference for imported GPT-2/Llama artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
+| Greedy autoregressive text generation | **implemented** (real per-step forward passes; EOS and context-length stopping; no sampling or KV cache) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
 | Torch-CPU NIR execution (all 41 operators, parity-tested against NumPy) | **implemented** |
@@ -111,6 +112,7 @@ uzen modify <artifact_id> interpolate --other <artifact_id> --param t=0.5
 uzen forward <artifact_id> --tokens '[[0,1,2,3]]'
 uzen forward <artifact_id> --tokens '[[0,1,2,3]]' --capture layers --values
 uzen forward <artifact_id> --text 'hello world' --capture layers
+uzen generate-text <artifact_id> --text 'hello world' --max-new-tokens 8
 uzen compare-models <source_id> <candidate_id> --tokens '[[0,1,2,3]]'
 uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
 uzen serve --host 0.0.0.0 --port 8080

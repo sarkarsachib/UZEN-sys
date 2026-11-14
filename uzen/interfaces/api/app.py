@@ -289,6 +289,21 @@ def create_app(
             capture=payload.get("capture"),
         )
 
+    @app.post(f"/{API_VERSION}/models/{{artifact_id}}/generate-text")
+    def generate_text(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        if "text" not in payload or not isinstance(payload["text"], str):
+            raise HTTPException(400, detail={"code": "request.invalid", "message": "provide text"})
+        client = Uzen(root=service.root)
+        return client.generate_text(
+            artifact_id,
+            text=payload["text"],
+            max_new_tokens=int(payload.get("max_new_tokens", 16)),
+            eos_token_id=payload.get("eos_token_id"),
+            positions=payload.get("positions"),
+        )
+
     @app.post(f"/{API_VERSION}/models/compare")
     def compare_models(payload: dict[str, Any], _: None = Depends(require_auth)):
         from uzen.interfaces.python_sdk.client import Uzen

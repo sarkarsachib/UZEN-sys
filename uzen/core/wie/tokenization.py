@@ -121,12 +121,11 @@ class TokenizedText:
     decoded_text: str
 
 
-def encode_text(root: str | Path, spec: Mapping[str, Any], text: str) -> TokenizedText:
+def encode_with_tokenizer(tokenizer: Any, text: str) -> TokenizedText:
     if not isinstance(text, str):
         raise InvalidOperationParameters("text must be a string")
     if not text:
         raise InvalidOperationParameters("text must not be empty")
-    tokenizer = load_tokenizer(root, spec)
     try:
         encoding = tokenizer.encode(text)
     except Exception as exc:
@@ -137,3 +136,29 @@ def encode_text(root: str | Path, spec: Mapping[str, Any], text: str) -> Tokeniz
     tokens = tuple(str(value) for value in encoding.tokens)
     decoded = tokenizer.decode(list(ids), skip_special_tokens=False)
     return TokenizedText(text=text, token_ids=ids, tokens=tokens, decoded_text=decoded)
+
+
+def encode_text(root: str | Path, spec: Mapping[str, Any], text: str) -> TokenizedText:
+    return encode_with_tokenizer(load_tokenizer(root, spec), text)
+
+
+EOS_TOKEN_CANDIDATES = (
+    "<|endoftext|>",
+    "<|end_of_text|>",
+    "</s>",
+    "<eos>",
+    "<|eot_id|>",
+    "<|im_end|>",
+)
+
+
+def infer_eos_token_id(tokenizer: Any) -> int | None:
+    """Return the tokenizer's explicit EOS id when its document declares one."""
+    for candidate in EOS_TOKEN_CANDIDATES:
+        try:
+            token_id = tokenizer.token_to_id(candidate)
+        except Exception:
+            token_id = None
+        if token_id is not None:
+            return int(token_id)
+    return None

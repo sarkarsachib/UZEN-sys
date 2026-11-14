@@ -13,6 +13,7 @@ Examples::
     uzen import model.safetensors --family transformer_decoder
     uzen modify ARTIFACT_ID interpolate --other OTHER_ID --param t=0.5
     uzen forward ARTIFACT_ID --text 'hello world'
+    uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8
     uzen generate --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen evaluate ARTIFACT_ID --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen align A B --method procrustes
@@ -137,6 +138,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="NIR node ids to capture, or 'layers' for transformer block outputs",
     )
     fwd.add_argument("--values", action="store_true", help="include output and captured values")
+
+    gen_text = sub.add_parser("generate-text", help="greedily generate text from a model artifact")
+    gen_text.add_argument("artifact_id")
+    gen_text.add_argument("--text", required=True, help="prompt text")
+    gen_text.add_argument("--max-new-tokens", type=int, default=16)
+    gen_text.add_argument("--eos-token-id", type=int)
+    gen_text.add_argument("--positions", help="JSON prompt position matrix")
 
     cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
     cmp_models.add_argument("source_artifact_id")
@@ -352,6 +360,18 @@ def _dispatch(args: argparse.Namespace) -> int:
                     capture=args.capture,
                 )
             )
+        return 0
+
+    if cmd == "generate-text":
+        _emit(
+            _client(args).generate_text(
+                args.artifact_id,
+                text=args.text,
+                max_new_tokens=args.max_new_tokens,
+                eos_token_id=args.eos_token_id,
+                positions=_json_arg(args.positions),
+            )
+        )
         return 0
 
     if cmd == "compare-models":
