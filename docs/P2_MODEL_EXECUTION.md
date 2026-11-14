@@ -28,10 +28,55 @@ result = client.forward_model(
 )
 ```
 
-The result contains the graph name, input/output shapes and dtypes, and the
-operation count. `include_values=True` additionally returns the output arrays.
-An artifact without a stored graph is refused with
-`operation.invalid_parameters`; no architecture is guessed.
+The result contains the graph name, input/output shapes and dtypes, the
+operation count, and a `captured` map. `include_values=True` additionally returns
+the output and captured arrays. An artifact without a stored graph is refused
+with `operation.invalid_parameters`; no architecture is guessed.
+
+## Per-layer activation capture
+
+Pass `capture=` to `forward_model()` or `forward_text()` to capture NIR node
+outputs during the same forward pass:
+
+```python
+execution = client.forward_model(
+    imported["artifact_id"],
+    tokens=[[0, 1, 2, 3]],
+    capture="layers",
+    include_values=True,
+)
+execution["captured"]["l0_res2"]["shape"]   # [1, 4, d_model]
+execution["captured"]["l0_res2"]["values"]  # present with include_values=True
+```
+
+`capture="layers"` resolves the reconstructed transformer block outputs named
+`l<N>_res2`, in numeric layer order. An explicit list of NIR node ids is also
+accepted. Unknown nodes raise `operation.invalid_parameters` rather than
+returning an empty capture. The same option is available through the REST
+forward routes (`"capture": ["layers"]`), the CLI (`--capture layers`), and the
+MCP forward tools.
+
+## Layer-by-layer Hugging Face parity
+
+The optional parity helpers compare every reconstructed block output with the
+corresponding Hugging Face transformer block, not just the final logits:
+
+```python
+from uzen.core.wie.parity import compare_gpt2_activations, compare_llama_activations
+
+report = compare_gpt2_activations(graph, package, local_checkpoint, tokens=[[0, 1, 2, 3]])
+report["passed"]
+report["max_abs_error"]
+report["layers"][0]["node"]          # l0_res2
+report["layers"][0]["max_abs_error"]
+```
+
+GPT-2 uses `transformers.GPT2LMHeadModel.transformer.h` and Llama uses
+`transformers.LlamaForCausalLM.model.layers`. Forward hooks capture each block's
+real output; the comparison does not depend on the version-specific
+`hidden_states` tuple layout. Each layer records its node id, shape, tolerance
+result, and absolute/relative errors. The gated live suite compares both tiny
+Hub fixtures layer by layer.
 
 ## Tokenizer-backed text inference
 
@@ -114,7 +159,7 @@ REST:
 
 Python SDK:
 
-* `forward_model(...)`
+* `forward_model(..., capture="layers")`
 * `compare_models(...)`
 
 CLI:
@@ -142,3 +187,6 @@ MCP:
   model and is refused by `compare_models` rather than coerced.
 * Numerical closeness is evidence for the stated inputs and tolerances, not a
   claim of semantic equivalence.
+* Layer parity requires a locally available Hugging Face checkpoint plus
+  `transformers` and `torch`; it is validated only for the explicit GPT-2/Llama
+  adapters.

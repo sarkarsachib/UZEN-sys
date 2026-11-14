@@ -94,6 +94,19 @@ def test_gpt2_text_inference_uses_stored_tokenizer(tmp_path):
     )
 
 
+def test_text_forward_captures_layer_outputs(tmp_path):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    result = client.forward_text(
+        artifact_id,
+        text="hello world",
+        capture="layers",
+        include_values=True,
+    )
+
+    assert result["captured"]["l0_res2"]["shape"][0] == 1
+    assert np.asarray(result["captured"]["l0_res2"]["values"]).ndim == 3
+
+
 def test_modified_model_keeps_text_tokenizer(tmp_path):
     client, source_id = _gpt2_text_client(tmp_path)
     modified = client.modify(

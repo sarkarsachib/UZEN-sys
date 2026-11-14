@@ -81,6 +81,14 @@ class MCPServer:
                                 "type": "array",
                                 "items": {"type": "array", "items": {"type": "integer"}},
                             },
+                            "capture": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "NIR node ids to capture, or ['layers'] for transformer "
+                                    "block outputs"
+                                ),
+                            },
                             "include_values": {"type": "boolean"},
                         },
                         "required": ["artifact_id", "tokens"],
@@ -102,6 +110,14 @@ class MCPServer:
                             "positions": {
                                 "type": "array",
                                 "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "capture": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "NIR node ids to capture, or ['layers'] for transformer "
+                                    "block outputs"
+                                ),
                             },
                             "include_values": {"type": "boolean"},
                         },
@@ -438,6 +454,7 @@ class MCPServer:
             tokens=args["tokens"],
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
+            capture=args.get("capture"),
         )
 
     def _forward_text(self, args: Mapping[str, Any]) -> Any:
@@ -446,6 +463,7 @@ class MCPServer:
             text=str(args["text"]),
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
+            capture=args.get("capture"),
         )
 
     def _compare_models(self, args: Mapping[str, Any]) -> Any:

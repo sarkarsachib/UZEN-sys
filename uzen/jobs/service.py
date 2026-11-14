@@ -244,6 +244,7 @@ class JobService:
         *,
         tokens: Sequence[Sequence[int]],
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        capture: Sequence[str] | str | None = None,
     ) -> ModelExecution:
         """Execute the stored graph recovered from an imported model artifact."""
         return execute_stored_model(
@@ -252,6 +253,7 @@ class JobService:
             artifact_id=artifact_id,
             tokens=tokens,
             positions=positions,
+            capture=capture,
         )
 
     def forward_text(
@@ -260,6 +262,7 @@ class JobService:
         *,
         text: str,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        capture: Sequence[str] | str | None = None,
     ) -> ModelTextExecution:
         """Run text through the stored tokenizer and reconstructed model graph."""
         return execute_stored_text(
@@ -269,6 +272,7 @@ class JobService:
             artifact_id=artifact_id,
             text=text,
             positions=positions,
+            capture=capture,
         )
 
     def compare_models(

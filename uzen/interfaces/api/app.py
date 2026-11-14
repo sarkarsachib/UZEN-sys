@@ -271,6 +271,7 @@ def create_app(
             tokens=payload["tokens"],
             positions=payload.get("positions"),
             include_values=bool(payload.get("include_values", False)),
+            capture=payload.get("capture"),
         )
 
     @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward-text")
@@ -285,6 +286,7 @@ def create_app(
             text=payload["text"],
             positions=payload.get("positions"),
             include_values=bool(payload.get("include_values", False)),
+            capture=payload.get("capture"),
         )
 
     @app.post(f"/{API_VERSION}/models/compare")

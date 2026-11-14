@@ -46,6 +46,13 @@ def _execution_payload(execution: ModelExecution, *, include_values: bool) -> di
             }
             for name in execution.outputs
         }
+        payload["captured"] = {
+            name: {
+                **payload["captured"][name],
+                "values": execution.intermediates[name].tolist(),
+            }
+            for name in execution.intermediates
+        }
     return payload
 
 
@@ -266,6 +273,7 @@ class Uzen:
         tokens: Sequence[Sequence[int]],
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
+        capture: Sequence[str] | str | None = None,
     ) -> dict[str, Any]:
         """Run a stored reconstructed model graph on token IDs."""
         if not self.local:
@@ -276,10 +284,11 @@ class Uzen:
                     "tokens": [list(row) for row in tokens],
                     "positions": positions,
                     "include_values": include_values,
+                    "capture": capture,
                 },
             )
         execution = self.service.forward_model(
-            artifact_id, tokens=tokens, positions=positions
+            artifact_id, tokens=tokens, positions=positions, capture=capture
         )
         return _execution_payload(execution, include_values=include_values)
 
@@ -290,6 +299,7 @@ class Uzen:
         text: str,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
+        capture: Sequence[str] | str | None = None,
     ) -> dict[str, Any]:
         """Tokenize text with the artifact's stored tokenizer and run its graph."""
         if not self.local:
@@ -300,10 +310,11 @@ class Uzen:
                     "text": text,
                     "positions": positions,
                     "include_values": include_values,
+                    "capture": capture,
                 },
             )
         result = self.service.forward_text(
-            artifact_id, text=text, positions=positions
+            artifact_id, text=text, positions=positions, capture=capture
         )
         return _text_execution_payload(result, include_values=include_values)
 

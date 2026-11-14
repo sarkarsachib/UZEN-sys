@@ -131,7 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     fwd_input.add_argument("--tokens", help="JSON token matrix, e.g. '[[0,1,2,3]]'")
     fwd_input.add_argument("--text", help="text encoded with the artifact's stored tokenizer")
     fwd.add_argument("--positions", help="JSON position matrix; defaults to arange")
-    fwd.add_argument("--values", action="store_true", help="include output values")
+    fwd.add_argument(
+        "--capture",
+        nargs="+",
+        help="NIR node ids to capture, or 'layers' for transformer block outputs",
+    )
+    fwd.add_argument("--values", action="store_true", help="include output and captured values")
 
     cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
     cmp_models.add_argument("source_artifact_id")
@@ -334,6 +339,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     text=args.text,
                     positions=_json_arg(args.positions),
                     include_values=args.values,
+                    capture=args.capture,
                 )
             )
         else:
@@ -343,6 +349,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     tokens=_json_arg(args.tokens),
                     positions=_json_arg(args.positions),
                     include_values=args.values,
+                    capture=args.capture,
                 )
             )
         return 0

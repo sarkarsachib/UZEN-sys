@@ -125,6 +125,8 @@ single-objective contract.
 | Tokenizer-backed text inference | implemented for imported GPT-2/Llama artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
 | Weight-only modification with stored-graph preservation | implemented; parent graph metadata is copied to the modified artifact |
 | Source/candidate model output comparison | implemented; same-graph enforcement, recorded tolerances and per-output errors |
+| Per-layer activation capture | implemented; `capture="layers"` returns `l<N>_res2` block outputs, explicit NIR node ids are also accepted |
+| Layer-by-layer Hugging Face parity | implemented for GPT-2/Llama via transformer forward hooks; per-layer shape and error report, gated live validation |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
 | Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |

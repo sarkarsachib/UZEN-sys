@@ -9,7 +9,8 @@ missing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -29,6 +30,7 @@ class ModelExecution:
     inputs: dict[str, np.ndarray]
     outputs: dict[str, np.ndarray]
     num_ops: int
+    intermediates: dict[str, np.ndarray] = field(default_factory=dict)
 
     def output(self, name: str = "logits") -> np.ndarray:
         try:
@@ -49,6 +51,10 @@ class ModelExecution:
             "outputs": {
                 name: {"shape": list(value.shape), "dtype": str(value.dtype)}
                 for name, value in self.outputs.items()
+            },
+            "captured": {
+                name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                for name, value in self.intermediates.items()
             },
             "num_ops": self.num_ops,
         }
@@ -119,6 +125,46 @@ def _causal_inputs(
     return inputs
 
 
+_LAYER_NODE = re.compile(r"^l([0-9]+)_res2$")
+
+
+def layer_node_ids(graph: Graph) -> list[str]:
+    """Return the `l<N>_res2` block outputs in numeric layer order."""
+    layers: list[tuple[int, str]] = []
+    for node_id, node in graph.nodes.items():
+        match = _LAYER_NODE.match(node_id)
+        if match is not None and node.op == "add":
+            layers.append((int(match.group(1)), node_id))
+    return [node_id for _, node_id in sorted(layers)]
+
+
+def _resolve_capture(graph: Graph, capture: Sequence[str] | str | None) -> list[str]:
+    if capture is None:
+        return []
+    if isinstance(capture, str):
+        requested = layer_node_ids(graph) if capture == "layers" else [capture]
+    elif isinstance(capture, Sequence):
+        requested = list(capture)
+        if requested == ["layers"]:
+            requested = layer_node_ids(graph)
+    else:
+        raise InvalidOperationParameters(
+            "capture must be 'layers', a node id, or a sequence of NIR node ids"
+        )
+    if not requested:
+        raise InvalidOperationParameters(
+            "capture requested no nodes; use 'layers' or explicit NIR node ids"
+        )
+    if any(not isinstance(node_id, str) for node_id in requested):
+        raise InvalidOperationParameters("capture node ids must be strings")
+    missing = [node_id for node_id in dict.fromkeys(requested) if node_id not in graph.nodes]
+    if missing:
+        raise InvalidOperationParameters(
+            "capture requested unknown NIR node ids: " + ", ".join(missing)
+        )
+    return list(dict.fromkeys(requested))
+
+
 def execute_stored_model(
     package: WeightPackage,
     manifest: Mapping[str, Any],
@@ -126,21 +172,26 @@ def execute_stored_model(
     artifact_id: str,
     tokens: Sequence[Sequence[int]],
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    capture: Sequence[str] | str | None = None,
 ) -> ModelExecution:
     graph = graph_from_manifest(manifest)
     inputs = _causal_inputs(graph, tokens, positions)
+    capture_ids = _resolve_capture(graph, capture)
     validation = graph.validate(package)
     if not validation.ok:
         raise GraphValidationError(
             "stored graph does not validate against the artifact package",
             errors=list(validation.errors),
         )
-    result = execute(graph, inputs, package, validate_types=True)
+    result = execute(
+        graph, inputs, package, capture=capture_ids, validate_types=True
+    )
     return ModelExecution(
         artifact_id=artifact_id,
         graph_name=graph.name,
         inputs=inputs,
         outputs=dict(result.outputs),
+        intermediates=dict(result.intermediates),
         num_ops=result.num_ops,
     )
 
@@ -153,6 +204,7 @@ def execute_stored_text(
     artifact_id: str,
     text: str,
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    capture: Sequence[str] | str | None = None,
 ) -> ModelTextExecution:
     """Tokenize text with the artifact's stored tokenizer, then execute its graph."""
     spec = tokenizer_spec_from_manifest(manifest)
@@ -163,6 +215,7 @@ def execute_stored_text(
         artifact_id=artifact_id,
         tokens=[encoded.token_ids],
         positions=positions,
+        capture=capture,
     )
     return ModelTextExecution(
         text=encoded.text,

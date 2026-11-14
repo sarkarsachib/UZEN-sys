@@ -18,7 +18,12 @@ import numpy as np
 import pytest
 
 from uzen.core.wie.importer import ModelImporter
-from uzen.core.wie.parity import compare_gpt2_logits, compare_llama_logits
+from uzen.core.wie.parity import (
+    compare_gpt2_activations,
+    compare_gpt2_logits,
+    compare_llama_activations,
+    compare_llama_logits,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("UZEN_LIVE_HF") != "1",
@@ -104,6 +109,29 @@ def test_live_tiny_gpt2_matches_huggingface_logits():
     assert parity["passed"], parity
     assert parity["max_abs_error"] <= 1e-5
     assert parity["actual_shape"] == parity["reference_shape"] == [1, 4, 1000]
+
+
+def test_live_tiny_gpt2_matches_huggingface_hidden_states():
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    result = ModelImporter().import_source("hf-internal-testing/tiny-random-GPT2", revision="main")
+    assert result.ok
+    parity = compare_gpt2_activations(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        result.report.source,
+        tokens=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["num_layers"] == 5
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+    assert all(layer["passed"] for layer in parity["layers"])
+    assert [layer["node"] for layer in parity["layers"]] == [
+        f"l{i}_res2" for i in range(5)
+    ]
 
 
 def test_live_tiny_gpt2_tokenizer_text_inference(tmp_path):
@@ -193,3 +221,28 @@ def test_live_tiny_llama_matches_huggingface_logits():
     assert parity["passed"], parity
     assert parity["max_abs_error"] <= 1e-5
     assert parity["actual_shape"] == parity["reference_shape"] == [1, 4, 32000]
+
+
+def test_live_tiny_llama_matches_huggingface_hidden_states():
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+
+    result = ModelImporter().import_source(
+        "hf-internal-testing/tiny-random-LlamaForCausalLM", revision="main"
+    )
+    parity = compare_llama_activations(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        result.report.source,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["num_layers"] >= 1
+    assert parity["num_layers"] == len(parity["layers"])
+    assert parity["positions"] == [[0, 1, 2, 3]]
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+    assert parity["layers"][0]["node"] == "l0_res2"

@@ -67,6 +67,51 @@ def test_weight_modification_preserves_graph_and_can_be_compared(tmp_path):
     assert changed_comparison["outputs"]["logits"]["max_abs_error"] > 0
 
 
+def test_forward_captures_transformer_layer_outputs(tmp_path):
+    client, artifact_id, _root = _gpt2_client(tmp_path)
+    execution = client.forward_model(
+        artifact_id,
+        tokens=[[0, 1, 2, 3]],
+        capture="layers",
+        include_values=True,
+    )
+
+    assert list(execution["captured"]) == ["l0_res2"]
+    assert execution["captured"]["l0_res2"]["shape"] == [1, 4, 8]
+    values = np.asarray(execution["captured"]["l0_res2"]["values"])
+    assert values.shape == (1, 4, 8)
+    assert np.isfinite(values).all()
+
+
+def test_forward_rejects_unknown_capture_node(tmp_path):
+    client, artifact_id, _root = _gpt2_client(tmp_path)
+    with pytest.raises(InvalidOperationParameters, match="unknown NIR node"):
+        client.forward_model(
+            artifact_id, tokens=[[0, 1, 2, 3]], capture=["not_a_node"]
+        )
+
+
+def test_rest_forward_supports_layer_capture(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    client, artifact_id, _root = _gpt2_client(tmp_path)
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    response = api.post(
+        f"/v1/models/{artifact_id}/forward",
+        json={
+            "tokens": [[0, 1, 2, 3]],
+            "capture": ["layers"],
+            "include_values": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["captured"]["l0_res2"]["shape"] == [1, 4, 8]
+    assert np.asarray(body["captured"]["l0_res2"]["values"]).shape == (1, 4, 8)
+
+
 def test_llama_graph_executes_with_explicit_positions(tmp_path):
     root, _arrays = _write_llama(tmp_path / "llama-model")
     client = Uzen(root=tmp_path / "llama-workspace")
@@ -130,11 +175,16 @@ def test_cli_forward_runs_real_model(tmp_path, capsys):
             source_id,
             "--tokens",
             "[[0,1,2,3]]",
+            "--capture",
+            "layers",
+            "--values",
         ]
     )
     assert status == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["outputs"]["logits"]["shape"] == [1, 4, 16]
+    assert payload["captured"]["l0_res2"]["shape"] == [1, 4, 8]
+    assert payload["captured"]["l0_res2"]["values"]
 
 
 def test_mcp_forward_and_compare_tools(tmp_path):
@@ -155,12 +205,18 @@ def test_mcp_forward_and_compare_tools(tmp_path):
             "method": "tools/call",
             "params": {
                 "name": "uzen.forward_model",
-                "arguments": {"artifact_id": source_id, "tokens": [[0, 1, 2, 3]]},
+                "arguments": {
+                    "artifact_id": source_id,
+                    "tokens": [[0, 1, 2, 3]],
+                    "capture": ["layers"],
+                    "include_values": True,
+                },
             },
         }
     )
     payload = json.loads(forwarded["result"]["content"][0]["text"])
     assert payload["outputs"]["logits"]["shape"] == [1, 4, 16]
+    assert payload["captured"]["l0_res2"]["shape"] == [1, 4, 8]
 
     compared = server.handle(
         {
