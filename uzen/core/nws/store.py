@@ -50,6 +50,7 @@ from uzen.infrastructure.storage.safetensors_io import (
     UZEN_GRAPH_METADATA_KEY,
     encode_graph_metadata,
     read_header,
+    rewrite_safetensors_metadata,
     read_safetensors,
     safetensors_tensor_digest,
     write_safetensors,
@@ -523,12 +524,16 @@ class ArtifactStore:
             if not isinstance(graph_doc, Mapping):
                 shutil.copyfile(d / TENSORS_NAME, dest)
                 return dest
-            # Rebuild the payload so the stored NIR graph travels with the weights.
+            # Rewrite only the header so the stored NIR graph travels with the
+            # weights; tensor bytes are streamed verbatim and never materialized.
             # The graph is validated on re-import before it is trusted.
-            arrays, header = read_safetensors(d / TENSORS_NAME)
-            file_metadata = dict(header.metadata)
-            file_metadata[UZEN_GRAPH_METADATA_KEY] = encode_graph_metadata(graph_doc)
-            write_safetensors(dest, arrays, metadata=file_metadata)
+            rewrite_safetensors_metadata(
+                d / TENSORS_NAME,
+                dest,
+                metadata={
+                    UZEN_GRAPH_METADATA_KEY: encode_graph_metadata(graph_doc),
+                },
+            )
             return dest
         if fmt in ("npz", "numpy"):
             arrays, _ = read_safetensors(d / TENSORS_NAME)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -353,6 +354,70 @@ def build_header(
     pad = (-len(header_bytes)) % HEADER_ALIGNMENT
     header_bytes = header_bytes + b" " * pad
     return header_bytes, buffers
+
+
+def _encode_header(
+    entries: Mapping[str, TensorEntry],
+    metadata: Mapping[str, str] | None,
+) -> bytes:
+    header: dict[str, Any] = {name: entry.to_dict() for name, entry in entries.items()}
+    if metadata:
+        header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
+    raw = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if len(raw) > MAX_HEADER_BYTES:
+        raise ArtifactIntegrityError(
+            f"safetensors header is {len(raw)} bytes, above the {MAX_HEADER_BYTES}-byte limit"
+        )
+    return raw + b" " * ((-len(raw)) % HEADER_ALIGNMENT)
+
+
+def rewrite_safetensors_metadata(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    metadata: Mapping[str, str] | None = None,
+) -> Path:
+    """Rewrite a safetensors header, streaming the tensor payload verbatim.
+
+    Tensor data offsets are relative to the data buffer, so adding metadata only
+    changes the header length: the payload can be copied byte-for-byte instead of
+    being decoded and re-encoded. This preserves dtype bit patterns (including
+    BF16) and keeps memory use independent of the tensor size.
+    """
+    header = read_header(source)
+    merged = dict(header.metadata)
+    if metadata:
+        merged.update({str(k): str(v) for k, v in metadata.items()})
+    header_bytes = _encode_header(header.entries, merged)
+
+    src = Path(source)
+    dest = Path(destination)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", dir=str(dest.parent))
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            out.write(struct.pack("<Q", len(header_bytes)))
+            out.write(header_bytes)
+            inp.seek(8 + header.header_bytes)
+            remaining = header.data_bytes
+            while remaining > 0:
+                chunk = inp.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ArtifactIntegrityError(
+                        "source safetensors data ended during metadata rewrite"
+                    )
+                out.write(chunk)
+                remaining -= len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_name, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return dest
 
 
 def write_safetensors(
