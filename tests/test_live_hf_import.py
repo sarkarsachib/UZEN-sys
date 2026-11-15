@@ -313,6 +313,90 @@ def test_live_tiny_llama_greedy_generation(tmp_path):
     assert isinstance(result["generated_text"], str)
 
 
+def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):
+    """Scale a real Llama checkpoint, export it, reload it and compare outputs.
+
+    Llama's graph takes explicit positions. As with GPT-2, safetensors carries
+    weights only, so the reloaded package is bound to the graph stored in the
+    modified artifact's manifest.
+    """
+    pytest.importorskip("huggingface_hub")
+    from uzen.interfaces.python_sdk.client import Uzen
+    from uzen.util.canonical import sha256_file
+
+    tokens = [[0, 1, 2, 3]]
+    positions = [[0, 1, 2, 3]]
+    client = Uzen(root=tmp_path / "llama-roundtrip-workspace")
+    imported = client.import_model(
+        "hf-internal-testing/tiny-random-LlamaForCausalLM", revision="main"
+    )
+    source_id = imported["artifact_id"]
+    source_execution = client.service.forward_model(
+        source_id, tokens=tokens, positions=positions
+    )
+    source_fingerprint = client.package(source_id).fingerprint()
+
+    modified = client.modify(source_id, "scale", params={"factor": 0.5})
+    modified_id = modified["artifact_id"]
+    assert modified["architecture_preserved"] is True
+    modified_execution = client.service.forward_model(
+        modified_id, tokens=tokens, positions=positions, capture="layers"
+    )
+
+    expected_layers = sorted(modified_execution.intermediates)
+    spec = imported["report"]["reconstruction"]["spec"]
+    assert len(expected_layers) == spec["n_layers"]
+    assert all(name.startswith("l") and name.endswith("_res2") for name in expected_layers)
+    assert not np.array_equal(
+        modified_execution.outputs["logits"], source_execution.outputs["logits"]
+    )
+
+    export_path = client.service.store.export(
+        modified_id, tmp_path / "modified-llama.safetensors"
+    )
+    assert export_path.exists() and export_path.stat().st_size > 0
+
+    family = client.artifact(modified_id)["family"]
+    reloaded_record = client.service.import_artifact(export_path, family=family)
+    reloaded_manifest = client.service.artifact_manifest(reloaded_record.artifact_id)
+    import_report = reloaded_manifest["metadata"]["import_report"]
+    assert import_report["format"] == "safetensors"
+    assert import_report["source_sha256"] == sha256_file(export_path)
+    assert "graph" not in reloaded_manifest["metadata"]
+
+    reloaded_package = client.service.get_package(reloaded_record.artifact_id)
+    modified_package = client.package(modified_id)
+    assert reloaded_package.fingerprint() == modified_package.fingerprint()
+    for name in reloaded_package.names():
+        np.testing.assert_array_equal(
+            reloaded_package.tensors[name], modified_package.tensors[name]
+        )
+
+    reloaded_execution = execute_stored_model(
+        reloaded_package,
+        client.service.artifact_manifest(modified_id),
+        artifact_id=reloaded_record.artifact_id,
+        tokens=tokens,
+        positions=positions,
+        capture="layers",
+    )
+    np.testing.assert_array_equal(
+        reloaded_execution.outputs["logits"], modified_execution.outputs["logits"]
+    )
+    assert sorted(reloaded_execution.intermediates) == expected_layers
+    for name in expected_layers:
+        np.testing.assert_array_equal(
+            reloaded_execution.intermediates[name], modified_execution.intermediates[name]
+        )
+
+    assert client.package(source_id).fingerprint() == source_fingerprint
+    assert client.verify_artifact(modified_id)["ok"] is True
+    assert client.verify_artifact(reloaded_record.artifact_id)["ok"] is True
+    lineage = client.artifact(modified_id)["lineage"]
+    assert lineage["parents"] == [source_id]
+    assert lineage["operation"] == "w.arithmetic.scale"
+
+
 def test_live_tiny_llama_matches_huggingface_logits():
     pytest.importorskip("huggingface_hub")
     pytest.importorskip("transformers")
