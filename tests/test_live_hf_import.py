@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from uzen.core.wie.importer import ModelImporter
+from uzen.core.wie.model_execution import execute_stored_model
 from uzen.core.wie.parity import (
     compare_gpt2_activations,
     compare_gpt2_logits,
@@ -168,6 +169,81 @@ def test_live_tiny_gpt2_greedy_generation(tmp_path):
         len(result["prompt_token_ids"]) + result["steps"]
     )
     assert isinstance(result["generated_text"], str)
+
+
+def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
+    """Modify a real checkpoint, export it, reload it and compare real outputs.
+
+    Safetensors carries weights, not the NIR graph. The reloaded artifact is
+    therefore validated through the public importer and bound to the graph stored
+    in the modified artifact's manifest, which is what its own forward pass uses.
+    """
+    pytest.importorskip("huggingface_hub")
+    from uzen.interfaces.python_sdk.client import Uzen
+    from uzen.util.canonical import sha256_file
+
+    client = Uzen(root=tmp_path / "roundtrip-workspace")
+    imported = client.import_model("hf-internal-testing/tiny-random-GPT2", revision="main")
+    source_id = imported["artifact_id"]
+    source_execution = client.service.forward_model(source_id, tokens=[[0, 1, 2, 3]])
+    source_fingerprint = client.package(source_id).fingerprint()
+
+    modified = client.modify(source_id, "scale", params={"factor": 0.5})
+    modified_id = modified["artifact_id"]
+    assert modified["architecture_preserved"] is True
+    modified_execution = client.service.forward_model(
+        modified_id, tokens=[[0, 1, 2, 3]], capture="layers"
+    )
+
+    expected_layers = sorted(modified_execution.intermediates)
+    assert expected_layers == [f"l{i}_res2" for i in range(5)]
+    assert not np.array_equal(
+        modified_execution.outputs["logits"], source_execution.outputs["logits"]
+    )
+
+    export_path = client.service.store.export(
+        modified_id, tmp_path / "modified-gpt2.safetensors"
+    )
+    assert export_path.exists() and export_path.stat().st_size > 0
+
+    family = client.artifact(modified_id)["family"]
+    reloaded_record = client.service.import_artifact(export_path, family=family)
+    reloaded_manifest = client.service.artifact_manifest(reloaded_record.artifact_id)
+    import_report = reloaded_manifest["metadata"]["import_report"]
+    assert import_report["format"] == "safetensors"
+    assert import_report["source_sha256"] == sha256_file(export_path)
+    assert "graph" not in reloaded_manifest["metadata"]
+
+    reloaded_package = client.service.get_package(reloaded_record.artifact_id)
+    modified_package = client.package(modified_id)
+    assert reloaded_package.fingerprint() == modified_package.fingerprint()
+    for name in reloaded_package.names():
+        np.testing.assert_array_equal(
+            reloaded_package.tensors[name], modified_package.tensors[name]
+        )
+
+    reloaded_execution = execute_stored_model(
+        reloaded_package,
+        client.service.artifact_manifest(modified_id),
+        artifact_id=reloaded_record.artifact_id,
+        tokens=[[0, 1, 2, 3]],
+        capture="layers",
+    )
+    np.testing.assert_array_equal(
+        reloaded_execution.outputs["logits"], modified_execution.outputs["logits"]
+    )
+    assert sorted(reloaded_execution.intermediates) == expected_layers
+    for name in expected_layers:
+        np.testing.assert_array_equal(
+            reloaded_execution.intermediates[name], modified_execution.intermediates[name]
+        )
+
+    assert client.package(source_id).fingerprint() == source_fingerprint
+    assert client.verify_artifact(modified_id)["ok"] is True
+    assert client.verify_artifact(reloaded_record.artifact_id)["ok"] is True
+    lineage = client.artifact(modified_id)["lineage"]
+    assert lineage["parents"] == [source_id]
+    assert lineage["operation"] == "w.arithmetic.scale"
 
 
 def test_live_tiny_llama_import_reconstruction_and_execution():
