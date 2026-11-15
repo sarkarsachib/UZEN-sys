@@ -97,11 +97,16 @@ class JobService:
             return self._import_torch_checkpoint(p, name=name, family=family)
         if suffix == ".onnx":
             return self._import_onnx_model(p, name=name, family=family)
+        graph_doc: dict[str, Any] | None = None
         report = self.wie.inspect_file(p)
         if report.format == "safetensors":
-            from uzen.infrastructure.storage.safetensors_io import read_safetensors
+            from uzen.infrastructure.storage.safetensors_io import (
+                decode_graph_metadata,
+                read_safetensors,
+            )
 
             arrays, header = read_safetensors(p)
+            graph_doc = decode_graph_metadata(header.metadata)
         elif report.format == "npz":
             data = np.load(p, allow_pickle=False)
             arrays = {k: np.asarray(data[k]) for k in data.files}
@@ -137,16 +142,28 @@ class JobService:
             "num_tensors": len(package),
             "family_guess": report.family_guess,
         }
+        artifact_metadata: dict[str, Any] = {
+            "source_path": str(p),
+            "family_guess": report.family_guess,
+            "import_report": import_report,
+        }
+        if graph_doc is not None:
+            from uzen.core.nir.graph import Graph
+
+            Graph.from_dict(graph_doc).require_valid(package)
+            import_report["graph_reconstructed"] = True
+            import_report["graph_name"] = graph_doc.get("name")
+            artifact_metadata["graph"] = graph_doc
         record = self.store.put(
             package,
             operation="import",
             reuse_existing=True,
-            metadata={
-                "source_path": str(p),
-                "family_guess": report.family_guess,
-                "import_report": import_report,
-            },
-            note="imported source artifact (immutable origin)",
+            metadata=artifact_metadata,
+            note=(
+                "imported source artifact with embedded NIR graph"
+                if graph_doc is not None
+                else "imported source artifact (immutable origin)"
+            ),
         )
         self.db.index_artifact(
             artifact_id=record.artifact_id,
@@ -362,14 +379,19 @@ class JobService:
         graph_doc = (
             reconstruction.graph
             if reconstruction is not None and reconstruction.graph_reconstructed
-            else None
+            else artifact_package.metadata.get("graph")
         )
         metadata: dict[str, Any] = {
             "source_path": str(source),
             "import_report": report,
         }
         if graph_doc is not None:
+            from uzen.core.nir.graph import Graph
+
+            Graph.from_dict(graph_doc).require_valid(artifact_package)
             metadata["graph"] = graph_doc
+            if reconstruction is None:
+                report["metadata"]["graph_restored_from_metadata"] = True
         tokenizer_spec = None
         if result.tokenizer_json is not None:
             tokenizer_spec = store_tokenizer(self.root, result.tokenizer_json)

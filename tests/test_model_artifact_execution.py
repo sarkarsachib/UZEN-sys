@@ -67,6 +67,35 @@ def test_weight_modification_preserves_graph_and_can_be_compared(tmp_path):
     assert changed_comparison["outputs"]["logits"]["max_abs_error"] > 0
 
 
+def test_export_embeds_graph_and_reloaded_artifact_executes(tmp_path):
+    client, source_id, _root = _gpt2_client(tmp_path)
+    modified = client.modify(source_id, "scale", params={"factor": 0.5})
+    modified_id = modified["artifact_id"]
+    expected = client.service.forward_model(
+        modified_id, tokens=[[0, 1, 2, 3]], capture="layers"
+    )
+
+    export_path = client.service.store.export(
+        modified_id, tmp_path / "modified.safetensors"
+    )
+    reloaded = client.import_weights(export_path)
+    reloaded_id = reloaded["artifact_id"]
+    manifest = client.artifact(reloaded_id)
+    assert manifest["metadata"]["graph"]["name"] == expected.graph_name
+    assert (
+        manifest["metadata"]["import_report"]["metadata"]["graph_restored_from_metadata"]
+        is True
+    )
+
+    actual = client.service.forward_model(
+        reloaded_id, tokens=[[0, 1, 2, 3]], capture="layers"
+    )
+    np.testing.assert_array_equal(actual.outputs["logits"], expected.outputs["logits"])
+    np.testing.assert_array_equal(
+        actual.intermediates["l0_res2"], expected.intermediates["l0_res2"]
+    )
+
+
 def test_forward_captures_transformer_layer_outputs(tmp_path):
     client, artifact_id, _root = _gpt2_client(tmp_path)
     execution = client.forward_model(

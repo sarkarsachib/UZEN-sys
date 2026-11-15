@@ -47,6 +47,8 @@ from uzen.errors import (
 )
 from uzen.infrastructure.provenance.lineage import LineageGraph, LineageNode
 from uzen.infrastructure.storage.safetensors_io import (
+    UZEN_GRAPH_METADATA_KEY,
+    encode_graph_metadata,
     read_header,
     read_safetensors,
     safetensors_tensor_digest,
@@ -517,7 +519,16 @@ class ArtifactStore:
         dest = Path(destination)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if fmt == "safetensors":
-            shutil.copyfile(d / TENSORS_NAME, dest)
+            graph_doc = manifest.metadata.get("graph") if isinstance(manifest.metadata, Mapping) else None
+            if not isinstance(graph_doc, Mapping):
+                shutil.copyfile(d / TENSORS_NAME, dest)
+                return dest
+            # Rebuild the payload so the stored NIR graph travels with the weights.
+            # The graph is validated on re-import before it is trusted.
+            arrays, header = read_safetensors(d / TENSORS_NAME)
+            file_metadata = dict(header.metadata)
+            file_metadata[UZEN_GRAPH_METADATA_KEY] = encode_graph_metadata(graph_doc)
+            write_safetensors(dest, arrays, metadata=file_metadata)
             return dest
         if fmt in ("npz", "numpy"):
             arrays, _ = read_safetensors(d / TENSORS_NAME)

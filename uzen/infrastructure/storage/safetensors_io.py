@@ -45,6 +45,35 @@ from uzen.util.canonical import atomic_write_bytes, sha256_file
 MAX_HEADER_BYTES = 100 * 1024 * 1024  # 100 MiB
 HEADER_ALIGNMENT = 8
 
+# UZEN embeds the stored NIR graph in a safetensors `__metadata__` entry so an
+# exported artifact can be re-imported and executed without its parent manifest.
+UZEN_GRAPH_METADATA_KEY = "uzen.graph"
+
+
+def encode_graph_metadata(graph: Mapping[str, Any]) -> str:
+    """Serialize a NIR graph document for safetensors metadata."""
+    return json.dumps(dict(graph), sort_keys=True, separators=(",", ":"))
+
+
+def decode_graph_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return the embedded NIR graph document, or ``None`` when it is absent."""
+    if not metadata:
+        return None
+    raw = metadata.get(UZEN_GRAPH_METADATA_KEY)
+    if not raw:
+        return None
+    try:
+        graph = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ArtifactIntegrityError(
+            f"invalid {UZEN_GRAPH_METADATA_KEY} metadata: {exc}"
+        ) from exc
+    if not isinstance(graph, dict):
+        raise ArtifactIntegrityError(
+            f"{UZEN_GRAPH_METADATA_KEY} metadata must be a JSON object"
+        )
+    return graph
+
 
 @dataclass(frozen=True)
 class TensorEntry:

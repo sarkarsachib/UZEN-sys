@@ -177,6 +177,15 @@ silently coerced.
 Parent IDs are deduplicated, so interpolating a model with itself records the
 source once in lineage.
 
+## Exporting a modified artifact
+
+Safetensors exports embed the stored NIR graph under the `uzen.graph` metadata
+key. Re-importing the file through `import_weights` or `uzen import` validates
+that graph against the reloaded tensors before storing it, so the new artifact
+executes without its parent artifact's manifest. Tokenizer documents and the
+original configuration are not embedded; text inference still requires the
+original import or a separate tokenizer sidecar.
+
 ## Interfaces
 
 REST:

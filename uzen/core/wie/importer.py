@@ -34,7 +34,7 @@ from uzen.core.nws.tensors import WeightPackage
 from uzen.core.wie.inspector import WeightIntelligenceEngine
 from uzen.core.wie.reconstruction import reconstruct_hf_model
 from uzen.errors import ArtifactIntegrityError, RuntimeUnavailable, UnsupportedFormat
-from uzen.infrastructure.storage.safetensors_io import read_safetensors
+from uzen.infrastructure.storage.safetensors_io import decode_graph_metadata, read_safetensors
 from uzen.util.canonical import ContentHasher, sha256_file, utc_now_iso
 
 HF_ALLOW_PATTERNS = [
@@ -656,6 +656,7 @@ class ModelImporter:
         arrays: dict[str, np.ndarray] = {}
         records: list[TensorRecord] = []
         source_dtypes: dict[str, str] = {}
+        graph_document: dict[str, Any] | None = None
         directory_kind = source_kind or (
             "huggingface_directory" if (root / "config.json").exists()
             else "safetensors_directory"
@@ -670,6 +671,7 @@ class ModelImporter:
                 problems.append(str(exc))
             else:
                 arrays.update(shard_arrays)
+                graph_document = decode_graph_metadata(header.metadata)
                 for tensor_name, entry in header.entries.items():
                     records.append(self._record(tensor_name, entry, single_file.name, shard_arrays[tensor_name]))
                     if entry.dtype_code == "BF16":
@@ -712,6 +714,7 @@ class ModelImporter:
                     problems.append(str(exc))
                 else:
                     arrays.update(shard_arrays)
+                    graph_document = decode_graph_metadata(header.metadata)
                     for tensor_name, entry in header.entries.items():
                         records.append(self._record(tensor_name, entry, file.name, shard_arrays[tensor_name]))
                         if entry.dtype_code == "BF16":
@@ -884,32 +887,36 @@ class ModelImporter:
         )
 
         if report.ok and arrays:
+            package_metadata: dict[str, Any] = {
+                "import_source": display_source,
+                "source_kind": report.source_kind,
+                "source_hash": report.source_hash,
+                "repo_id": repo_id,
+                "revision": revision,
+                "license": license_info,
+                "architecture": architecture,
+                "tokenizer": {
+                    "status": tokenizer.get("status"),
+                    "vocab_size": tokenizer.get("vocab_size"),
+                    "files": tokenizer.get("files", []),
+                },
+                "compatibility": compatibility.to_dict(),
+                "reconstruction": {
+                    "status": reconstruction_doc.get("status"),
+                    "architecture": reconstruction_doc.get("architecture"),
+                    "spec": reconstruction_doc.get("spec"),
+                    "graph_summary": reconstruction_doc.get("graph_summary"),
+                    "tensor_mapping": reconstruction_doc.get("tensor_mapping"),
+                },
+            }
+            if graph_document is not None:
+                package_metadata["graph"] = graph_document
+                report.metadata["graph_restored_from_metadata"] = True
             package = WeightPackage.from_arrays(
                 arrays,
                 name=name or default_name,
                 family=selected_family,
-                metadata={
-                    "import_source": display_source,
-                    "source_kind": report.source_kind,
-                    "source_hash": report.source_hash,
-                    "repo_id": repo_id,
-                    "revision": revision,
-                    "license": license_info,
-                    "architecture": architecture,
-                    "tokenizer": {
-                        "status": tokenizer.get("status"),
-                        "vocab_size": tokenizer.get("vocab_size"),
-                        "files": tokenizer.get("files", []),
-                    },
-                    "compatibility": compatibility.to_dict(),
-                    "reconstruction": {
-                        "status": reconstruction_doc.get("status"),
-                        "architecture": reconstruction_doc.get("architecture"),
-                        "spec": reconstruction_doc.get("spec"),
-                        "graph_summary": reconstruction_doc.get("graph_summary"),
-                        "tensor_mapping": reconstruction_doc.get("tensor_mapping"),
-                    },
-                },
+                metadata=package_metadata,
                 source_dtypes=source_dtypes,
             )
             canonical = (

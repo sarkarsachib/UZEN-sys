@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from uzen.core.wie.importer import ModelImporter
-from uzen.core.wie.model_execution import execute_stored_model
 from uzen.core.wie.parity import (
     compare_gpt2_activations,
     compare_gpt2_logits,
@@ -174,13 +173,11 @@ def test_live_tiny_gpt2_greedy_generation(tmp_path):
 def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
     """Modify a real checkpoint, export it, reload it and compare real outputs.
 
-    Safetensors carries weights, not the NIR graph. The reloaded artifact is
-    therefore validated through the public importer and bound to the graph stored
-    in the modified artifact's manifest, which is what its own forward pass uses.
+    The safetensors export embeds the stored NIR graph, so the reloaded artifact
+    executes from its own manifest without the parent artifact.
     """
     pytest.importorskip("huggingface_hub")
     from uzen.interfaces.python_sdk.client import Uzen
-    from uzen.util.canonical import sha256_file
 
     client = Uzen(root=tmp_path / "roundtrip-workspace")
     imported = client.import_model("hf-internal-testing/tiny-random-GPT2", revision="main")
@@ -206,15 +203,16 @@ def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
     )
     assert export_path.exists() and export_path.stat().st_size > 0
 
-    family = client.artifact(modified_id)["family"]
-    reloaded_record = client.service.import_artifact(export_path, family=family)
-    reloaded_manifest = client.service.artifact_manifest(reloaded_record.artifact_id)
-    import_report = reloaded_manifest["metadata"]["import_report"]
-    assert import_report["format"] == "safetensors"
-    assert import_report["source_sha256"] == sha256_file(export_path)
-    assert "graph" not in reloaded_manifest["metadata"]
+    reloaded = client.import_weights(export_path)
+    reloaded_id = reloaded["artifact_id"]
+    reloaded_manifest = client.artifact(reloaded_id)
+    assert reloaded_manifest["metadata"]["graph"]["name"] == modified_execution.graph_name
+    assert (
+        reloaded_manifest["metadata"]["import_report"]["metadata"]["graph_restored_from_metadata"]
+        is True
+    )
 
-    reloaded_package = client.service.get_package(reloaded_record.artifact_id)
+    reloaded_package = client.package(reloaded_id)
     modified_package = client.package(modified_id)
     assert reloaded_package.fingerprint() == modified_package.fingerprint()
     for name in reloaded_package.names():
@@ -222,12 +220,8 @@ def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
             reloaded_package.tensors[name], modified_package.tensors[name]
         )
 
-    reloaded_execution = execute_stored_model(
-        reloaded_package,
-        client.service.artifact_manifest(modified_id),
-        artifact_id=reloaded_record.artifact_id,
-        tokens=[[0, 1, 2, 3]],
-        capture="layers",
+    reloaded_execution = client.service.forward_model(
+        reloaded_id, tokens=[[0, 1, 2, 3]], capture="layers"
     )
     np.testing.assert_array_equal(
         reloaded_execution.outputs["logits"], modified_execution.outputs["logits"]
@@ -240,7 +234,7 @@ def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
 
     assert client.package(source_id).fingerprint() == source_fingerprint
     assert client.verify_artifact(modified_id)["ok"] is True
-    assert client.verify_artifact(reloaded_record.artifact_id)["ok"] is True
+    assert client.verify_artifact(reloaded_id)["ok"] is True
     lineage = client.artifact(modified_id)["lineage"]
     assert lineage["parents"] == [source_id]
     assert lineage["operation"] == "w.arithmetic.scale"
@@ -316,13 +310,11 @@ def test_live_tiny_llama_greedy_generation(tmp_path):
 def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):
     """Scale a real Llama checkpoint, export it, reload it and compare outputs.
 
-    Llama's graph takes explicit positions. As with GPT-2, safetensors carries
-    weights only, so the reloaded package is bound to the graph stored in the
-    modified artifact's manifest.
+    Llama's graph takes explicit positions. The safetensors export embeds the
+    stored NIR graph, so the reloaded artifact executes from its own manifest.
     """
     pytest.importorskip("huggingface_hub")
     from uzen.interfaces.python_sdk.client import Uzen
-    from uzen.util.canonical import sha256_file
 
     tokens = [[0, 1, 2, 3]]
     positions = [[0, 1, 2, 3]]
@@ -356,15 +348,16 @@ def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):
     )
     assert export_path.exists() and export_path.stat().st_size > 0
 
-    family = client.artifact(modified_id)["family"]
-    reloaded_record = client.service.import_artifact(export_path, family=family)
-    reloaded_manifest = client.service.artifact_manifest(reloaded_record.artifact_id)
-    import_report = reloaded_manifest["metadata"]["import_report"]
-    assert import_report["format"] == "safetensors"
-    assert import_report["source_sha256"] == sha256_file(export_path)
-    assert "graph" not in reloaded_manifest["metadata"]
+    reloaded = client.import_weights(export_path)
+    reloaded_id = reloaded["artifact_id"]
+    reloaded_manifest = client.artifact(reloaded_id)
+    assert reloaded_manifest["metadata"]["graph"]["name"] == modified_execution.graph_name
+    assert (
+        reloaded_manifest["metadata"]["import_report"]["metadata"]["graph_restored_from_metadata"]
+        is True
+    )
 
-    reloaded_package = client.service.get_package(reloaded_record.artifact_id)
+    reloaded_package = client.package(reloaded_id)
     modified_package = client.package(modified_id)
     assert reloaded_package.fingerprint() == modified_package.fingerprint()
     for name in reloaded_package.names():
@@ -372,10 +365,8 @@ def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):
             reloaded_package.tensors[name], modified_package.tensors[name]
         )
 
-    reloaded_execution = execute_stored_model(
-        reloaded_package,
-        client.service.artifact_manifest(modified_id),
-        artifact_id=reloaded_record.artifact_id,
+    reloaded_execution = client.service.forward_model(
+        reloaded_id,
         tokens=tokens,
         positions=positions,
         capture="layers",
@@ -391,7 +382,7 @@ def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):
 
     assert client.package(source_id).fingerprint() == source_fingerprint
     assert client.verify_artifact(modified_id)["ok"] is True
-    assert client.verify_artifact(reloaded_record.artifact_id)["ok"] is True
+    assert client.verify_artifact(reloaded_id)["ok"] is True
     lineage = client.artifact(modified_id)["lineage"]
     assert lineage["parents"] == [source_id]
     assert lineage["operation"] == "w.arithmetic.scale"
