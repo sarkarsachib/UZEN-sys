@@ -300,8 +300,10 @@ def compare_llama_logits(
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
     atol: float = 1e-5,
     rtol: float = 1e-5,
+    model_cls: Any | None = None,
+    model_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compare reconstructed Llama logits against ``transformers.LlamaForCausalLM``.
+    """Compare reconstructed Llama-like logits against a Hugging Face causal LM.
 
     ``positions`` is optional; when omitted it is ``arange(sequence_length)``
     repeated for each batch item.  When supplied, the same positions are passed
@@ -354,19 +356,22 @@ def compare_llama_logits(
     if not source_path.exists():
         raise FileNotFoundError(f"local reference checkpoint not found: {source_path}")
 
-    model = LlamaForCausalLM.from_pretrained(str(source_path), local_files_only=True).eval()
+    loader = model_cls or LlamaForCausalLM
+    load_kwargs = dict(model_kwargs or {})
+    load_kwargs.setdefault("local_files_only", True)
+    model = loader.from_pretrained(str(source_path), **load_kwargs).eval()
     with torch.no_grad():
         reference = model(
             input_ids=torch.as_tensor(token_array),
             position_ids=torch.as_tensor(position_array),
-        ).logits.detach().cpu().numpy()
+        ).logits.float().detach().cpu().numpy()
     actual = execute(
         graph, {"tokens": token_array, "positions": position_array}, package
     ).output("logits")
     return _comparison_report(
         actual,
         reference,
-        reference_name="transformers.LlamaForCausalLM",
+        reference_name=f"transformers.{getattr(loader, '__name__', 'CausalLM')}",
         source_path=source_path,
         tokens=token_array,
         positions=position_array,

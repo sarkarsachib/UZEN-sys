@@ -343,6 +343,120 @@ def test_live_tiny_neox_matches_huggingface_hidden_states():
     assert parity["layers"][0]["node"] == "l0_res2"
 
 
+def test_live_tiny_qwen2_biases_match_huggingface(tmp_path):
+    """Verify a real Qwen2 checkpoint with Q/K/V biases, not just the synthetic spec."""
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    from huggingface_hub import snapshot_download
+    from transformers import AutoModelForCausalLM
+
+    local = tmp_path / "qwen2"
+    snapshot_download(
+        repo_id="Jiqing/tiny-random-qwen2",
+        local_dir=local,
+        allow_patterns=["*.json", "*.safetensors"],
+    )
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.reconstruction["spec"]["profile"] == "qwen2"
+    assert any(
+        node.get("params", {}).get("bias") == "param:layers.0.q_proj.bias"
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+
+    parity = compare_llama_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+        model_cls=AutoModelForCausalLM,
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
+def test_live_tiny_olmo_non_affine_norms_match_huggingface(tmp_path):
+    """Verify OLMo's non-parametric norms through the shared profile adapter."""
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    from huggingface_hub import snapshot_download
+    from transformers import AutoModelForCausalLM
+
+    local = tmp_path / "olmo"
+    snapshot_download(
+        repo_id="hf-internal-testing/tiny-random-OlmoForCausalLM",
+        local_dir=local,
+        allow_patterns=["*.json", "*.safetensors"],
+    )
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.reconstruction["spec"]["profile"] == "olmo"
+    assert "norm.weight" not in result.artifact_package.tensors
+
+    parity = compare_llama_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+        model_cls=AutoModelForCausalLM,
+        model_kwargs={"torch_dtype": __import__("torch").float64},
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
+def test_live_tiny_neox_exact_gelu_matches_huggingface(tmp_path):
+    """Verify the exact-GELU path against a real NeoX checkpoint.
+
+    The upstream tiny NeoX fixture is distributed as a pickle, which the importer
+    deliberately refuses. This test converts that trusted fixture to safetensors
+    once, then imports and compares the converted directory.
+    """
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from transformers import GPTNeoXForCausalLM
+
+    repo_id = "hf-internal-testing/tiny-random-GPTNeoXForCausalLM"
+    model = GPTNeoXForCausalLM.from_pretrained(repo_id).eval()
+    local = tmp_path / "exact-gelu-neox"
+    model.save_pretrained(local, safe_serialization=True)
+
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.config["hidden_act"] == "gelu"
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.compatibility.execution == "passed"
+    assert result.report.reconstruction["spec"]["activation"] == "gelu_exact"
+    assert any(
+        node["op"] == "gelu_exact"
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+
+    parity = compare_neox_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
 def test_live_tiny_neox_modify_export_reload_roundtrip(tmp_path):
     """Scale a real GPT-NeoX checkpoint, export it, reload it and compare outputs."""
     pytest.importorskip("huggingface_hub")

@@ -176,6 +176,11 @@ def _gelu64(x):
     return 0.5 * x64 * (1.0 + torch.tanh(c * (x64 + 0.044715 * x64**3)))
 
 
+def _gelu_exact64(x):
+    x64 = x.to(torch.float64)
+    return 0.5 * x64 * (1.0 + torch.erf(x64 / float(np.sqrt(2.0))))
+
+
 def _silu64(x):
     x64 = x.to(torch.float64)
     return x64 / (1.0 + torch.exp(-x64))
@@ -536,9 +541,11 @@ _KERNELS: dict[str, Callable[..., list[Any]]] = {
     "sub": lambda i, p, b: [i[0] - i[1]],
     "mul": lambda i, p, b: [i[0] * i[1]],
     "scale": lambda i, p, b: [(i[0] * float(p.get("factor", 1.0))).to(i[0].dtype)],
+    "clip": lambda i, p, b: [torch.clamp(i[0], float(p.get("min", -1.0)), float(p.get("max", 1.0))).to(i[0].dtype)],
     "matmul": _matmul,
     "relu": lambda i, p, b: [torch.clamp_min(i[0], 0).to(i[0].dtype)],
     "gelu": lambda i, p, b: [_gelu64(i[0]).to(i[0].dtype)],
+    "gelu_exact": lambda i, p, b: [_gelu_exact64(i[0]).to(i[0].dtype)],
     "silu": lambda i, p, b: [_silu64(i[0]).to(i[0].dtype)],
     "tanh": lambda i, p, b: [torch.tanh(i[0]).to(i[0].dtype)],
     "sigmoid": lambda i, p, b: [torch.sigmoid(i[0]).to(i[0].dtype)],

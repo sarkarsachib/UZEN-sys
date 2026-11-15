@@ -29,21 +29,21 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Weight operation registry (45 registered operations) | **implemented** |
 | Arithmetic, merging (incl. TIES/DARE), decomposition (SVD/orthogonal/sparsify) | **implemented** |
 | NPA alignment: identity, Procrustes, linear map, permutation (Hungarian), basis, activation/CKA | **implemented** |
-| NASE synthesis: 12 families (transformer/MLP/CNN/RNN/autoencoder/MoE/SSM/GNN/VAE/diffusion/multimodal/hybrid), compose, substitute, bypass, truncate | **implemented** |
+| NASE synthesis: 24 families ordered simple→advanced (residual/gated MLP, CNN, RNN, autoencoder, Siamese, retrieval, set transformer, VAE, SSM, GNN, MoE, diffusion, multimodal, hybrid, transformer encoder, ALBERT, BERT, ViT, perceiver, seq2seq, transformer decoder), compose, substitute, bypass, truncate | **implemented** |
 | WComp compiler + WPL language (real lexer, recursive-descent parser, typed pipeline) | **implemented** |
 | VEL verification: structural, numerical, functional, regression, performance, provenance | **implemented** |
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
-| GPT-2, Llama, OPT and GPT-NeoX HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and reference-logit parity | **implemented for the explicit GPT-2, Llama, OPT and GPT-NeoX adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; OPT includes the +2 offset position table, biased LayerNorm/Q/K/V/O/MLP projections and ReLU; GPT-NeoX includes partial RoPE over a per-head-interleaved fused QKV and a parallel attention/MLP residual; other architectures are reported `unsupported`** |
-| Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama/OPT/GPT-NeoX graphs; per-output tolerances and error metrics) |
+| HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and reference-logit parity | **implemented for explicit GPT-2, Llama, OPT, GPT-NeoX and Llama-like profile adapters (Qwen2, Yi, Aquila, Baichuan, InternLM2, OLMo, MiniCPM, Orion); Llama covers RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; OPT covers the +2 offset position table, biased projections and ReLU; GPT-NeoX covers partial RoPE over interleaved fused QKV and exact/tanh GELU; OLMo adds non-affine LayerNorm and QKV clipping; Qwen2 adds Q/K/V biases. Profiles that need sliding windows, ALiBi or fused non-Llama layouts are reported `unsupported` with their reason** |
+| Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama/OPT/GPT-NeoX and explicit profile graphs; per-output tolerances and error metrics) |
 | Per-layer activation capture and Hugging Face block-output parity | **implemented** (`capture="layers"` exposes `l<N>_res2` outputs; transformer forward hooks compare every layer, not just logits) |
 | Tokenizer-backed text inference for imported GPT-2/Llama/OPT artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
 | Greedy autoregressive text generation | **implemented** (real per-step forward passes; EOS and context-length stopping; no sampling or KV cache) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
-| Torch-CPU NIR execution (all 41 operators, parity-tested against NumPy) | **implemented** |
+| Torch-CPU NIR execution (all 43 operators, parity-tested against NumPy) | **implemented** |
 | GGUF v3 adapter + GGML type registry (F32/F16, Q4/Q5/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K decode, Q8_0 encode, payload-free inspection) | **implemented** |
 | ONNX interchange (export/import of the supported NIR subset) | **implemented** (requires the `onnx` extra; validated with `onnx.checker`) |
 | Sparse-dispatch MoE (only routed tokens are computed per expert) | **implemented** |
@@ -205,7 +205,7 @@ uzen/
 Live Hugging Face validation is opt-in: set the `UZEN_RUN_LIVE_HF` repository
 variable to `1`, or dispatch the CI workflow with `live_hf`, to run
 `UZEN_LIVE_HF=1 pytest tests/test_live_hf_import.py` against the tiny GPT-2,
-Llama, OPT and GPT-NeoX fixtures.
+Llama, OPT, GPT-NeoX, Qwen2 and OLMo fixtures.
 
 The suite exercises the 15 mandatory acceptance tests against real implementations:
 real tensor arithmetic, real SVD, real alignment refusals, real policy rejection, real

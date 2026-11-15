@@ -20,6 +20,18 @@ from uzen.runtimes.pytorch_runtime import PyTorchRuntime  # noqa: E402
 from uzen.runtimes.torch_executor import execute_torch, is_available  # noqa: E402
 
 FAMILY_SPECS = {
+    "linear_residual": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "gated_mlp": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "conv_residual": dict(channels=2, height=8, width=8, num_classes=3),
+    "transformer_encoder": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "albert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "bert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "vit": dict(in_channels=1, height=8, width=8, patch=2, d_model=8, n_heads=2, n_layers=1, d_ff=16, num_classes=3),
+    "set_transformer": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8, num_classes=3),
+    "siamese": dict(input_dim=6, hidden_dim=10, num_classes=2),
+    "retrieval": dict(vocab_size=16, d_model=8, hidden_dim=16, embed_dim=4, max_seq_len=8),
+    "perceiver": dict(vocab_size=16, d_model=8, n_heads=2, latent_count=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "seq2seq": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8),
     "transformer_decoder": dict(
         d_model=16, n_heads=4, n_layers=2, d_ff=32, vocab_size=24, max_seq_len=12
     ),
@@ -57,6 +69,17 @@ def test_torch_cpu_matches_numpy_for_every_family(family, spec):
         )
 
 
+def test_torch_clip_matches_numpy():
+    g = Graph(name="clip", inputs={"x": TensorType.of((2, 3, 4))})
+    g.add_node("clip", "clip", {"x": Ref("input:x")}, {"min": -0.5, "max": 0.75})
+    g.set_output("y", Ref("clip"))
+    x = np.linspace(-2.0, 2.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    package = WeightPackage.from_arrays({})
+    expected = execute(g, {"x": x}, package).outputs["y"]
+    got = execute_torch(g, {"x": x}, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
 def test_runtime_prefers_torch_and_can_force_the_reference():
     definition = build_architecture("mlp", dict(input_dim=4, hidden_dims=[6], output_dim=2))
     package = definition.build_package(seed=1)
@@ -84,6 +107,17 @@ def test_torch_backend_can_be_requested_explicitly():
     expected = execute(definition.graph, inputs, package).outputs
     for name in expected:
         np.testing.assert_allclose(got[name], expected[name], rtol=1e-5, atol=1e-6)
+
+
+def test_torch_gelu_exact_matches_numpy():
+    graph = Graph(name="exact-gelu", inputs={"x": TensorType.of((1, 5))})
+    graph.add_node("act", "gelu_exact", {"x": Ref("input:x")})
+    graph.set_output("y", Ref("act"))
+    package = WeightPackage.from_arrays({})
+    x = np.array([[-3.0, -1.0, 0.0, 1.0, 3.0]], dtype=np.float32)
+    expected = execute(graph, {"x": x}, package).outputs["y"]
+    got = execute_torch(graph, {"x": x}, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
 
 
 def test_torch_neox_graph_matches_numpy(tmp_path):

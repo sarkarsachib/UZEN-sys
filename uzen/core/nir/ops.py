@@ -12,6 +12,7 @@ weight package. The executor resolves these and the validator checks shapes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -302,9 +303,29 @@ def _gelu(x):
     return 0.5 * x64 * (1.0 + np.tanh(c * (x64 + 0.044715 * x64**3)))
 
 
+def _gelu_exact(x):
+    x64 = x.astype(np.float64, copy=False)
+    erf = np.frompyfunc(math.erf, 1, 1)(x64 / np.sqrt(2.0)).astype(np.float64)
+    return 0.5 * x64 * (1.0 + erf)
+
+
 def _silu(x):
     x64 = x.astype(np.float64, copy=False)
     return x64 / (1.0 + np.exp(-x64))
+
+
+def _clip_infer(inputs, params, bound):
+    lower = _param_float(params, "min", -1.0)
+    upper = _param_float(params, "max", 1.0)
+    if lower > upper:
+        raise InvalidOperationParameters("clip min must not exceed max")
+    return [_same(inputs[0].shape, _float_dtype(inputs[0]))]
+
+
+def _clip_run(inputs, params, bound):
+    lower = float(params.get("min", -1.0))
+    upper = float(params.get("max", 1.0))
+    return [np.clip(inputs[0], lower, upper).astype(inputs[0].dtype, copy=False)]
 
 
 def _softmax_infer(inputs, params, bound):
@@ -1113,9 +1134,11 @@ _reg("add", 2, 2, _binary_infer("add"), _binary_run(lambda a, b: a + b), "elemen
 _reg("sub", 2, 2, _binary_infer("sub"), _binary_run(lambda a, b: a - b), "elementwise subtraction", "math")
 _reg("mul", 2, 2, _binary_infer("mul"), _binary_run(lambda a, b: a * b), "elementwise product", "math")
 _reg("scale", 1, 1, _scale_infer, _scale_run, "scalar multiplication", "math")
+_reg("clip", 1, 1, _clip_infer, _clip_run, "elementwise clamp to [min, max]", "math")
 _reg("matmul", 2, 2, _matmul_infer, _matmul_run, "batched matrix multiplication", "math")
 _reg("relu", 1, 1, _unary_infer, _activate(lambda x: np.maximum(x, 0)), "rectified linear unit", "activation")
 _reg("gelu", 1, 1, _unary_infer, _activate(_gelu), "Gaussian error linear unit (tanh approximation)", "activation")
+_reg("gelu_exact", 1, 1, _unary_infer, _activate(_gelu_exact), "Gaussian error linear unit (exact erf)", "activation")
 _reg("silu", 1, 1, _unary_infer, _activate(_silu), "sigmoid linear unit (swish)", "activation")
 _reg("tanh", 1, 1, _unary_infer, _activate(np.tanh), "hyperbolic tangent", "activation")
 _reg("sigmoid", 1, 1, _unary_infer, _activate(lambda x: 1.0 / (1.0 + np.exp(-x))), "logistic sigmoid", "activation")

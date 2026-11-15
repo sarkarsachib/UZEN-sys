@@ -119,15 +119,15 @@ single-objective contract.
 
 | Capability | Status |
 | --- | --- |
-| Families: `transformer_decoder`, `mlp`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `moe`, `state_space`, `gnn`, `vae`, `diffusion`, `multimodal`, `hybrid` | implemented |
-| NIR operators (41): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, reductions, activations | implemented |
-| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX graphs; finite output validation, no KV cache |
+| Families (24, catalogue ordered simple→advanced): `linear_residual`, `gated_mlp`, `mlp`, `conv_residual`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `siamese`, `retrieval`, `set_transformer`, `vae`, `state_space`, `gnn`, `moe`, `diffusion`, `multimodal`, `hybrid`, `transformer_encoder`, `albert`, `bert`, `vit`, `perceiver`, `seq2seq`, `transformer_decoder` | implemented |
+| NIR operators (43): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, `clip`, reductions, activations including exact `gelu_exact` | implemented |
+| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX and the explicit Llama-like profile graphs; finite output validation, no KV cache |
 | Tokenizer-backed text inference | implemented for imported GPT-2/Llama/OPT artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
 | Greedy autoregressive generation | implemented; one real forward pass per token, explicit EOS or context-length stopping, no sampling and no KV cache |
 | Weight-only modification with stored-graph preservation | implemented; parent graph metadata is copied to the modified artifact |
 | Source/candidate model output comparison | implemented; same-graph enforcement, recorded tolerances and per-output errors |
 | Per-layer activation capture | implemented; `capture="layers"` returns `l<N>_res2` block outputs, explicit NIR node ids are also accepted |
-| Layer-by-layer Hugging Face parity | implemented for GPT-2/Llama/OPT/GPT-NeoX via transformer forward hooks; per-layer shape and error report, gated live validation |
+| Logit parity for HF families | implemented for GPT-2/Llama/OPT/GPT-NeoX and live-verified Qwen2/OLMo; other Llama-like profiles are layout- and execution-tested but not claimed as live parity |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
 | Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |
@@ -141,7 +141,7 @@ single-objective contract.
 | --- | --- |
 | NumPy reference (safetensors + npz, graph execution) | implemented |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
-| Torch-CPU NIR executor (all 41 operators) | implemented; parity-tested against the NumPy reference across all 12 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
+| Torch-CPU NIR executor (all 43 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
 | ONNX interchange for the NIR subset (export/import) | implemented when the `onnx` extra is installed; validated with `onnx.checker`, no embedded executor |
 | CUDA-native kernels | planned — UZEN never claims GPU acceleration it does not have |

@@ -168,10 +168,26 @@ def test_neox_sequential_residual_variant_is_explicit(tmp_path):
     assert ln2["inputs"]["x"] == "l0_res1"
 
 
-def test_neox_rejects_exact_gelu_instead_of_silently_approximating(tmp_path):
+def test_neox_exact_gelu_uses_the_exact_operator(tmp_path):
     root, _arrays = _write_neox(
         tmp_path / "neox-exact-gelu",
         hidden_act="gelu",
+    )
+    result = ModelImporter().import_source(root)
+
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.compatibility.execution == "passed"
+    assert result.report.reconstruction["spec"]["activation"] == "gelu_exact"
+    graph = result.report.reconstruction["graph"]
+    assert sum(node["op"] == "gelu_exact" for node in graph["nodes"]) == 2
+    assert not any(node["op"] == "gelu" for node in graph["nodes"])
+
+
+def test_neox_rejects_unsupported_activation(tmp_path):
+    root, _arrays = _write_neox(
+        tmp_path / "neox-silu",
+        hidden_act="silu",
     )
     result = ModelImporter().import_source(root)
 
@@ -181,6 +197,4 @@ def test_neox_rejects_exact_gelu_instead_of_silently_approximating(tmp_path):
     assert result.report.reconstruction["graph"] is None
     assert result.reconstruction is not None
     assert result.reconstruction.package is None
-    assert any(
-        "tanh" in reason for reason in result.report.compatibility.reasons
-    )
+    assert any("silu" in reason for reason in result.report.compatibility.reasons)

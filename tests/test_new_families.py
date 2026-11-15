@@ -7,18 +7,32 @@ each new operator against an independently written reference computation.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from uzen.core.nir.executor import execute
 from uzen.core.nir.graph import Graph
-from uzen.core.nir.ops import OPERATORS, _gelu
+from uzen.core.nir.ops import OPERATORS, _gelu, _gelu_exact
 from uzen.core.nir.types import Ref, TensorType
-from uzen.core.nws.families import build_architecture, family_catalogue
+from uzen.core.nws.families import FAMILY_ORDER, build_architecture, family_catalogue
 from uzen.core.nws.tensors import WeightPackage
 from uzen.errors import InvalidOperationParameters, ShapeMismatch
 
 FAMILY_SPECS = {
+    "linear_residual": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "gated_mlp": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "conv_residual": dict(channels=2, height=8, width=8, num_classes=3),
+    "transformer_encoder": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "albert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "bert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "vit": dict(in_channels=1, height=8, width=8, patch=2, d_model=8, n_heads=2, n_layers=1, d_ff=16, num_classes=3),
+    "set_transformer": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8, num_classes=3),
+    "siamese": dict(input_dim=6, hidden_dim=10, num_classes=2),
+    "retrieval": dict(vocab_size=16, d_model=8, hidden_dim=16, embed_dim=4, max_seq_len=8),
+    "perceiver": dict(vocab_size=16, d_model=8, n_heads=2, latent_count=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "seq2seq": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8),
     "moe": dict(vocab_size=16, d_model=8, n_experts=4, top_k=2, d_ff=16, num_classes=3),
     "state_space": dict(vocab_size=16, d_model=8, state_dim=4, num_classes=3),
     "gnn": dict(in_features=5, hidden_dim=6, num_classes=3, n_layers=2),
@@ -46,6 +60,38 @@ def test_family_builds_validates_and_runs(family, spec):
 def test_catalogue_lists_the_new_families():
     names = {entry["family"] for entry in family_catalogue()}
     assert set(FAMILY_SPECS) <= names
+
+
+def test_catalogue_is_ordered_from_simple_to_advanced():
+    names = [entry["family"] for entry in family_catalogue()]
+    assert names == list(FAMILY_ORDER)
+    ordered = [
+        "linear_residual",
+        "gated_mlp",
+        "conv_residual",
+        "siamese",
+        "retrieval",
+        "set_transformer",
+        "transformer_encoder",
+        "albert",
+        "bert",
+        "vit",
+        "perceiver",
+        "seq2seq",
+    ]
+    new_names = [name for name in names if name in set(ordered)]
+    assert new_names == ordered
+
+
+def test_exact_gelu_matches_erf_and_differs_from_the_tanh_approximation():
+    x = np.array([-3.0, -1.0, 0.0, 1.0, 3.0], dtype=np.float32)
+    expected = np.array(
+        [0.5 * float(v) * (1.0 + math.erf(float(v) / math.sqrt(2.0))) for v in x],
+        dtype=np.float64,
+    )
+    got = _gelu_exact(x)
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
+    assert not np.allclose(_gelu(x), got, rtol=0, atol=1e-6)
 
 
 def test_new_kernels_are_registered_as_implemented():

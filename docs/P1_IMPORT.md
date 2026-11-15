@@ -186,14 +186,20 @@ notifications loses no diagnostic information.
   otherwise it is explicitly `unknown`. Importing a checkpoint does not change or
   infer its license.
 * Reconstruction currently supports explicit GPT-2, Llama, OPT and GPT-NeoX
-  adapters. Other architectures, unsupported Llama fields (scaled RoPE, biases,
-  non-SiLU), OPT variants with `word_embed_proj_dim != hidden_size`, post-LN OPT,
-  scaled embeddings or non-ReLU activations, GPT-NeoX variants with scaled RoPE
-  or exact (erf) GELU, learned architecture variants, quantized formats, and
-  arbitrary custom layers are reported as unsupported rather than approximated.
-* GPT-2, Llama, OPT and GPT-NeoX reference-logit parity is checked only in the
-  gated live tests against the tiny public fixtures. It is not a guarantee for
-  every checkpoint.
+  adapters plus the Llama-like profile adapters for Qwen2, Yi, Aquila, Baichuan,
+  InternLM2, OLMo, MiniCPM and Orion. Profile reconstruction still requires the
+  exact Llama tensor names and config fields; profiles are not guessed. Import
+  profiles for Mistral (sliding window), StableLM (biased LayerNorm and GELU),
+  Gemma, GPT-J, GPT-Neo, Falcon, Bloom, MPT and Phi are recognized but report a
+  concrete `unsupported` reason. OPT variants with `word_embed_proj_dim !=
+  hidden_size`, post-LN OPT, scaled embeddings or non-ReLU activations, GPT-NeoX
+  variants with scaled RoPE or unsupported activations, learned architecture
+  variants, quantized formats, and arbitrary custom layers remain unsupported
+  rather than approximated.
+* Reference-logit parity is checked only in the gated live tests against tiny
+  public fixtures. Llama, GPT-2, OPT, GPT-NeoX, Qwen2 and OLMo have live parity;
+  the other profile adapters are layout- and execution-tested but are not a
+  guarantee for every checkpoint.
 * Text inference requires a `tokenizer.json` payload and the optional `uzen[tokenizer]`
   runtime. `vocab.json`/`merges.txt`-only and `tokenizer.model`-only artifacts are
   imported and reported, but text inference refuses them explicitly.

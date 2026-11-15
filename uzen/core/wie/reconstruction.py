@@ -31,6 +31,7 @@ from uzen.core.nir.types import Ref, TensorType
 from uzen.core.nws.dtypes import dtype_name
 from uzen.core.nws.families import ArchitectureDefinition, build_architecture
 from uzen.core.nws.tensors import WeightPackage
+from uzen.core.wie.hf_profiles import HFProfile, hf_profile_for
 from uzen.errors import UzenError
 
 
@@ -125,7 +126,36 @@ def reconstruct_hf_model(
     model_type = str(config.get("model_type") or "").lower()
     architectures = [str(a) for a in (config.get("architectures") or [])]
     architecture = architectures[0] if architectures else (model_type or None)
-    if model_type == "llama":
+    profile = hf_profile_for(model_type, architectures)
+    if profile is not None and not profile.reconstruct:
+        reason = (
+            f"{profile.model_type} reconstruction is not implemented; "
+            f"the model is recognized as an import profile: {profile.reason}"
+        )
+        step("architecture", "unsupported", reason)
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[reason],
+                warnings=[],
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[reason],
+            )
+        )
+    if model_type == "llama" or profile is not None:
         return _reconstruct_llama(
             arrays,
             config,
@@ -134,6 +164,7 @@ def reconstruct_hf_model(
             name=name,
             source_hash=source_hash,
             on_progress=on_progress,
+            profile=profile,
         )
     if model_type == "opt":
         return _reconstruct_opt(
@@ -422,6 +453,12 @@ def _gpt2_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
             warnings.append(f"{key}={config.get(key)} is a training-time dropout; inference omits it")
     if config.get("type_vocab_size", 1) not in (None, 1):
         warnings.append("type_vocab_size is present but this GPT-2 adapter does not use token-type embeddings")
+    if activation == "gelu":
+        nir_activation = "gelu_exact"
+    elif activation == "gelu_new":
+        nir_activation = "gelu"
+    else:
+        nir_activation = activation
     return {
         "d_model": d_model,
         "n_heads": n_heads,
@@ -430,7 +467,7 @@ def _gpt2_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
         "vocab_size": vocab_size,
         "max_seq_len": max_seq,
         "norm": "layernorm",
-        "activation": "gelu" if activation == "gelu_new" else activation,
+        "activation": nir_activation,
         "tie_embeddings": tie,
     }
 
@@ -587,6 +624,7 @@ def _reconstruct_llama(
     name: str | None,
     source_hash: str | None,
     on_progress: Any | None = None,
+    profile: HFProfile | None = None,
 ) -> ReconstructionResult:
     progress: list[dict[str, Any]] = []
     unresolved: list[str] = []
@@ -602,7 +640,7 @@ def _reconstruct_llama(
             on_progress(stage, status, message)
 
     try:
-        spec = _llama_spec(config, warnings)
+        spec = _llama_spec(config, warnings, profile=profile)
     except ValueError as exc:
         step("config", "unsupported", str(exc))
         return ReconstructionResult(
@@ -768,7 +806,12 @@ def _reconstruct_llama(
     return ReconstructionResult(report=report, package=package, definition=definition)
 
 
-def _llama_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]:
+def _llama_spec(
+    config: Mapping[str, Any],
+    warnings: list[str],
+    *,
+    profile: HFProfile | None = None,
+) -> dict[str, Any]:
     try:
         hidden = int(config["hidden_size"])
         n_heads = int(config["num_attention_heads"])
@@ -784,16 +827,44 @@ def _llama_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any
         raise ValueError("Llama dimensions, layers, vocabulary and context length must be positive")
     if n_heads % n_kv != 0:
         raise ValueError(f"num_attention_heads={n_heads} must be divisible by num_key_value_heads={n_kv}")
-    if config.get("attention_bias"):
-        raise ValueError("attention_bias=true has no explicit Llama NIR mapping")
-    if config.get("mlp_bias"):
-        raise ValueError("mlp_bias=true has no explicit Llama NIR mapping")
+    qkv_bias = bool(profile.qkv_bias) if profile is not None else False
+    o_bias = bool(profile.o_bias) if profile is not None else False
+    mlp_bias = bool(profile.mlp_bias) if profile is not None else False
+    norm_affine = bool(profile.norm_affine) if profile is not None else True
+    if config.get("attention_bias") and not qkv_bias:
+        raise ValueError("attention_bias=true has no explicit mapping for this profile")
+    if config.get("mlp_bias") and not mlp_bias:
+        raise ValueError("mlp_bias=true has no explicit mapping for this profile")
+    partial = float(
+        config.get(
+            "partial_rotary_factor",
+            0.25 if profile is not None and profile.partial_rotary else 1.0,
+        )
+    )
+    if partial != 1.0 and not (profile is not None and profile.partial_rotary):
+        raise ValueError("partial_rotary_factor has no explicit mapping for this profile")
+    if partial <= 0 or partial > 1:
+        raise ValueError("partial_rotary_factor must be in (0, 1]")
+    rotary_dim = int(head_dim * partial)
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError("partial rotary dimension must be a positive even integer")
+    clip_qkv = float(config.get("clip_qkv") or 0.0)
+    if clip_qkv < 0:
+        raise ValueError("clip_qkv must be non-negative")
+    if clip_qkv and not (profile is not None and profile.clip_qkv):
+        raise ValueError("clip_qkv has no explicit mapping for this profile")
     if config.get("rope_scaling") is not None:
         raise ValueError("rope_scaling is not implemented; no scaled-RoPE graph was guessed")
     activation = str(config.get("hidden_act") or "silu")
     if activation != "silu":
         raise ValueError(f"hidden_act='{activation}' is not supported; Llama adapter implements SwiGLU with silu")
-    eps = float(config.get("rms_norm_eps", 1e-6))
+    norm_type = "layernorm" if profile is not None and profile.layer_norm else "rmsnorm"
+    eps_default = (
+        profile.norm_eps
+        if profile is not None and profile.norm_eps is not None
+        else (1e-5 if norm_type == "layernorm" else 1e-6)
+    )
+    eps = float(config.get("layer_norm_eps", config.get("rms_norm_eps", eps_default)))
     theta = float(config.get("rope_theta", 10000.0))
     if eps <= 0 or theta <= 0:
         raise ValueError("rms_norm_eps and rope_theta must be positive")
@@ -802,7 +873,8 @@ def _llama_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any
     if config.get("pretraining_tp", 1) not in (1, None):
         raise ValueError("pretraining_tp != 1 is a tensor-parallel layout and is not supported")
     return {
-        "architecture": "llama",
+        "architecture": profile.model_type if profile is not None else "llama",
+        "profile": profile.model_type if profile is not None else "llama",
         "hidden_size": hidden,
         "n_heads": n_heads,
         "n_kv_heads": n_kv,
@@ -812,7 +884,14 @@ def _llama_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any
         "vocab_size": vocab,
         "max_seq_len": max_seq,
         "rms_norm_eps": eps,
+        "norm_type": norm_type,
         "rope_theta": theta,
+        "rotary_dim": rotary_dim,
+        "clip_qkv": clip_qkv,
+        "qkv_bias": qkv_bias,
+        "o_bias": o_bias,
+        "mlp_bias": mlp_bias,
+        "norm_affine": norm_affine,
         "activation": "silu",
         "tie_embeddings": bool(config.get("tie_word_embeddings", False)),
     }
@@ -830,14 +909,28 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
     layers = int(spec["n_layers"])
     intermediate = int(spec["intermediate_size"])
     vocab = int(spec["vocab_size"])
-    g = Graph(name=f"llama_L{layers}", metadata={"family": "transformer_decoder", "architecture": "llama", "spec": dict(spec)})
+    architecture = str(spec.get("profile") or "llama")
+    qkv_bias = bool(spec.get("qkv_bias", False))
+    o_bias = bool(spec.get("o_bias", False))
+    mlp_bias = bool(spec.get("mlp_bias", False))
+    norm_affine = bool(spec.get("norm_affine", True))
+    norm_type = str(spec.get("norm_type", "rmsnorm"))
+    if norm_type not in ("rmsnorm", "layernorm"):
+        raise ValueError(f"unsupported norm type '{norm_type}'")
+    norm_op = "layernorm" if norm_type == "layernorm" else "rmsnorm"
+    rotary_dim = int(spec.get("rotary_dim", head_dim))
+    clip_qkv = float(spec.get("clip_qkv", 0.0))
+    g = Graph(name=f"{architecture}_L{layers}", metadata={"family": "transformer_decoder", "architecture": architecture, "spec": dict(spec)})
     g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
     g.add_input("positions", TensorType.of(("B", "T"), "int64"))
     sh: dict[str, tuple[int, ...]] = {
         "embed.weight": (vocab, d),
         "lm_head.weight": (vocab, d),
-        "norm.weight": (d,),
     }
+    if norm_affine:
+        sh["norm.weight"] = (d,)
+        if norm_type == "layernorm":
+            sh["norm.bias"] = (d,)
     cur = g.add_node("embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"})
 
     def split_heads(x: Ref, layer: int, name: str, heads_count: int) -> Ref:
@@ -856,8 +949,6 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
 
     for layer in range(layers):
         p = f"layers.{layer}"
-        sh[f"{p}.input_norm.weight"] = (d,)
-        sh[f"{p}.post_norm.weight"] = (d,)
         sh[f"{p}.q_proj.weight"] = (q_dim, d)
         sh[f"{p}.k_proj.weight"] = (kv_dim, d)
         sh[f"{p}.v_proj.weight"] = (kv_dim, d)
@@ -865,30 +956,55 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
         sh[f"{p}.gate_proj.weight"] = (intermediate, d)
         sh[f"{p}.up_proj.weight"] = (intermediate, d)
         sh[f"{p}.down_proj.weight"] = (d, intermediate)
+        if norm_affine:
+            sh[f"{p}.input_norm.weight"] = (d,)
+            sh[f"{p}.post_norm.weight"] = (d,)
+            norm1_params = {"weight": f"param:{p}.input_norm.weight", "eps": eps}
+            norm2_params = {"weight": f"param:{p}.post_norm.weight", "eps": eps}
+            if norm_type == "layernorm":
+                sh[f"{p}.input_norm.bias"] = (d,)
+                sh[f"{p}.post_norm.bias"] = (d,)
+                norm1_params["bias"] = f"param:{p}.input_norm.bias"
+                norm2_params["bias"] = f"param:{p}.post_norm.bias"
+        else:
+            norm1_params = {"eps": eps}
+            norm2_params = {"eps": eps}
+        if qkv_bias:
+            sh[f"{p}.q_proj.bias"] = (q_dim,)
+            sh[f"{p}.k_proj.bias"] = (kv_dim,)
+            sh[f"{p}.v_proj.bias"] = (kv_dim,)
+        if o_bias:
+            sh[f"{p}.o_proj.bias"] = (d,)
+        if mlp_bias:
+            sh[f"{p}.gate_proj.bias"] = (intermediate,)
+            sh[f"{p}.up_proj.bias"] = (intermediate,)
+            sh[f"{p}.down_proj.bias"] = (d,)
+
+        def qkv_params(name: str) -> dict[str, str]:
+            params = {"weight": f"param:{p}.{name}_proj.weight"}
+            if qkv_bias:
+                params["bias"] = f"param:{p}.{name}_proj.bias"
+            return params
+
+        def mlp_params(name: str) -> dict[str, str]:
+            params = {"weight": f"param:{p}.{name}_proj.weight"}
+            if mlp_bias:
+                params["bias"] = f"param:{p}.{name}_proj.bias"
+            return params
+
         norm1 = g.add_node(
             f"l{layer}_input_norm",
-            "rmsnorm",
+            norm_op,
             {"x": cur},
-            {"weight": f"param:{p}.input_norm.weight", "eps": eps},
+            norm1_params,
         )
-        q = g.add_node(
-            f"l{layer}_q_proj",
-            "linear",
-            {"x": norm1},
-            {"weight": f"param:{p}.q_proj.weight"},
-        )
-        k = g.add_node(
-            f"l{layer}_k_proj",
-            "linear",
-            {"x": norm1},
-            {"weight": f"param:{p}.k_proj.weight"},
-        )
-        v = g.add_node(
-            f"l{layer}_v_proj",
-            "linear",
-            {"x": norm1},
-            {"weight": f"param:{p}.v_proj.weight"},
-        )
+        q = g.add_node(f"l{layer}_q_proj", "linear", {"x": norm1}, qkv_params("q"))
+        k = g.add_node(f"l{layer}_k_proj", "linear", {"x": norm1}, qkv_params("k"))
+        v = g.add_node(f"l{layer}_v_proj", "linear", {"x": norm1}, qkv_params("v"))
+        if clip_qkv:
+            q = g.add_node(f"l{layer}_q_clip", "clip", {"x": q}, {"min": -clip_qkv, "max": clip_qkv})
+            k = g.add_node(f"l{layer}_k_clip", "clip", {"x": k}, {"min": -clip_qkv, "max": clip_qkv})
+            v = g.add_node(f"l{layer}_v_clip", "clip", {"x": v}, {"min": -clip_qkv, "max": clip_qkv})
         qh = split_heads(q, layer, "q", heads)
         kh = split_heads(k, layer, "k", kv_heads)
         vh = split_heads(v, layer, "v", kv_heads)
@@ -896,13 +1012,13 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
             f"l{layer}_q_rope",
             "rope",
             {"x": qh, "positions": Ref("input:positions")},
-            {"theta": theta},
+            {"theta": theta, "rotary_dim": rotary_dim},
         )
         kr = g.add_node(
             f"l{layer}_k_rope",
             "rope",
             {"x": kh, "positions": Ref("input:positions")},
-            {"theta": theta},
+            {"theta": theta, "rotary_dim": rotary_dim},
         )
         kr = g.add_node(
             f"l{layer}_k_repeat",
@@ -923,47 +1039,30 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
             {"causal": True, "scale": "auto"},
         )
         merged = g.add_node(f"l{layer}_merge", "merge_heads", {"x": attn}, {"n_heads": heads})
-        proj = g.add_node(
-            f"l{layer}_o_proj",
-            "linear",
-            {"x": merged},
-            {"weight": f"param:{p}.o_proj.weight"},
-        )
+        o_params = {"weight": f"param:{p}.o_proj.weight"}
+        if o_bias:
+            o_params["bias"] = f"param:{p}.o_proj.bias"
+        proj = g.add_node(f"l{layer}_o_proj", "linear", {"x": merged}, o_params)
         cur = g.add_node(f"l{layer}_res1", "add", {"a": cur, "b": proj})
         norm2 = g.add_node(
             f"l{layer}_post_norm",
-            "rmsnorm",
+            norm_op,
             {"x": cur},
-            {"weight": f"param:{p}.post_norm.weight", "eps": eps},
+            norm2_params,
         )
-        gate = g.add_node(
-            f"l{layer}_gate",
-            "linear",
-            {"x": norm2},
-            {"weight": f"param:{p}.gate_proj.weight"},
-        )
+        gate = g.add_node(f"l{layer}_gate", "linear", {"x": norm2}, mlp_params("gate"))
         gate = g.add_node(f"l{layer}_silu", "silu", {"x": gate})
-        up = g.add_node(
-            f"l{layer}_up",
-            "linear",
-            {"x": norm2},
-            {"weight": f"param:{p}.up_proj.weight"},
-        )
+        up = g.add_node(f"l{layer}_up", "linear", {"x": norm2}, mlp_params("up"))
         gated = g.add_node(f"l{layer}_gated", "mul", {"a": gate, "b": up})
-        down = g.add_node(
-            f"l{layer}_down",
-            "linear",
-            {"x": gated},
-            {"weight": f"param:{p}.down_proj.weight"},
-        )
+        down = g.add_node(f"l{layer}_down", "linear", {"x": gated}, mlp_params("down"))
         cur = g.add_node(f"l{layer}_res2", "add", {"a": cur, "b": down})
 
-    final = g.add_node(
-        "final_norm",
-        "rmsnorm",
-        {"x": cur},
-        {"weight": "param:norm.weight", "eps": eps},
-    )
+    final_params = {"eps": eps}
+    if norm_affine:
+        final_params["weight"] = "param:norm.weight"
+        if norm_type == "layernorm":
+            final_params["bias"] = "param:norm.bias"
+    final = g.add_node("final_norm", norm_op, {"x": cur}, final_params)
     logits = g.add_node(
         "lm_head",
         "linear",
@@ -1002,6 +1101,10 @@ def _llama_tensors(
     shape_errors: list[str] = []
     used: set[str] = set()
     tie = bool(spec["tie_embeddings"])
+    norm_affine = bool(spec.get("norm_affine", True))
+    qkv_bias = bool(spec.get("qkv_bias", False))
+    o_bias = bool(spec.get("o_bias", False))
+    mlp_bias = bool(spec.get("mlp_bias", False))
 
     def add(target: str, source: str | None, note: str = "") -> None:
         if target not in expected:
@@ -1023,7 +1126,10 @@ def _llama_tensors(
         mapping.append({"target": target, "source": source, "transform": "identity", "status": status, "source_shape": shape, "expected_shape": list(expected[target]), "dtype": dtype_name(arr.dtype), "note": note})
 
     add("embed.weight", "model.embed_tokens.weight")
-    add("norm.weight", "model.norm.weight")
+    if norm_affine:
+        add("norm.weight", "model.norm.weight")
+        if spec.get("norm_type") == "layernorm":
+            add("norm.bias", "model.norm.bias")
     lm_head = arrays.get("lm_head.weight")
     if tie:
         if lm_head is not None:
@@ -1038,15 +1144,29 @@ def _llama_tensors(
     for layer in range(int(spec["n_layers"])):
         src = f"model.layers.{layer}"
         dst = f"layers.{layer}"
-        add(f"{dst}.input_norm.weight", f"{src}.input_layernorm.weight")
-        add(f"{dst}.post_norm.weight", f"{src}.post_attention_layernorm.weight")
+        if norm_affine:
+            add(f"{dst}.input_norm.weight", f"{src}.input_layernorm.weight")
+            add(f"{dst}.post_norm.weight", f"{src}.post_attention_layernorm.weight")
+            if spec.get("norm_type") == "layernorm":
+                add(f"{dst}.input_norm.bias", f"{src}.input_layernorm.bias")
+                add(f"{dst}.post_norm.bias", f"{src}.post_attention_layernorm.bias")
         add(f"{dst}.q_proj.weight", f"{src}.self_attn.q_proj.weight")
         add(f"{dst}.k_proj.weight", f"{src}.self_attn.k_proj.weight")
         add(f"{dst}.v_proj.weight", f"{src}.self_attn.v_proj.weight")
+        if qkv_bias:
+            add(f"{dst}.q_proj.bias", f"{src}.self_attn.q_proj.bias")
+            add(f"{dst}.k_proj.bias", f"{src}.self_attn.k_proj.bias")
+            add(f"{dst}.v_proj.bias", f"{src}.self_attn.v_proj.bias")
         add(f"{dst}.o_proj.weight", f"{src}.self_attn.o_proj.weight")
+        if o_bias:
+            add(f"{dst}.o_proj.bias", f"{src}.self_attn.o_proj.bias")
         add(f"{dst}.gate_proj.weight", f"{src}.mlp.gate_proj.weight")
         add(f"{dst}.up_proj.weight", f"{src}.mlp.up_proj.weight")
         add(f"{dst}.down_proj.weight", f"{src}.mlp.down_proj.weight")
+        if mlp_bias:
+            add(f"{dst}.gate_proj.bias", f"{src}.mlp.gate_proj.bias")
+            add(f"{dst}.up_proj.bias", f"{src}.mlp.up_proj.bias")
+            add(f"{dst}.down_proj.bias", f"{src}.mlp.down_proj.bias")
 
     extra = sorted(set(arrays) - used)
     for name in extra:
@@ -1867,10 +1987,11 @@ def _neox_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
             f"hidden_size={d_model} is not divisible by num_attention_heads={n_heads}"
         )
     head_dim = d_model // n_heads
+    # GPTNeoXConfig defaults a missing partial-rotary factor to 0.25, not 1.0.
     rotary_pct = float(
         config.get("partial_rotary_factor")
         or config.get("rotary_pct")
-        or 1.0
+        or 0.25
     )
     rotary_dim = int(head_dim * rotary_pct)
     if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
@@ -1884,10 +2005,14 @@ def _neox_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
     if config.get("rope_scaling") is not None:
         raise ValueError("rope_scaling is not implemented; no scaled-RoPE graph was guessed")
     activation = str(config.get("hidden_act") or "gelu_fast")
-    if activation not in ("gelu_fast", "gelu_new"):
+    if activation in ("gelu_fast", "gelu_new"):
+        nir_activation = "gelu"
+    elif activation == "gelu":
+        nir_activation = "gelu_exact"
+    else:
         raise ValueError(
-            f"hidden_act='{activation}' is not supported; this adapter implements the "
-            "tanh-approximated GELU used by gelu_fast/gelu_new"
+            f"hidden_act='{activation}' is not supported; this adapter implements "
+            "exact GELU and the tanh-approximated gelu_fast/gelu_new"
         )
     eps = float(config.get("layer_norm_eps") or 1e-5)
     if eps <= 0:
@@ -1911,7 +2036,7 @@ def _neox_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
         "rotary_dim": rotary_dim,
         "rope_theta": theta,
         "layer_norm_eps": eps,
-        "activation": "gelu",
+        "activation": nir_activation,
         "parallel_residual": bool(config.get("use_parallel_residual", True)),
         "attention_bias": bool(config.get("attention_bias", False)),
         "tie_embeddings": False if tie is None else bool(tie),
@@ -2043,7 +2168,7 @@ def _build_neox_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
             {"x": mlp_input},
             {"weight": f"param:{p}.mlp_up.weight", "bias": f"param:{p}.mlp_up.bias"},
         )
-        act = g.add_node(f"l{layer}_act", "gelu", {"x": up})
+        act = g.add_node(f"l{layer}_act", str(spec["activation"]), {"x": up})
         down = g.add_node(
             f"l{layer}_mlp_down",
             "linear",
