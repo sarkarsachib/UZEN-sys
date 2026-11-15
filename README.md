@@ -202,6 +202,11 @@ uzen/
 .venv/bin/python -m pytest -q
 ```
 
+Live Hugging Face validation is opt-in: set the `UZEN_RUN_LIVE_HF` repository
+variable to `1`, or dispatch the CI workflow with `live_hf`, to run
+`UZEN_LIVE_HF=1 pytest tests/test_live_hf_import.py` against the tiny GPT-2 and
+Llama fixtures.
+
 The suite exercises the 15 mandatory acceptance tests against real implementations:
 real tensor arithmetic, real SVD, real alignment refusals, real policy rejection, real
 job retries, real worker authentication and real graph binding validation. There are

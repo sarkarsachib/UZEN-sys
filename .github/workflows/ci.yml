@@ -3,6 +3,12 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      live_hf:
+        description: Download tiny Hugging Face fixtures and run live tests
+        type: boolean
+        default: false
 
 jobs:
   core:
@@ -49,6 +55,32 @@ jobs:
         run: python -m pip check
       - name: Full test suite
         run: python -m pytest -q
+
+  live-hf:
+    name: Live Hugging Face tests (tiny GPT-2 and Llama)
+    # Opt-in: set the repository variable UZEN_RUN_LIVE_HF=1, or dispatch this
+    # workflow manually with live_hf enabled. Normal pushes and PRs skip the job.
+    if: vars.UZEN_RUN_LIVE_HF == '1' || (github.event_name == 'workflow_dispatch' && inputs.live_hf)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install core, test and HF reference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,hf-reference,tokenizer]"
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Dependency check
+        run: python -m pip check
+      - name: Live Hugging Face tests
+        env:
+          UZEN_LIVE_HF: "1"
+        run: python -m pytest tests/test_live_hf_import.py -q
 
   syntax:
     name: Syntax and import checks
