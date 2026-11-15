@@ -69,6 +69,34 @@ def test_torch_cpu_matches_numpy_for_every_family(family, spec):
         )
 
 
+def test_torch_windowed_alibi_attention_matches_numpy():
+    rng = np.random.default_rng(21)
+    values = {
+        "q": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+        "k": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+        "v": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+    }
+    g = Graph(
+        name="windowed-alibi",
+        inputs={
+            "q": TensorType.of((1, 2, 4, 2)),
+            "k": TensorType.of((1, 2, 4, 2)),
+            "v": TensorType.of((1, 2, 4, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "window": 2, "alibi_slopes": [0.25, 0.5], "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    package = WeightPackage.from_arrays({})
+    expected = execute(g, values, package).outputs["y"]
+    got = execute_torch(g, values, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
 def test_torch_clip_matches_numpy():
     g = Graph(name="clip", inputs={"x": TensorType.of((2, 3, 4))})
     g.add_node("clip", "clip", {"x": Ref("input:x")}, {"min": -0.5, "max": 0.75})

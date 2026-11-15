@@ -121,13 +121,13 @@ single-objective contract.
 | --- | --- |
 | Families (24, catalogue ordered simple→advanced): `linear_residual`, `gated_mlp`, `mlp`, `conv_residual`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `siamese`, `retrieval`, `set_transformer`, `vae`, `state_space`, `gnn`, `moe`, `diffusion`, `multimodal`, `hybrid`, `transformer_encoder`, `albert`, `bert`, `vit`, `perceiver`, `seq2seq`, `transformer_decoder` | implemented |
 | NIR operators (43): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, `clip`, reductions, activations including exact `gelu_exact` | implemented |
-| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX and the explicit Llama-like profile graphs; finite output validation, no KV cache |
-| Tokenizer-backed text inference | implemented for imported GPT-2/Llama/OPT artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
-| Greedy autoregressive generation | implemented; one real forward pass per token, explicit EOS or context-length stopping, no sampling and no KV cache |
+| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX and the explicit Llama-like profile graphs; finite output validation, optional in-memory K/V cache for RoPE decoder graphs |
+| Tokenizer-backed text inference | implemented for imported GPT-2/Llama/OPT/GPT-NeoX and explicit profile artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
+| Greedy autoregressive generation | implemented; cached single-token decoding for RoPE decoder graphs, full recomputation elsewhere; explicit EOS or context-length stopping; no sampling or beam search |
 | Weight-only modification with stored-graph preservation | implemented; parent graph metadata is copied to the modified artifact |
 | Source/candidate model output comparison | implemented; same-graph enforcement, recorded tolerances and per-output errors |
 | Per-layer activation capture | implemented; `capture="layers"` returns `l<N>_res2` block outputs, explicit NIR node ids are also accepted |
-| Logit parity for HF families | implemented for GPT-2/Llama/OPT/GPT-NeoX and live-verified Qwen2/OLMo; other Llama-like profiles are layout- and execution-tested but not claimed as live parity |
+| Logit parity for HF families | implemented for GPT-2/Llama/OPT/GPT-NeoX and live-verified Mistral/Qwen2/OLMo; other Llama-like profiles are layout- and execution-tested but not claimed as live parity |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
 | Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |

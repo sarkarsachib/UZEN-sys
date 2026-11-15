@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from uzen.core.nir.executor import KVCache, execute
 from uzen.core.wie.importer import ModelImporter
 from uzen.infrastructure.storage.safetensors_io import write_safetensors
 
@@ -82,6 +83,33 @@ def _write_llama(root: Path, *, rope_scaling: dict | None = None) -> tuple[Path,
     }
     (root / "config.json").write_text(json.dumps(config))
     return root, arrays
+
+
+def test_llama_kv_cache_decode_matches_full_forward(tmp_path):
+    root, _arrays = _write_llama(tmp_path / "llama-kv-cache")
+    result = ModelImporter().import_source(root)
+    assert result.reconstruction is not None
+    graph = result.reconstruction.definition.graph
+    package = result.artifact_package
+    tokens = np.array([[0, 1, 2, 3, 4]], dtype=np.int64)
+    positions = np.array([[0, 1, 2, 3, 4]], dtype=np.int64)
+
+    full = execute(graph, {"tokens": tokens, "positions": positions}, package).output("logits")
+    cache = KVCache()
+    execute(
+        graph,
+        {"tokens": tokens[:, :-1], "positions": positions[:, :-1]},
+        package,
+        cache=cache,
+    )
+    decode = execute(
+        graph,
+        {"tokens": tokens[:, -1:], "positions": positions[:, -1:]},
+        package,
+        cache=cache,
+    ).output("logits")
+    assert len(cache) == 1
+    np.testing.assert_allclose(decode[0, 0], full[0, -1], rtol=1e-6, atol=1e-7)
 
 
 def test_llama_gqa_reconstruction_validates_and_executes(tmp_path):

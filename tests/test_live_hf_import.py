@@ -415,6 +415,44 @@ def test_live_tiny_olmo_non_affine_norms_match_huggingface(tmp_path):
     assert parity["max_abs_error"] <= 1e-5
 
 
+def test_live_tiny_mistral_sliding_window_matches_huggingface(tmp_path):
+    """Verify the windowed Mistral path against a real checkpoint."""
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from transformers import AutoModelForCausalLM, MistralForCausalLM
+
+    repo_id = "hf-internal-testing/tiny-random-MistralForCausalLM"
+    model = MistralForCausalLM.from_pretrained(repo_id).eval()
+    local = tmp_path / "mistral"
+    model.save_pretrained(local, safe_serialization=True)
+
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.reconstruction["spec"]["profile"] == "mistral"
+    window = result.report.reconstruction["spec"]["sliding_window"]
+    assert window > 0
+    assert any(
+        node["op"] == "attention" and node.get("params", {}).get("window") == window
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+
+    parity = compare_llama_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+        model_cls=AutoModelForCausalLM,
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
 def test_live_tiny_neox_exact_gelu_matches_huggingface(tmp_path):
     """Verify the exact-GELU path against a real NeoX checkpoint.
 
@@ -594,6 +632,19 @@ def test_live_tiny_llama_greedy_generation(tmp_path):
         len(result["prompt_token_ids"]) + result["steps"]
     )
     assert isinstance(result["generated_text"], str)
+
+    # The cached path must select exactly the same tokens as full recomputation.
+    from uzen.core.wie import model_execution
+
+    original = model_execution._supports_kv_cache
+    model_execution._supports_kv_cache = lambda graph: False
+    try:
+        full = client.generate_text(
+            imported["artifact_id"], text="Hello", max_new_tokens=2
+        )
+    finally:
+        model_execution._supports_kv_cache = original
+    assert full["generated_token_ids"] == result["generated_token_ids"]
 
 
 def test_live_tiny_llama_modify_export_reload_roundtrip(tmp_path):

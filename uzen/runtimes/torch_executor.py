@@ -202,12 +202,22 @@ def _attention(inputs, params, bound):
     scale = params.get("scale", "auto")
     scale = 1.0 / float(np.sqrt(q.shape[-1])) if scale == "auto" else float(scale)
     scores = torch.einsum("bhtd,bhsd->bhts", q64, k64) * scale
-    if bool(params.get("causal", True)):
-        t, s = scores.shape[-2], scores.shape[-1]
-        if t != s:
-            raise InvalidOperationParameters(f"causal attention requires square scores, got {t} x {s}")
-        mask = torch.triu(torch.ones((t, s), dtype=torch.bool, device=scores.device), diagonal=1)
-        scores = scores.masked_fill(mask, float("-inf"))
+    causal = bool(params.get("causal", True))
+    t, s = scores.shape[-2], scores.shape[-1]
+    qpos = torch.arange(s - t, s, device=scores.device)[:, None]
+    kpos = torch.arange(s, device=scores.device)[None, :]
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        distances = (qpos - kpos) if causal else (qpos - kpos).abs()
+        slope_t = torch.as_tensor(slopes, dtype=torch.float64, device=scores.device)
+        scores = scores - slope_t[None, :, None, None] * distances[None, None, :, :]
+    mask = torch.zeros((t, s), dtype=torch.bool, device=scores.device)
+    if causal:
+        mask = mask | (kpos > qpos)
+    window = params.get("window")
+    if window is not None:
+        mask = mask | ((qpos - kpos).abs() > int(window))
+    scores = scores.masked_fill(mask[None, None, :, :], float("-inf"))
     m = scores.max(dim=-1, keepdim=True).values
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     e = torch.exp(scores - m)

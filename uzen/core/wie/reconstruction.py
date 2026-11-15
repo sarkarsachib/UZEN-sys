@@ -9,8 +9,9 @@ never become a validated artifact.
 GPT-2 uses learned position embeddings, pre-LayerNorm blocks, fused QKV, causal
 attention, GELU, and a tied LM head. Its Hugging Face Conv1D weights are
 transposed into the NIR linear convention, and those transforms are recorded per
-tensor. Llama uses separate Q/K/V/O projections, RMSNorm, SwiGLU, real RoPE, and
-GQA-aware K/V repetition. OPT uses a learned absolute position table with its
+tensor. Llama and its Mistral profile use separate Q/K/V/O projections, RMSNorm,
+SwiGLU, real RoPE, and GQA-aware K/V repetition; Mistral adds explicit
+sliding-window attention. OPT uses a learned absolute position table with its
 +2 offset, pre-LayerNorm blocks with biased LayerNorm and biased Q/K/V/O and MLP
 projections, and a ReLU feed-forward block. GPT-NeoX uses partial rotary
 embeddings over a fused, per-head-interleaved QKV projection and a parallel
@@ -853,11 +854,25 @@ def _llama_spec(
         raise ValueError("clip_qkv must be non-negative")
     if clip_qkv and not (profile is not None and profile.clip_qkv):
         raise ValueError("clip_qkv has no explicit mapping for this profile")
+    window_raw = config.get("sliding_window")
+    window = int(window_raw) if window_raw is not None else 0
+    if window < 0:
+        raise ValueError("sliding_window must be non-negative")
+    if window and not (profile is not None and profile.sliding_window):
+        raise ValueError("sliding_window has no explicit mapping for this profile")
     if config.get("rope_scaling") is not None:
         raise ValueError("rope_scaling is not implemented; no scaled-RoPE graph was guessed")
     activation = str(config.get("hidden_act") or "silu")
-    if activation != "silu":
-        raise ValueError(f"hidden_act='{activation}' is not supported; Llama adapter implements SwiGLU with silu")
+    if activation == "silu":
+        nir_activation = "silu"
+    elif activation == "gelu":
+        nir_activation = "gelu_exact"
+    else:
+        raise ValueError(f"hidden_act='{activation}' is not supported by the Llama-like adapter")
+    if nir_activation != "silu" and profile is None:
+        raise ValueError(
+            f"hidden_act='{activation}' is only mapped for an explicit family profile"
+        )
     norm_type = "layernorm" if profile is not None and profile.layer_norm else "rmsnorm"
     eps_default = (
         profile.norm_eps
@@ -888,11 +903,12 @@ def _llama_spec(
         "rope_theta": theta,
         "rotary_dim": rotary_dim,
         "clip_qkv": clip_qkv,
+        "sliding_window": window,
         "qkv_bias": qkv_bias,
         "o_bias": o_bias,
         "mlp_bias": mlp_bias,
         "norm_affine": norm_affine,
-        "activation": "silu",
+        "activation": nir_activation,
         "tie_embeddings": bool(config.get("tie_word_embeddings", False)),
     }
 
@@ -920,6 +936,7 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
     norm_op = "layernorm" if norm_type == "layernorm" else "rmsnorm"
     rotary_dim = int(spec.get("rotary_dim", head_dim))
     clip_qkv = float(spec.get("clip_qkv", 0.0))
+    sliding_window = int(spec.get("sliding_window", 0))
     g = Graph(name=f"{architecture}_L{layers}", metadata={"family": "transformer_decoder", "architecture": architecture, "spec": dict(spec)})
     g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
     g.add_input("positions", TensorType.of(("B", "T"), "int64"))
@@ -1032,11 +1049,14 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
             {"x": vh},
             {"n_heads": heads},
         )
+        attn_params: dict[str, Any] = {"causal": True, "scale": "auto"}
+        if sliding_window:
+            attn_params["window"] = sliding_window
         attn = g.add_node(
             f"l{layer}_attn",
             "attention",
             {"q": qr, "k": kr, "v": vr},
-            {"causal": True, "scale": "auto"},
+            attn_params,
         )
         merged = g.add_node(f"l{layer}_merge", "merge_heads", {"x": attn}, {"n_heads": heads})
         o_params = {"weight": f"param:{p}.o_proj.weight"}
@@ -1051,7 +1071,7 @@ def _build_llama_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
             norm2_params,
         )
         gate = g.add_node(f"l{layer}_gate", "linear", {"x": norm2}, mlp_params("gate"))
-        gate = g.add_node(f"l{layer}_silu", "silu", {"x": gate})
+        gate = g.add_node(f"l{layer}_act", str(spec.get("activation", "silu")), {"x": gate})
         up = g.add_node(f"l{layer}_up", "linear", {"x": norm2}, mlp_params("up"))
         gated = g.add_node(f"l{layer}_gated", "mul", {"a": gate, "b": up})
         down = g.add_node(f"l{layer}_down", "linear", {"x": gated}, mlp_params("down"))

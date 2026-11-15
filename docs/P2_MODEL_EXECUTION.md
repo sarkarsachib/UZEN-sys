@@ -120,9 +120,12 @@ The REST endpoint is `POST /v1/models/{artifact_id}/forward-text`, the CLI form 
 
 ## Greedy autoregressive generation
 
-`generate_text()` repeatedly executes the stored graph on the prompt plus every
-token generated so far, selecting the highest-logit token at the final position.
-This is deterministic greedy decoding, not sampling.
+`generate_text()` selects the highest-logit token at the final position. For
+decoder-only graphs without learned positional tables (Llama, Mistral, GPT-NeoX
+and the Llama-like profile graphs), it prefills the prompt once into an in-memory
+K/V cache and then runs one single-token decode per generated token. Graphs with
+learned position embeddings (GPT-2, OPT) fall back to full-sequence
+recomputation. This is deterministic greedy decoding, not sampling.
 
 ```python
 generated = client.generate_text(
@@ -224,8 +227,10 @@ MCP:
   adapters.
 * Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
   `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
-* There is no KV cache; each forward pass, including every generation step,
-  recomputes the supplied sequence.
+* The K/V cache is process-local and generation-scoped; it is not a paged or
+  disk-backed cache, and cached decoding is limited to decoder self-attention
+  graphs whose positions are carried by RoPE or explicit inputs. Cross-attention
+  graphs are not cached.
 * Generation is greedy only; sampling, beam search and temperature controls are
   not implemented.
 * Prompt and generated tokens are limited to the graph's stored maximum sequence

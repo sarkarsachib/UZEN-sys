@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from uzen.core.nir.executor import execute
+from uzen.core.nir.executor import KVCache, execute
 from uzen.core.nir.graph import Graph
 from uzen.core.nws.tensors import WeightPackage
 from uzen.core.wie.tokenization import (
@@ -215,6 +215,7 @@ def execute_stored_model(
     tokens: Sequence[Sequence[int]],
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
     capture: Sequence[str] | str | None = None,
+    cache: KVCache | None = None,
 ) -> ModelExecution:
     graph = graph_from_manifest(manifest)
     inputs = _causal_inputs(graph, tokens, positions)
@@ -226,7 +227,7 @@ def execute_stored_model(
             errors=list(validation.errors),
         )
     result = execute(
-        graph, inputs, package, capture=capture_ids, validate_types=True
+        graph, inputs, package, capture=capture_ids, validate_types=True, cache=cache
     )
     return ModelExecution(
         artifact_id=artifact_id,
@@ -236,6 +237,19 @@ def execute_stored_model(
         intermediates=dict(result.intermediates),
         num_ops=result.num_ops,
     )
+
+
+def _supports_kv_cache(graph: Graph) -> bool:
+    """Cache only decoder-only graphs whose positions are carried by RoPE or inputs."""
+    saw_attention = False
+    for node in graph.nodes.values():
+        if node.op == "pos_embedding":
+            return False
+        if node.op == "attention":
+            saw_attention = True
+            if not bool(node.params.get("causal", True)):
+                return False
+    return saw_attention
 
 
 def _max_sequence_length(graph: Graph, package: WeightPackage) -> int | None:
@@ -282,11 +296,13 @@ def greedy_generate(
     eos_token_id: int | None = None,
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
 ) -> ModelGeneration:
-    """Generate tokens greedily from repeated real forward passes.
+    """Generate tokens greedily from real forward passes.
 
-    The graph is executed once per generated token. This is deliberately simple:
-    there is no KV cache and no sampling. Generation stops on EOS, the requested
-    token budget, or the graph's declared maximum sequence length.
+    Decoder-only graphs without learned positional tables use an in-memory K/V
+    cache: one prefill pass plus one single-token decode per generated token.
+    Other graphs fall back to full-sequence recomputation. Generation stops on
+    EOS, the requested token budget, or the graph's declared maximum sequence
+    length.
     """
     if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 1:
         raise InvalidOperationParameters("max_new_tokens must be a positive integer")
@@ -312,6 +328,25 @@ def greedy_generate(
 
     generated: list[int] = []
     stopped_reason = "max_new_tokens"
+    cache = KVCache() if _supports_kv_cache(graph) else None
+    logits: np.ndarray | None = None
+
+    if cache is not None:
+        prefill = execute_stored_model(
+            package,
+            manifest,
+            artifact_id=artifact_id,
+            tokens=[ids],
+            positions=[position_row] if position_row is not None else None,
+            cache=cache,
+        )
+        logits = prefill.output("logits")
+        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != len(ids):
+            raise InvalidOperationParameters(
+                "prefill logits must have shape (1, sequence, vocabulary), got "
+                f"{list(logits.shape)}"
+            )
+
     while len(generated) < max_new_tokens:
         if max_sequence_length is not None and len(ids) >= max_sequence_length:
             stopped_reason = "max_sequence_length"
@@ -323,19 +358,20 @@ def greedy_generate(
         ):
             stopped_reason = "max_sequence_length"
             break
-        execution = execute_stored_model(
-            package,
-            manifest,
-            artifact_id=artifact_id,
-            tokens=[ids],
-            positions=[position_row] if position_row is not None else None,
-        )
-        logits = execution.output("logits")
-        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != len(ids):
-            raise InvalidOperationParameters(
-                "logits must have shape (1, sequence, vocabulary), got "
-                f"{list(logits.shape)}"
+        if logits is None:
+            execution = execute_stored_model(
+                package,
+                manifest,
+                artifact_id=artifact_id,
+                tokens=[ids],
+                positions=[position_row] if position_row is not None else None,
             )
+            logits = execution.output("logits")
+            if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != len(ids):
+                raise InvalidOperationParameters(
+                    "logits must have shape (1, sequence, vocabulary), got "
+                    f"{list(logits.shape)}"
+                )
         last_logits = logits[0, -1, :]
         if not np.isfinite(last_logits).all():
             raise TensorInvalid("greedy generation received non-finite logits")
@@ -347,6 +383,29 @@ def greedy_generate(
         if resolved_eos is not None and next_token == resolved_eos:
             stopped_reason = "eos_token"
             break
+        if len(generated) >= max_new_tokens:
+            break
+        if cache is not None:
+            # Feed the newly appended token through the model once; the cache
+            # already holds the prompt's and earlier tokens' K/V tensors.
+            decode_position = position_row[-1] if position_row is not None else len(ids) - 1
+            decode = execute_stored_model(
+                package,
+                manifest,
+                artifact_id=artifact_id,
+                tokens=[[next_token]],
+                positions=[[decode_position]],
+                cache=cache,
+            )
+            logits = decode.output("logits")
+            if logits.ndim != 3 or logits.shape != (1, 1, int(logits.shape[-1])):
+                raise InvalidOperationParameters(
+                    "cached decode logits must have shape (1, 1, vocabulary), got "
+                    f"{list(logits.shape)}"
+                )
+        else:
+            # Force a full-sequence recomputation for the next token.
+            logits = None
 
     generated_tokens = tuple(str(tokenizer.id_to_token(token) or "") for token in generated)
     return ModelGeneration(

@@ -25,6 +25,7 @@ class HFProfile:
     norm_eps: float | None = None
     partial_rotary: bool = False
     clip_qkv: bool = False
+    sliding_window: bool = False
     reason: str = ""
 
 
@@ -53,11 +54,7 @@ _PROFILES = (
     HFProfile("minicpm", ("MiniCPMForCausalLM",), True, partial_rotary=True),
     HFProfile("orion", ("OrionForCausalLM",), True),
     # Explicit import profiles: recognized, but no graph is guessed.
-    HFProfile(
-        "mistral",
-        ("MistralForCausalLM",),
-        reason="sliding-window attention is not implemented; no unwindowed graph is substituted",
-    ),
+    HFProfile("mistral", ("MistralForCausalLM",), True, sliding_window=True),
     HFProfile(
         "gemma",
         ("GemmaForCausalLM",),

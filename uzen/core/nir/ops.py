@@ -530,7 +530,26 @@ def _attention_infer(inputs, params, bound):
         raise ShapeMismatch("attention: q/k head_dim mismatch")
     if k.shape[-2] != v.shape[-2]:
         raise ShapeMismatch("attention: k/v sequence length mismatch")
+    window = params.get("window")
+    if window is not None and int(window) <= 0:
+        raise InvalidOperationParameters("attention window must be a positive integer")
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        if not isinstance(slopes, (list, tuple)) or not slopes:
+            raise InvalidOperationParameters("attention alibi_slopes must be a non-empty list")
+        if len(slopes) != int(q.shape[1]):
+            raise InvalidOperationParameters(
+                f"attention alibi_slopes has {len(slopes)} entries for {q.shape[1]} heads"
+            )
+        if not all(float(s) > 0 for s in slopes):
+            raise InvalidOperationParameters("attention alibi slopes must be positive")
     return [TensorType(tuple(q.shape), _float_dtype(q, k, v))]
+
+
+def _attention_positions(t: int, s: int) -> tuple[np.ndarray, np.ndarray]:
+    # Query positions are the last ``t`` positions, which also makes cached
+    # one-token decoding use the correct absolute distance for masks and ALiBi.
+    return np.arange(s - t, s)[:, None], np.arange(s)[None, :]
 
 
 def _attention_run(inputs, params, bound):
@@ -539,14 +558,19 @@ def _attention_run(inputs, params, bound):
     scale = 1.0 / np.sqrt(q.shape[-1]) if scale == "auto" else float(scale)
     scores = np.einsum("bhtd,bhsd->bhts", q, k) * scale
     causal = bool(params.get("causal", True))
+    t, s = scores.shape[-2], scores.shape[-1]
+    qpos, kpos = _attention_positions(t, s)
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        distance = (qpos - kpos) if causal else np.abs(qpos - kpos)
+        scores = scores - np.asarray(slopes, dtype=np.float64)[None, :, None, None] * distance[None, None, :, :]
+    mask = np.zeros((t, s), dtype=bool)
     if causal:
-        t, s = scores.shape[-2], scores.shape[-1]
-        if t != s:
-            raise InvalidOperationParameters(
-                f"causal attention requires square scores, got {t} x {s}"
-            )
-        mask = np.triu(np.ones((t, s), dtype=bool), k=1)
-        scores = np.where(mask, -np.inf, scores)
+        mask |= kpos > qpos
+    window = params.get("window")
+    if window is not None:
+        mask |= np.abs(qpos - kpos) > int(window)
+    scores = np.where(mask[None, None, :, :], -np.inf, scores)
     m = np.max(scores, axis=-1, keepdims=True)
     m = np.where(np.isfinite(m), m, 0.0)
     e = np.exp(scores - m)

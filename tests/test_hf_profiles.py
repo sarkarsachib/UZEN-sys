@@ -120,12 +120,17 @@ def test_stablelm_is_not_mapped_to_rmsnorm_swiglu():
     assert "LayerNorm" in result.report.reasons[0]
 
 
-def test_sliding_window_mistral_is_reported_unsupported_not_unwindowed():
+def test_mistral_sliding_window_is_mapped_into_attention():
     profile = hf_profile_for("mistral")
-    assert profile is not None and not profile.reconstruct
+    assert profile is not None and profile.reconstruct
     arrays, config = _llama_like_arrays()
     config["model_type"] = "mistral"
     config["architectures"] = ["MistralForCausalLM"]
+    config["sliding_window"] = 2
     result = reconstruct_hf_model(arrays, config)
-    assert result.report.status == "unsupported"
-    assert "sliding-window" in result.report.reasons[0]
+    assert result.report.status == "validated", result.report.reasons
+    assert result.report.spec["sliding_window"] == 2
+    assert any(
+        node["op"] == "attention" and node.get("params", {}).get("window") == 2
+        for node in result.report.graph["nodes"]
+    )

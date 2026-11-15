@@ -94,6 +94,76 @@ def test_exact_gelu_matches_erf_and_differs_from_the_tanh_approximation():
     assert not np.allclose(_gelu(x), got, rtol=0, atol=1e-6)
 
 
+def test_attention_window_masks_keys_outside_the_window():
+    rng = np.random.default_rng(11)
+    q = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    k = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    v = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    g = Graph(
+        name="windowed_attention",
+        inputs={
+            "q": TensorType.of((1, 1, 4, 2)),
+            "k": TensorType.of((1, 1, 4, 2)),
+            "v": TensorType.of((1, 1, 4, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "window": 1, "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    got = execute(g, {"q": q, "k": k, "v": v}, WeightPackage.from_arrays({})).outputs["y"]
+
+    scores = np.einsum("bhtd,bhsd->bhts", q.astype(np.float64), k.astype(np.float64)) / np.sqrt(2.0)
+    qpos = np.arange(4)[:, None]
+    kpos = np.arange(4)[None, :]
+    mask = (kpos > qpos) | (np.abs(qpos - kpos) > 1)
+    scores = np.where(mask[None, None], -np.inf, scores)
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.einsum("bhts,bhsd->bhtd", probs, v.astype(np.float64))
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_attention_alibi_bias_uses_per_head_distance_slopes():
+    rng = np.random.default_rng(12)
+    q = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    k = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    v = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    slopes = [0.25, 0.5]
+    g = Graph(
+        name="alibi_attention",
+        inputs={
+            "q": TensorType.of((1, 2, 3, 2)),
+            "k": TensorType.of((1, 2, 3, 2)),
+            "v": TensorType.of((1, 2, 3, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "alibi_slopes": slopes, "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    got = execute(g, {"q": q, "k": k, "v": v}, WeightPackage.from_arrays({})).outputs["y"]
+
+    scores = np.einsum("bhtd,bhsd->bhts", q.astype(np.float64), k.astype(np.float64)) / np.sqrt(2.0)
+    qpos = np.arange(3)[:, None]
+    kpos = np.arange(3)[None, :]
+    distance = qpos - kpos
+    scores -= np.asarray(slopes)[None, :, None, None] * distance[None, None]
+    scores = np.where((kpos > qpos)[None, None], -np.inf, scores)
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.einsum("bhts,bhsd->bhtd", probs, v.astype(np.float64))
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
 def test_new_kernels_are_registered_as_implemented():
     for name in ("select", "moe", "ssm", "gcn", "sample_normal", "add_noise"):
         assert OPERATORS[name].maturity.value == "implemented"
