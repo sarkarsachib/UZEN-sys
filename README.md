@@ -36,10 +36,10 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
-| GPT-2 and Llama HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and GPT-2/Llama reference-logit parity | **implemented for the explicit GPT-2 and Llama adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; other architectures are reported `unsupported`** |
-| Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama graphs; per-output tolerances and error metrics) |
+| GPT-2, Llama and OPT HF-to-NIR reconstruction with tensor/config consistency, graph validation, finite forward execution, and reference-logit parity | **implemented for the explicit GPT-2, Llama and OPT adapters; Llama includes RoPE, GQA-aware KV repetition, RMSNorm and SwiGLU; OPT includes the +2 offset position table, biased LayerNorm/Q/K/V/O/MLP projections and ReLU; other architectures are reported `unsupported`** |
+| Execute stored reconstructed model graphs and compare weight-modified artifacts on identical inputs | **implemented** (stored GPT-2/Llama/OPT graphs; per-output tolerances and error metrics) |
 | Per-layer activation capture and Hugging Face block-output parity | **implemented** (`capture="layers"` exposes `l<N>_res2` outputs; transformer forward hooks compare every layer, not just logits) |
-| Tokenizer-backed text inference for imported GPT-2/Llama artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
+| Tokenizer-backed text inference for imported GPT-2/Llama/OPT artifacts | **implemented** (`tokenizer.json` stored by SHA-256; real `tokenizers` encoding, optional `uzen[tokenizer]` extra) |
 | Greedy autoregressive text generation | **implemented** (real per-step forward passes; EOS and context-length stopping; no sampling or KV cache) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
@@ -204,8 +204,8 @@ uzen/
 
 Live Hugging Face validation is opt-in: set the `UZEN_RUN_LIVE_HF` repository
 variable to `1`, or dispatch the CI workflow with `live_hf`, to run
-`UZEN_LIVE_HF=1 pytest tests/test_live_hf_import.py` against the tiny GPT-2 and
-Llama fixtures.
+`UZEN_LIVE_HF=1 pytest tests/test_live_hf_import.py` against the tiny GPT-2,
+Llama and OPT fixtures.
 
 The suite exercises the 15 mandatory acceptance tests against real implementations:
 real tensor arithmetic, real SVD, real alignment refusals, real policy rejection, real

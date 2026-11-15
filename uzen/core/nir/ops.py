@@ -191,6 +191,18 @@ def _embedding_run(inputs, params, bound):
 def _pos_embedding_infer(inputs, params, bound):
     x = inputs[0]
     w = _require_bound(bound, str(params.get("weight", "weight")).replace("param:", ""), "pos_embedding")
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    t = x.shape[1]
+    if (
+        isinstance(t, int)
+        and isinstance(w.shape[0], int)
+        and offset + t > w.shape[0]
+    ):
+        raise ShapeMismatch(
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
+        )
     return [_same(x.shape, _float_dtype(x, w))]
 
 
@@ -200,11 +212,14 @@ def _pos_embedding_run(inputs, params, bound):
     if x.ndim < 3:
         raise InvalidOperationParameters(f"pos_embedding expects (batch, seq, dim), got {x.shape}")
     t = x.shape[1]
-    if t > w.shape[0]:
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    if offset + t > w.shape[0]:
         raise ShapeMismatch(
-            f"sequence length {t} exceeds positional embedding table size {w.shape[0]}"
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
         )
-    return [x + w[:t].reshape((1, t) + tuple(x.shape[2:]))]
+    return [x + w[offset : offset + t].reshape((1, t) + tuple(x.shape[2:]))]
 
 
 def _layernorm_infer(inputs, params, bound):

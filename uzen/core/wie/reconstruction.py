@@ -10,7 +10,10 @@ GPT-2 uses learned position embeddings, pre-LayerNorm blocks, fused QKV, causal
 attention, GELU, and a tied LM head. Its Hugging Face Conv1D weights are
 transposed into the NIR linear convention, and those transforms are recorded per
 tensor. Llama uses separate Q/K/V/O projections, RMSNorm, SwiGLU, real RoPE, and
-GQA-aware K/V repetition; those mappings and graph nodes are likewise explicit.
+GQA-aware K/V repetition. OPT uses a learned absolute position table with its
++2 offset, pre-LayerNorm blocks with biased LayerNorm and biased Q/K/V/O and MLP
+projections, and a ReLU feed-forward block. Those mappings and graph nodes are
+explicit for every adapter.
 """
 
 from __future__ import annotations
@@ -122,6 +125,16 @@ def reconstruct_hf_model(
     architecture = architectures[0] if architectures else (model_type or None)
     if model_type == "llama":
         return _reconstruct_llama(
+            arrays,
+            config,
+            architecture=architecture,
+            source_dtypes=source_dtypes,
+            name=name,
+            source_hash=source_hash,
+            on_progress=on_progress,
+        )
+    if model_type == "opt":
+        return _reconstruct_opt(
             arrays,
             config,
             architecture=architecture,
@@ -1052,3 +1065,562 @@ def _execute_llama(
         }
     except Exception as exc:
         return {"status": "failed", "message": str(exc), "inputs": {k: list(v.shape) for k, v in inputs.items()}}
+
+
+# --------------------------------------------------------------------------- #
+# OPT adapter: learned absolute positions (+2 offset), pre-LN, biased linears
+# --------------------------------------------------------------------------- #
+
+
+def _reconstruct_opt(
+    arrays: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    architecture: str | None,
+    source_dtypes: Mapping[str, str] | None,
+    name: str | None,
+    source_hash: str | None,
+    on_progress: Any | None = None,
+) -> ReconstructionResult:
+    progress: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    warnings: list[str] = []
+    missing: list[str] = []
+    extra: list[str] = []
+    shape_errors: list[str] = []
+    reasons: list[str] = []
+
+    def step(stage: str, status: str, message: str) -> None:
+        progress.append({"stage": stage, "status": status, "message": message})
+        if on_progress is not None:
+            on_progress(stage, status, message)
+
+    try:
+        spec = _opt_spec(config, warnings)
+    except ValueError as exc:
+        step("config", "unsupported", str(exc))
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[str(exc)],
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[str(exc)],
+            )
+        )
+    step("config", "complete", "OPT configuration validated against the supported adapter")
+
+    definition = _build_opt_definition(spec)
+    step("architecture", "complete", "explicit OPT NIR graph with offset positions and biased projections built")
+    canonical, mapping, missing, extra, shape_errors, unresolved = _opt_tensors(
+        arrays, spec, definition, unresolved
+    )
+    step(
+        "tensor_mapping",
+        "complete" if not missing and not shape_errors else "failed",
+        f"mapped {len(mapping)} tensors; {len(missing)} missing, {len(shape_errors)} shape errors, "
+        f"{len(extra)} unmapped source tensors",
+    )
+    if missing or shape_errors:
+        reasons.append("all OPT NIR parameters must be present with expected shapes; none are invented")
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    package = WeightPackage.from_arrays(
+        canonical,
+        name=name or "opt_model",
+        family="transformer_decoder",
+        family_spec=spec,
+        metadata={
+            "reconstruction": {
+                "architecture": architecture,
+                "adapter": "opt",
+                "source_hash": source_hash,
+                "tensor_mapping": mapping,
+                "graph": definition.graph.to_dict(),
+            },
+            "source_hash": source_hash,
+        },
+        source_dtypes={
+            target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
+            for target, item in ((m["target"], m) for m in mapping)
+        },
+    )
+    validation = definition.graph.validate(package)
+    validation_doc = {
+        "ok": validation.ok,
+        "errors": list(validation.errors),
+        "warnings": list(validation.warnings),
+        "num_nodes": validation.num_nodes,
+        "num_params": validation.num_params,
+        "param_names": list(validation.param_names),
+        "order": list(validation.order),
+    }
+    step(
+        "graph_validation",
+        "complete" if validation.ok else "failed",
+        f"graph validation {'passed' if validation.ok else 'failed'} with {validation.num_nodes} nodes",
+    )
+    if not validation.ok:
+        reasons.append("OPT graph validation failed; no validated artifact should be published")
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="failed",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=definition.graph.to_dict(),
+                graph_summary=definition.graph.summary(),
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=validation_doc,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    execution = _execute_opt(definition, package, spec)
+    step(
+        "forward_execution",
+        execution.get("status", "failed"),
+        execution.get("message", "forward pass completed"),
+    )
+    if extra:
+        unresolved.append(
+            "source tensors not represented by the OPT graph: " + ", ".join(extra[:12])
+        )
+    status = "validated" if execution.get("status") == "passed" and not extra and not unresolved else "partial"
+    if execution.get("status") != "passed":
+        status = "failed"
+        reasons.append("OPT forward execution failed; the graph is not marked validated")
+    elif status == "partial":
+        reasons.append("OPT graph executes, but some source tensors remain unresolved")
+    else:
+        reasons.append("all OPT tensors mapped, graph validated, and forward execution produced finite logits")
+    report = ReconstructionReport(
+        status=status,
+        architecture=architecture,
+        family="transformer_decoder",
+        spec=spec,
+        graph=definition.graph.to_dict(),
+        graph_summary=definition.graph.summary(),
+        tensor_mapping=mapping,
+        missing=missing,
+        extra=extra,
+        shape_errors=shape_errors,
+        unresolved=unresolved,
+        warnings=warnings,
+        validation=validation_doc,
+        execution=execution,
+        source_tensor_count=len(arrays),
+        mapped_tensor_count=len(canonical),
+        progress=progress,
+        reasons=reasons,
+    )
+    if status == "failed":
+        return ReconstructionResult(report=report, package=None, definition=definition)
+    return ReconstructionResult(report=report, package=package, definition=definition)
+
+
+def _opt_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]:
+    try:
+        d_model = int(config["hidden_size"])
+        n_heads = int(config["num_attention_heads"])
+        n_layers = int(config["num_hidden_layers"])
+        d_ff = int(config["ffn_dim"])
+        vocab_size = int(config["vocab_size"])
+        max_seq = int(config["max_position_embeddings"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"OPT configuration is missing a required integer field: {exc}") from exc
+    if min(d_model, n_heads, n_layers, d_ff, vocab_size, max_seq) <= 0:
+        raise ValueError("OPT dimensions, layers, vocabulary and context length must be positive")
+    if d_model % n_heads != 0:
+        raise ValueError(f"hidden_size={d_model} is not divisible by num_attention_heads={n_heads}")
+    word_embed_proj_dim = int(config.get("word_embed_proj_dim") or d_model)
+    if word_embed_proj_dim != d_model:
+        raise ValueError(
+            "word_embed_proj_dim differs from hidden_size; OPT project_in/project_out "
+            "are not implemented"
+        )
+    if config.get("do_layer_norm_before") is False:
+        raise ValueError("do_layer_norm_before=false is not represented by this OPT adapter")
+    if config.get("_remove_final_layer_norm"):
+        raise ValueError("_remove_final_layer_norm=true is not represented by this OPT adapter")
+    if config.get("scale_embedding"):
+        raise ValueError("scale_embedding=true is not represented by this OPT adapter")
+    activation = str(config.get("activation_function") or "relu")
+    if activation != "relu":
+        raise ValueError(
+            f"activation_function='{activation}' is not supported; this OPT adapter implements relu"
+        )
+    eps = float(config.get("layer_norm_eps") or 1e-5)
+    if eps <= 0:
+        raise ValueError("layer_norm_eps must be positive")
+    if config.get("attention_dropout"):
+        warnings.append("attention_dropout is a training-time setting; inference omits it")
+    if config.get("dropout"):
+        warnings.append("dropout is a training-time setting; inference omits it")
+    if config.get("layerdrop"):
+        warnings.append("layerdrop is a training-time setting; inference omits it")
+    return {
+        "architecture": "opt",
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "head_dim": d_model // n_heads,
+        "n_layers": n_layers,
+        "d_ff": d_ff,
+        "vocab_size": vocab_size,
+        "max_seq_len": max_seq,
+        "pos_table_size": max_seq + 2,
+        "position_offset": 2,
+        "norm": "layernorm",
+        "layer_norm_eps": eps,
+        "activation": "relu",
+        "tie_embeddings": True
+        if config.get("tie_word_embeddings") is None
+        else bool(config.get("tie_word_embeddings")),
+    }
+
+
+def _build_opt_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
+    d = int(spec["d_model"])
+    heads = int(spec["n_heads"])
+    head_dim = int(spec["head_dim"])
+    layers = int(spec["n_layers"])
+    ffn = int(spec["d_ff"])
+    vocab = int(spec["vocab_size"])
+    table = int(spec["pos_table_size"])
+    offset = int(spec["position_offset"])
+    eps = float(spec["layer_norm_eps"])
+    g = Graph(
+        name=f"opt_L{layers}",
+        metadata={"family": "transformer_decoder", "architecture": "opt", "spec": dict(spec)},
+    )
+    g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+    sh: dict[str, tuple[int, ...]] = {
+        "embed.weight": (vocab, d),
+        "pos_embed.weight": (table, d),
+        "lm_head.weight": (vocab, d),
+    }
+    cur = g.add_node("embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"})
+    cur = g.add_node(
+        "pos",
+        "pos_embedding",
+        {"x": cur},
+        {"weight": "param:pos_embed.weight", "offset": offset},
+    )
+
+    def split_heads(x: Ref, layer: int, name: str) -> Ref:
+        reshaped = g.add_node(
+            f"l{layer}_{name}_reshape",
+            "reshape",
+            {"x": x},
+            {"shape": ["B", "T", heads, head_dim]},
+        )
+        return g.add_node(
+            f"l{layer}_{name}_heads",
+            "transpose",
+            {"x": reshaped},
+            {"perm": [0, 2, 1, 3]},
+        )
+
+    for layer in range(layers):
+        p = f"layers.{layer}"
+        sh[f"{p}.ln1.weight"] = (d,)
+        sh[f"{p}.ln1.bias"] = (d,)
+        sh[f"{p}.q_proj.weight"] = (d, d)
+        sh[f"{p}.q_proj.bias"] = (d,)
+        sh[f"{p}.k_proj.weight"] = (d, d)
+        sh[f"{p}.k_proj.bias"] = (d,)
+        sh[f"{p}.v_proj.weight"] = (d, d)
+        sh[f"{p}.v_proj.bias"] = (d,)
+        sh[f"{p}.attn_out.weight"] = (d, d)
+        sh[f"{p}.attn_out.bias"] = (d,)
+        sh[f"{p}.ln2.weight"] = (d,)
+        sh[f"{p}.ln2.bias"] = (d,)
+        sh[f"{p}.mlp_up.weight"] = (ffn, d)
+        sh[f"{p}.mlp_up.bias"] = (ffn,)
+        sh[f"{p}.mlp_down.weight"] = (d, ffn)
+        sh[f"{p}.mlp_down.bias"] = (d,)
+
+        ln1 = g.add_node(
+            f"l{layer}_ln1",
+            "layernorm",
+            {"x": cur},
+            {
+                "weight": f"param:{p}.ln1.weight",
+                "bias": f"param:{p}.ln1.bias",
+                "eps": eps,
+            },
+        )
+        q = g.add_node(
+            f"l{layer}_q_proj",
+            "linear",
+            {"x": ln1},
+            {"weight": f"param:{p}.q_proj.weight", "bias": f"param:{p}.q_proj.bias"},
+        )
+        k = g.add_node(
+            f"l{layer}_k_proj",
+            "linear",
+            {"x": ln1},
+            {"weight": f"param:{p}.k_proj.weight", "bias": f"param:{p}.k_proj.bias"},
+        )
+        v = g.add_node(
+            f"l{layer}_v_proj",
+            "linear",
+            {"x": ln1},
+            {"weight": f"param:{p}.v_proj.weight", "bias": f"param:{p}.v_proj.bias"},
+        )
+        qh = split_heads(q, layer, "q")
+        kh = split_heads(k, layer, "k")
+        vh = split_heads(v, layer, "v")
+        attn = g.add_node(
+            f"l{layer}_attn",
+            "attention",
+            {"q": qh, "k": kh, "v": vh},
+            {"causal": True, "scale": "auto"},
+        )
+        merged = g.add_node(f"l{layer}_merge", "merge_heads", {"x": attn}, {"n_heads": heads})
+        proj = g.add_node(
+            f"l{layer}_attn_out",
+            "linear",
+            {"x": merged},
+            {"weight": f"param:{p}.attn_out.weight", "bias": f"param:{p}.attn_out.bias"},
+        )
+        cur = g.add_node(f"l{layer}_res1", "add", {"a": cur, "b": proj})
+        ln2 = g.add_node(
+            f"l{layer}_ln2",
+            "layernorm",
+            {"x": cur},
+            {
+                "weight": f"param:{p}.ln2.weight",
+                "bias": f"param:{p}.ln2.bias",
+                "eps": eps,
+            },
+        )
+        up = g.add_node(
+            f"l{layer}_mlp_up",
+            "linear",
+            {"x": ln2},
+            {"weight": f"param:{p}.mlp_up.weight", "bias": f"param:{p}.mlp_up.bias"},
+        )
+        act = g.add_node(f"l{layer}_act", "relu", {"x": up})
+        down = g.add_node(
+            f"l{layer}_mlp_down",
+            "linear",
+            {"x": act},
+            {"weight": f"param:{p}.mlp_down.weight", "bias": f"param:{p}.mlp_down.bias"},
+        )
+        cur = g.add_node(f"l{layer}_res2", "add", {"a": cur, "b": down})
+
+    sh["ln_f.weight"] = (d,)
+    sh["ln_f.bias"] = (d,)
+    final = g.add_node(
+        "ln_f",
+        "layernorm",
+        {"x": cur},
+        {"weight": "param:ln_f.weight", "bias": "param:ln_f.bias", "eps": eps},
+    )
+    logits = g.add_node(
+        "lm_head",
+        "linear",
+        {"x": final},
+        {"weight": "param:lm_head.weight"},
+    )
+    g.set_output("logits", logits)
+    g.set_output("hidden", final)
+    return ArchitectureDefinition(
+        family="transformer_decoder",
+        spec=dict(spec),
+        graph=g,
+        parameter_shapes=sh,
+        default_inputs={"tokens": ("B", "T")},
+        input_dtypes={"tokens": "int64"},
+    )
+
+
+def _opt_tensors(
+    arrays: Mapping[str, np.ndarray],
+    spec: Mapping[str, Any],
+    definition: ArchitectureDefinition,
+    unresolved: list[str],
+) -> tuple[
+    dict[str, np.ndarray],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    expected = dict(definition.parameter_shapes)
+    canonical: dict[str, np.ndarray] = {}
+    mapping: list[dict[str, Any]] = []
+    missing: list[str] = []
+    shape_errors: list[str] = []
+    used: set[str] = set()
+    tie = bool(spec["tie_embeddings"])
+
+    def add(target: str, source: str | None, transform: str = "identity", note: str = "") -> None:
+        if target not in expected:
+            shape_errors.append(f"adapter produced unexpected target '{target}'")
+            return
+        if source is None or source not in arrays:
+            missing.append(target)
+            mapping.append(
+                {
+                    "target": target,
+                    "source": source,
+                    "transform": transform,
+                    "status": "missing",
+                    "expected_shape": list(expected[target]),
+                    "note": note,
+                }
+            )
+            return
+        arr = arrays[source]
+        shape = [int(d) for d in arr.shape]
+        status = "mapped"
+        if tuple(shape) != tuple(expected[target]):
+            status = "shape_error"
+            shape_errors.append(
+                f"{target}: source {source} shape {shape} != expected {list(expected[target])}"
+            )
+        if status == "mapped":
+            canonical[target] = np.ascontiguousarray(arr)
+            used.add(source)
+        mapping.append(
+            {
+                "target": target,
+                "source": source,
+                "transform": transform,
+                "status": status,
+                "source_shape": shape,
+                "expected_shape": list(expected[target]),
+                "dtype": dtype_name(arr.dtype),
+                "note": note,
+            }
+        )
+
+    add("embed.weight", "model.decoder.embed_tokens.weight")
+    add(
+        "pos_embed.weight",
+        "model.decoder.embed_positions.weight",
+        note="OPT position table includes the +2 position offset",
+    )
+    add("ln_f.weight", "model.decoder.final_layer_norm.weight")
+    add("ln_f.bias", "model.decoder.final_layer_norm.bias")
+    embed = arrays.get("model.decoder.embed_tokens.weight")
+    lm_head = arrays.get("lm_head.weight")
+    if tie:
+        if lm_head is not None:
+            if embed is not None and lm_head.shape == embed.shape and not np.array_equal(lm_head, embed):
+                unresolved.append(
+                    "tied embed_tokens/lm_head tensors differ; no tied OPT graph is claimed"
+                )
+            add("lm_head.weight", "lm_head.weight", note="tied LM head")
+        else:
+            add(
+                "lm_head.weight",
+                "model.decoder.embed_tokens.weight",
+                "tied_embedding",
+                "LM head tied to the word embedding",
+            )
+    else:
+        add("lm_head.weight", "lm_head.weight")
+
+    for layer in range(int(spec["n_layers"])):
+        src = f"model.decoder.layers.{layer}"
+        dst = f"layers.{layer}"
+        add(f"{dst}.ln1.weight", f"{src}.self_attn_layer_norm.weight")
+        add(f"{dst}.ln1.bias", f"{src}.self_attn_layer_norm.bias")
+        add(f"{dst}.q_proj.weight", f"{src}.self_attn.q_proj.weight")
+        add(f"{dst}.q_proj.bias", f"{src}.self_attn.q_proj.bias")
+        add(f"{dst}.k_proj.weight", f"{src}.self_attn.k_proj.weight")
+        add(f"{dst}.k_proj.bias", f"{src}.self_attn.k_proj.bias")
+        add(f"{dst}.v_proj.weight", f"{src}.self_attn.v_proj.weight")
+        add(f"{dst}.v_proj.bias", f"{src}.self_attn.v_proj.bias")
+        add(f"{dst}.attn_out.weight", f"{src}.self_attn.out_proj.weight")
+        add(f"{dst}.attn_out.bias", f"{src}.self_attn.out_proj.bias")
+        add(f"{dst}.ln2.weight", f"{src}.final_layer_norm.weight")
+        add(f"{dst}.ln2.bias", f"{src}.final_layer_norm.bias")
+        add(f"{dst}.mlp_up.weight", f"{src}.fc1.weight")
+        add(f"{dst}.mlp_up.bias", f"{src}.fc1.bias")
+        add(f"{dst}.mlp_down.weight", f"{src}.fc2.weight")
+        add(f"{dst}.mlp_down.bias", f"{src}.fc2.bias")
+
+    extra = sorted(set(arrays) - used)
+    for tensor_name in extra:
+        unresolved.append(f"source tensor '{tensor_name}' is not represented by the OPT graph")
+    return canonical, mapping, sorted(set(missing)), extra, shape_errors, unresolved
+
+
+def _execute_opt(
+    definition: ArchitectureDefinition, package: WeightPackage, spec: Mapping[str, Any]
+) -> dict[str, Any]:
+    seq = min(4, int(spec["max_seq_len"]))
+    tokens = np.arange(seq, dtype=np.int64).reshape(1, seq)
+    inputs = {"tokens": tokens}
+    try:
+        result = execute(definition.graph, inputs, package, check_finite=True, validate_types=True)
+        logits = result.output("logits")
+        expected = (1, seq, int(spec["vocab_size"]))
+        if tuple(logits.shape) != expected:
+            return {
+                "status": "failed",
+                "message": f"logits shape {tuple(logits.shape)} != expected {expected}",
+                "inputs": {k: list(v.shape) for k, v in inputs.items()},
+            }
+        return {
+            "status": "passed",
+            "message": "OPT forward pass produced finite logits with the expected shape",
+            "inputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in inputs.items()},
+            "outputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in result.outputs.items()},
+            "num_ops": result.num_ops,
+            "sample_sequence_length": seq,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "message": str(exc),
+            "inputs": {k: list(v.shape) for k, v in inputs.items()},
+        }

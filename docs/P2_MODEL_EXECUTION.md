@@ -1,7 +1,7 @@
 # P2 — Reconstructed model execution and modification validation
 
-P1 imports and reconstructs GPT-2/Llama checkpoints. P2 makes the resulting
-artifact a usable model object rather than an import report:
+P1 imports and reconstructs GPT-2, Llama and OPT checkpoints. P2 makes the
+resulting artifact a usable model object rather than an import report:
 
 1. **Execute** the validated graph stored in an imported artifact.
 2. **Modify** its immutable weight package through the existing registered
@@ -62,7 +62,11 @@ The optional parity helpers compare every reconstructed block output with the
 corresponding Hugging Face transformer block, not just the final logits:
 
 ```python
-from uzen.core.wie.parity import compare_gpt2_activations, compare_llama_activations
+from uzen.core.wie.parity import (
+    compare_gpt2_activations,
+    compare_llama_activations,
+    compare_opt_activations,
+)
 
 report = compare_gpt2_activations(graph, package, local_checkpoint, tokens=[[0, 1, 2, 3]])
 report["passed"]
@@ -71,12 +75,13 @@ report["layers"][0]["node"]          # l0_res2
 report["layers"][0]["max_abs_error"]
 ```
 
-GPT-2 uses `transformers.GPT2LMHeadModel.transformer.h` and Llama uses
-`transformers.LlamaForCausalLM.model.layers`. Forward hooks capture each block's
-real output; the comparison does not depend on the version-specific
+GPT-2 uses `transformers.GPT2LMHeadModel.transformer.h`, Llama uses
+`transformers.LlamaForCausalLM.model.layers`, and OPT uses
+`transformers.OPTForCausalLM.model.decoder.layers`. Forward hooks capture each
+block's real output; the comparison does not depend on the version-specific
 `hidden_states` tuple layout. Each layer records its node id, shape, tolerance
-result, and absolute/relative errors. The gated live suite compares both tiny
-Hub fixtures layer by layer.
+result, and absolute/relative errors. The gated live suite compares all three
+tiny Hub fixtures layer by layer.
 
 ## Tokenizer-backed text inference
 
@@ -213,7 +218,7 @@ MCP:
 ## Limits
 
 * Execution is for causal-LM graphs with `tokens` and optional `positions`
-  inputs, which are the graphs produced by the current GPT-2/Llama adapters.
+  inputs, which are the graphs produced by the current GPT-2/Llama/OPT adapters.
 * Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
   `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
 * There is no KV cache; each forward pass, including every generation step,
@@ -227,5 +232,5 @@ MCP:
 * Numerical closeness is evidence for the stated inputs and tolerances, not a
   claim of semantic equivalence.
 * Layer parity requires a locally available Hugging Face checkpoint plus
-  `transformers` and `torch`; it is validated only for the explicit GPT-2/Llama
-  adapters.
+  `transformers` and `torch`; it is validated only for the explicit GPT-2, Llama
+  and OPT adapters.

@@ -85,6 +85,30 @@ def test_torch_backend_can_be_requested_explicitly():
         np.testing.assert_allclose(got[name], expected[name], rtol=1e-5, atol=1e-6)
 
 
+def test_torch_pos_embedding_honours_the_offset_parameter():
+    graph = Graph(name="offset", inputs={"tokens": TensorType.of((1, 3), "int64")})
+    graph.add_node(
+        "embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed"}
+    )
+    graph.add_node(
+        "pos",
+        "pos_embedding",
+        {"x": Ref("embed")},
+        {"weight": "param:pos", "offset": 2},
+    )
+    graph.set_output("y", Ref("pos"))
+    embed = np.arange(20, dtype=np.float32).reshape(5, 4)
+    pos = np.arange(24, dtype=np.float32).reshape(6, 4)
+    package = WeightPackage.from_arrays({"embed": embed, "pos": pos})
+    inputs = {"tokens": np.array([[0, 2, 4]], dtype=np.int64)}
+
+    expected = embed[inputs["tokens"]] + pos[2:5]
+    np.testing.assert_array_equal(execute(graph, inputs, package).outputs["y"], expected)
+    np.testing.assert_allclose(
+        execute_torch(graph, inputs, package).outputs["y"], expected, rtol=0, atol=0
+    )
+
+
 def test_capture_returns_intermediates():
     definition = build_architecture("mlp", dict(input_dim=4, hidden_dims=[6], output_dim=2))
     package = definition.build_package(seed=3)

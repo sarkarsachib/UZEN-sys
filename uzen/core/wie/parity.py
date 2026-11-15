@@ -460,3 +460,121 @@ def compare_llama_activations(
         atol=atol,
         rtol=rtol,
     )
+
+
+def compare_opt_logits(
+    graph: Graph,
+    package: WeightPackage,
+    source: str | Path,
+    *,
+    tokens: Sequence[Sequence[int]] | None = None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> dict[str, Any]:
+    """Compare reconstructed OPT logits against ``transformers.OPTForCausalLM``.
+
+    OPT indexes its learned position table at ``position + 2``; the reconstructed
+    graph bakes that offset into the ``pos_embedding`` node, so only token IDs are
+    supplied here. Hugging Face derives the same positions from its all-ones
+    attention mask, which makes this a real check of position handling.
+    """
+    if atol < 0 or rtol < 0:
+        raise ValueError("atol and rtol must be non-negative")
+    try:
+        import torch
+        from transformers import OPTForCausalLM
+    except ImportError as exc:  # pragma: no cover - depends on optional environment
+        raise RuntimeUnavailable(
+            "OPT parity requires optional packages: install transformers and torch"
+        ) from exc
+
+    token_array = (
+        np.asarray(tokens, dtype=np.int64)
+        if tokens is not None
+        else np.array([[0, 1, 2, 3]], dtype=np.int64)
+    )
+    if token_array.ndim != 2:
+        raise ValueError("tokens must have shape (batch, sequence)")
+    if token_array.size == 0:
+        raise ValueError("tokens must not be empty")
+    if int(token_array.min()) < 0:
+        raise ValueError("tokens must be non-negative")
+
+    source_path = Path(source)
+    if not source_path.exists():
+        raise FileNotFoundError(f"local reference checkpoint not found: {source_path}")
+
+    model = OPTForCausalLM.from_pretrained(str(source_path), local_files_only=True).eval()
+    with torch.no_grad():
+        reference = model(input_ids=torch.as_tensor(token_array)).logits.detach().cpu().numpy()
+    actual = execute(graph, {"tokens": token_array}, package).output("logits")
+    return _comparison_report(
+        actual,
+        reference,
+        reference_name="transformers.OPTForCausalLM",
+        source_path=source_path,
+        tokens=token_array,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+def compare_opt_activations(
+    graph: Graph,
+    package: WeightPackage,
+    source: str | Path,
+    *,
+    tokens: Sequence[Sequence[int]] | None = None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> dict[str, Any]:
+    """Compare each reconstructed OPT block output with Hugging Face hidden states."""
+    if atol < 0 or rtol < 0:
+        raise ValueError("atol and rtol must be non-negative")
+    try:
+        import torch
+        from transformers import OPTForCausalLM
+    except ImportError as exc:  # pragma: no cover - depends on optional environment
+        raise RuntimeUnavailable(
+            "OPT activation parity requires optional packages: install transformers and torch"
+        ) from exc
+
+    token_array = (
+        np.asarray(tokens, dtype=np.int64)
+        if tokens is not None
+        else np.array([[0, 1, 2, 3]], dtype=np.int64)
+    )
+    if token_array.ndim != 2:
+        raise ValueError("tokens must have shape (batch, sequence)")
+    if token_array.size == 0:
+        raise ValueError("tokens must not be empty")
+    if int(token_array.min()) < 0:
+        raise ValueError("tokens must be non-negative")
+
+    source_path = Path(source)
+    if not source_path.exists():
+        raise FileNotFoundError(f"local reference checkpoint not found: {source_path}")
+    node_ids = layer_node_ids(graph)
+    if not node_ids:
+        raise ValueError("graph has no reconstructed transformer layer outputs (l<N>_res2)")
+
+    model = OPTForCausalLM.from_pretrained(str(source_path), local_files_only=True).eval()
+    decoder = getattr(getattr(model, "model", None), "decoder", None)
+    blocks = getattr(decoder, "layers", None)
+    if blocks is None:
+        raise ValueError("Hugging Face OPT model does not expose decoder layers")
+    with torch.no_grad():
+        block_outputs = _block_outputs(
+            blocks, lambda: model(input_ids=torch.as_tensor(token_array))
+        )
+    captured = execute(
+        graph, {"tokens": token_array}, package, capture=node_ids
+    ).intermediates
+    return _activation_report(
+        _compare_block_outputs(captured, block_outputs, node_ids, atol=atol, rtol=rtol),
+        reference_name="transformers.OPTForCausalLM",
+        source_path=source_path,
+        tokens=token_array,
+        atol=atol,
+        rtol=rtol,
+    )

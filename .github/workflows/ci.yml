@@ -57,7 +57,7 @@ jobs:
         run: python -m pytest -q
 
   live-hf:
-    name: Live Hugging Face tests (tiny GPT-2 and Llama)
+    name: Live Hugging Face tests (tiny GPT-2, Llama and OPT)
     # Opt-in: set the repository variable UZEN_RUN_LIVE_HF=1, or dispatch this
     # workflow manually with live_hf enabled. Normal pushes and PRs skip the job.
     if: vars.UZEN_RUN_LIVE_HF == '1' || (github.event_name == 'workflow_dispatch' && inputs.live_hf)

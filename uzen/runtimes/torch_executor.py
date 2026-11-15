@@ -135,11 +135,14 @@ def _pos_embedding(inputs, params, bound):
     if x.dim() < 3:
         raise InvalidOperationParameters(f"pos_embedding expects (batch, seq, dim), got {tuple(x.shape)}")
     t = x.shape[1]
-    if t > w.shape[0]:
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    if offset + t > w.shape[0]:
         raise ShapeMismatch(
-            f"sequence length {t} exceeds positional embedding table size {w.shape[0]}"
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
         )
-    return [x + w[:t].reshape((1, t) + tuple(x.shape[2:]))]
+    return [x + w[offset : offset + t].reshape((1, t) + tuple(x.shape[2:]))]
 
 
 def _layernorm(inputs, params, bound):
