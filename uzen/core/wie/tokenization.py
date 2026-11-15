@@ -9,7 +9,7 @@ from the caller.
 
 Only the tokenizer document is loaded.  No tokenizer code, custom model code or
 pickle is executed.  The optional ``tokenizers`` package performs the real
-GPT-2/Llama/OPT encoding; when it is absent, text inference raises a typed
+encoding for supported reconstructed models; when it is absent, text inference raises a typed
 ``runtime.unavailable`` error instead of inventing token IDs.
 """
 

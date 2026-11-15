@@ -37,9 +37,9 @@ api = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.27"]
 safetensors = ["safetensors>=0.4"]
 # Download Hugging Face repositories into the import pipeline.
 hf = ["huggingface_hub>=0.23"]
-# Encode text with imported tokenizer.json documents (GPT-2/Llama/OPT inference).
+# Encode text with imported tokenizer.json documents (supported transformer inference).
 tokenizer = ["tokenizers>=0.20"]
-# Optional live GPT-2/Llama/OPT parity against the Hugging Face reference implementations.
+# Optional live GPT-2/Llama/OPT/GPT-NeoX parity against Hugging Face references.
 hf-reference = ["huggingface_hub>=0.23", "transformers>=4.40"]
 # ONNX interchange (export/import of the supported NIR subset).
 onnx = ["onnx>=1.16"]

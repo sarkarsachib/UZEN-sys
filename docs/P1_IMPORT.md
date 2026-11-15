@@ -1,10 +1,11 @@
-# P1 — Hugging Face / safetensors import and GPT-2/Llama/OPT reconstruction
+# P1 — Hugging Face / safetensors import and GPT-2/Llama/OPT/GPT-NeoX reconstruction
 
 P1 now covers two separate stages:
 
 1. **Import** weights and source metadata safely.
 2. **Reconstruct** a validated NIR graph for an explicitly supported GPT-2,
-   Llama or OPT adapter, or report an unsupported architecture without guessing.
+   Llama, OPT or GPT-NeoX adapter, or report an unsupported architecture without
+   guessing.
 
 Import and reconstruction are reported independently. A complete tensor payload
 does not imply a reconstructed graph, and a graph does not imply numerical
@@ -184,15 +185,15 @@ notifications loses no diagnostic information.
 * A license is reported when found in model-card frontmatter or `config.json`;
   otherwise it is explicitly `unknown`. Importing a checkpoint does not change or
   infer its license.
-* Reconstruction currently supports explicit GPT-2, Llama and OPT adapters.
-  Other architectures, unsupported Llama fields (scaled RoPE, biases, non-SiLU),
-  OPT variants with `word_embed_proj_dim != hidden_size`, post-LN OPT, scaled
-  embeddings or non-ReLU activations, learned architecture variants, quantized
-  formats, and arbitrary custom layers are reported as unsupported rather than
-  approximated.
-* GPT-2, Llama and OPT reference-logit parity is checked only in the gated live
-  tests against the tiny public fixtures. It is not a guarantee for every
-  checkpoint.
+* Reconstruction currently supports explicit GPT-2, Llama, OPT and GPT-NeoX
+  adapters. Other architectures, unsupported Llama fields (scaled RoPE, biases,
+  non-SiLU), OPT variants with `word_embed_proj_dim != hidden_size`, post-LN OPT,
+  scaled embeddings or non-ReLU activations, GPT-NeoX variants with scaled RoPE
+  or exact (erf) GELU, learned architecture variants, quantized formats, and
+  arbitrary custom layers are reported as unsupported rather than approximated.
+* GPT-2, Llama, OPT and GPT-NeoX reference-logit parity is checked only in the
+  gated live tests against the tiny public fixtures. It is not a guarantee for
+  every checkpoint.
 * Text inference requires a `tokenizer.json` payload and the optional `uzen[tokenizer]`
   runtime. `vocab.json`/`merges.txt`-only and `tokenizer.model`-only artifacts are
   imported and reported, but text inference refuses them explicitly.

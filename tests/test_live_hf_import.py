@@ -4,10 +4,11 @@ Run explicitly with::
 
     UZEN_LIVE_HF=1 .venv/bin/python -m pytest tests/test_live_hf_import.py -q
 
-The tests download tiny public GPT-2, Llama and OPT checkpoints, import the
-actual files, reconstruct their graphs, and require graph validation plus a
-finite forward pass. Every family's logits are also compared with its Hugging
-Face reference implementation; a successful download alone is not success.
+The tests download tiny public GPT-2, Llama, OPT and GPT-NeoX checkpoints,
+import the actual files, reconstruct their graphs, and require graph validation
+plus a finite forward pass. Every family's logits are also compared with its
+Hugging Face reference implementation; a successful download alone is not
+success.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from uzen.core.wie.parity import (
     compare_gpt2_logits,
     compare_llama_activations,
     compare_llama_logits,
+    compare_neox_activations,
+    compare_neox_logits,
     compare_opt_activations,
     compare_opt_logits,
 )
@@ -224,6 +227,176 @@ def test_live_tiny_gpt2_modify_export_reload_roundtrip(tmp_path):
 
     reloaded_execution = client.service.forward_model(
         reloaded_id, tokens=[[0, 1, 2, 3]], capture="layers"
+    )
+    np.testing.assert_array_equal(
+        reloaded_execution.outputs["logits"], modified_execution.outputs["logits"]
+    )
+    assert sorted(reloaded_execution.intermediates) == expected_layers
+    for name in expected_layers:
+        np.testing.assert_array_equal(
+            reloaded_execution.intermediates[name], modified_execution.intermediates[name]
+        )
+
+    assert client.package(source_id).fingerprint() == source_fingerprint
+    assert client.verify_artifact(modified_id)["ok"] is True
+    assert client.verify_artifact(reloaded_id)["ok"] is True
+    lineage = client.artifact(modified_id)["lineage"]
+    assert lineage["parents"] == [source_id]
+    assert lineage["operation"] == "w.arithmetic.scale"
+
+
+def test_live_tiny_neox_import_reconstruction_and_execution():
+    pytest.importorskip("huggingface_hub")
+    repo_id = "hyper-accel/tiny-random-gpt_neox"
+    result = ModelImporter().import_source(repo_id, revision="main")
+
+    assert result.ok
+    report = result.report
+    assert report.repo_id == repo_id
+    assert report.source_kind == "huggingface_repo"
+    assert report.config["model_type"] == "gpt_neox"
+    assert len(report.tensors) == 28
+    assert report.compatibility.reconstruction == "validated"
+    assert report.compatibility.execution == "passed"
+    assert report.compatibility.overall == "validated"
+    assert report.reconstruction["missing"] == []
+    assert report.reconstruction["shape_errors"] == []
+    assert report.reconstruction["extra"] == []
+    assert report.reconstruction["validation"]["ok"] is True
+    assert report.reconstruction["execution"]["status"] == "passed"
+    assert report.reconstruction["execution"]["outputs"]["logits"]["shape"] == [
+        1,
+        4,
+        50432,
+    ]
+    assert report.reconstruction["spec"] == {
+        "architecture": "gpt_neox",
+        "d_model": 384,
+        "n_heads": 4,
+        "head_dim": 96,
+        "n_layers": 2,
+        "d_ff": 1536,
+        "vocab_size": 50432,
+        "max_seq_len": 2048,
+        "rotary_dim": 24,
+        "rope_theta": 10000.0,
+        "layer_norm_eps": 1e-5,
+        "activation": "gelu",
+        "parallel_residual": True,
+        "attention_bias": True,
+        "tie_embeddings": False,
+    }
+    assert result.artifact_package is not None
+    assert "gpt_neox.layers.0.attention.query_key_value.weight" in result.package
+    assert "layers.0.qkv.weight" in result.artifact_package
+    mapping = {m["target"]: m for m in report.reconstruction["tensor_mapping"]}
+    assert mapping["layers.0.qkv.weight"]["source_shape"] == [1152, 384]
+    assert mapping["layers.0.qkv.bias"]["source_shape"] == [1152]
+    assert mapping["lm_head.weight"]["source"] == "embed_out.weight"
+
+
+def test_live_tiny_neox_matches_huggingface_logits():
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+
+    result = ModelImporter().import_source(
+        "hyper-accel/tiny-random-gpt_neox", revision="main"
+    )
+    parity = compare_neox_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        result.report.source,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["tolerances"] == {"atol": 1e-5, "rtol": 1e-5}
+    assert parity["positions"] == [[0, 1, 2, 3]]
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+    assert parity["actual_shape"] == parity["reference_shape"] == [1, 4, 50432]
+
+
+def test_live_tiny_neox_matches_huggingface_hidden_states():
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+
+    result = ModelImporter().import_source(
+        "hyper-accel/tiny-random-gpt_neox", revision="main"
+    )
+    parity = compare_neox_activations(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        result.report.source,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert parity["num_layers"] == 2
+    assert parity["positions"] == [[0, 1, 2, 3]]
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+    assert parity["layers"][0]["node"] == "l0_res2"
+
+
+def test_live_tiny_neox_modify_export_reload_roundtrip(tmp_path):
+    """Scale a real GPT-NeoX checkpoint, export it, reload it and compare outputs."""
+    pytest.importorskip("huggingface_hub")
+    from uzen.interfaces.python_sdk.client import Uzen
+
+    tokens = [[0, 1, 2, 3]]
+    positions = [[0, 1, 2, 3]]
+    client = Uzen(root=tmp_path / "neox-roundtrip-workspace")
+    imported = client.import_model(
+        "hyper-accel/tiny-random-gpt_neox", revision="main"
+    )
+    source_id = imported["artifact_id"]
+    source_execution = client.service.forward_model(
+        source_id, tokens=tokens, positions=positions
+    )
+    source_fingerprint = client.package(source_id).fingerprint()
+
+    modified = client.modify(source_id, "scale", params={"factor": 0.5})
+    modified_id = modified["artifact_id"]
+    assert modified["architecture_preserved"] is True
+    modified_execution = client.service.forward_model(
+        modified_id, tokens=tokens, positions=positions, capture="layers"
+    )
+
+    expected_layers = sorted(modified_execution.intermediates)
+    assert expected_layers == ["l0_res2", "l1_res2"]
+    assert not np.array_equal(
+        modified_execution.outputs["logits"], source_execution.outputs["logits"]
+    )
+
+    export_path = client.service.store.export(
+        modified_id, tmp_path / "modified-neox.safetensors"
+    )
+    assert export_path.exists() and export_path.stat().st_size > 0
+
+    reloaded = client.import_weights(export_path)
+    reloaded_id = reloaded["artifact_id"]
+    reloaded_manifest = client.artifact(reloaded_id)
+    assert reloaded_manifest["metadata"]["graph"]["name"] == modified_execution.graph_name
+    assert (
+        reloaded_manifest["metadata"]["import_report"]["metadata"]["graph_restored_from_metadata"]
+        is True
+    )
+
+    reloaded_package = client.package(reloaded_id)
+    modified_package = client.package(modified_id)
+    assert reloaded_package.fingerprint() == modified_package.fingerprint()
+    for name in reloaded_package.names():
+        np.testing.assert_array_equal(
+            reloaded_package.tensors[name], modified_package.tensors[name]
+        )
+
+    reloaded_execution = client.service.forward_model(
+        reloaded_id, tokens=tokens, positions=positions, capture="layers"
     )
     np.testing.assert_array_equal(
         reloaded_execution.outputs["logits"], modified_execution.outputs["logits"]

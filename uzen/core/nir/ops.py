@@ -350,6 +350,10 @@ def _split_qkv_infer(inputs, params, bound):
     heads = _param_int(params, "n_heads", 0)
     if heads <= 0:
         raise InvalidOperationParameters("split_qkv requires n_heads > 0")
+    if str(params.get("layout", "grouped")) not in ("grouped", "interleaved"):
+        raise InvalidOperationParameters(
+            "split_qkv layout must be 'grouped' or 'interleaved'"
+        )
     last = x.shape[-1]
     if not isinstance(last, int):
         raise InvalidOperationParameters("split_qkv requires a concrete last dimension")
@@ -370,11 +374,18 @@ def _split_qkv_run(inputs, params, bound):
             f"split_qkv expects (batch, seq, 3*dim), got shape {x.shape}"
         )
     heads = int(params["n_heads"])
+    layout = str(params.get("layout", "grouped"))
     bsz, seq, last = x.shape
     dh = last // (3 * heads)
-    # (B, T, 3, H, Dh) -> (B, 3, H, T, Dh)
-    r = np.transpose(x.reshape(bsz, seq, 3, heads, dh), (0, 2, 3, 1, 4))
-    return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "grouped":
+        # (B, T, 3, H, Dh) -> (B, 3, H, T, Dh)
+        r = np.transpose(x.reshape(bsz, seq, 3, heads, dh), (0, 2, 3, 1, 4))
+        return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "interleaved":
+        # (B, T, H, 3, Dh) -> (B, H, 3, T, Dh)
+        r = np.transpose(x.reshape(bsz, seq, heads, 3, dh), (0, 2, 3, 1, 4))
+        return [r[:, :, 0], r[:, :, 1], r[:, :, 2]]
+    raise InvalidOperationParameters("split_qkv layout must be 'grouped' or 'interleaved'")
 
 
 def _merge_heads_infer(inputs, params, bound):
@@ -405,8 +416,15 @@ def _rope_infer(inputs, params, bound):
         raise InvalidOperationParameters("rope expects (batch, heads, seq, head_dim)")
     if positions.rank not in (1, 2):
         raise InvalidOperationParameters("rope positions must be rank 1 or 2")
-    if isinstance(x.shape[-1], int) and x.shape[-1] % 2 != 0:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    dim = x.shape[-1]
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else (dim if isinstance(dim, int) else 0)
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise InvalidOperationParameters("rope rotary_dim must be a positive even integer")
+    if isinstance(dim, int) and rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} exceeds head dimension {dim}"
+        )
     theta = _param_float(params, "theta", 10000.0)
     if theta <= 0:
         raise InvalidOperationParameters("rope theta must be positive")
@@ -426,18 +444,33 @@ def _rope_run(inputs, params, bound):
         raise ShapeMismatch(
             f"rope positions {positions.shape} do not match (batch={bsz}, seq={seq})"
         )
-    if dim % 2:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else dim
+    if rotary_dim <= 0 or rotary_dim % 2 != 0 or rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} must be positive, even and <= {dim}"
+        )
     theta = float(params.get("theta", 10000.0))
-    inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
+    if theta <= 0:
+        raise InvalidOperationParameters("rope theta must be positive")
+    half = rotary_dim // 2
+    inv_freq = 1.0 / (
+        theta ** (np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
+    )
     freqs = np.concatenate([inv_freq, inv_freq], axis=0)
     angles = pos.astype(np.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = np.cos(angles)
     sin = np.sin(angles)
-    x1 = x[..., : dim // 2]
-    x2 = x[..., dim // 2 :]
+    x_rot = x[..., :rotary_dim]
+    x1 = x_rot[..., :half]
+    x2 = x_rot[..., half:]
     rotated = np.concatenate([-x2, x1], axis=-1)
-    return [(x.astype(np.float64) * cos + rotated.astype(np.float64) * sin).astype(x.dtype, copy=False)]
+    rotated_out = x_rot.astype(np.float64) * cos + rotated.astype(np.float64) * sin
+    if rotary_dim == dim:
+        out = rotated_out
+    else:
+        out = np.concatenate([rotated_out, x[..., rotary_dim:]], axis=-1)
+    return [out.astype(x.dtype, copy=False)]
 
 
 def _repeat_kv_infer(inputs, params, bound):
@@ -1087,7 +1120,7 @@ _reg("silu", 1, 1, _unary_infer, _activate(_silu), "sigmoid linear unit (swish)"
 _reg("tanh", 1, 1, _unary_infer, _activate(np.tanh), "hyperbolic tangent", "activation")
 _reg("sigmoid", 1, 1, _unary_infer, _activate(lambda x: 1.0 / (1.0 + np.exp(-x))), "logistic sigmoid", "activation")
 _reg("softmax", 1, 1, _softmax_infer, _softmax_run, "numerically stable softmax", "activation")
-_reg("split_qkv", 1, 1, _split_qkv_infer, _split_qkv_run, "fused QKV projection -> three head tensors", "attention")
+_reg("split_qkv", 1, 1, _split_qkv_infer, _split_qkv_run, "fused QKV projection -> three head tensors (grouped or interleaved)", "attention")
 _reg("rope", 2, 2, _rope_infer, _rope_run, "rotary position embedding (Llama rotate-half)", "attention", ports=("x", "positions"))
 _reg("repeat_kv", 1, 1, _repeat_kv_infer, _repeat_kv_run, "repeat grouped-query KV heads to query-head count", "attention")
 _reg("merge_heads", 1, 1, _merge_heads_infer, _merge_heads_run, "merge attention heads back to model width", "attention")

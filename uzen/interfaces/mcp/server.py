@@ -66,7 +66,7 @@ class MCPServer:
             "uzen.forward_model": (
                 {
                     "description": (
-                        "Run a stored reconstructed GPT-2/Llama/OPT model graph on token IDs. "
+                        "Run a stored reconstructed causal-LM model graph on token IDs. "
                         "Returns output shapes and optional values; no training or gradients."
                     ),
                     "inputSchema": {
@@ -100,7 +100,7 @@ class MCPServer:
                 {
                     "description": (
                         "Tokenize text with the imported artifact's stored tokenizer and run "
-                        "its reconstructed GPT-2/Llama/OPT graph. No training or gradients."
+                        "its reconstructed causal-LM graph. No training or gradients."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -129,7 +129,7 @@ class MCPServer:
             "uzen.generate_text": (
                 {
                     "description": (
-                        "Greedily generate text from an imported GPT-2/Llama/OPT artifact using "
+                        "Greedily generate text from an imported causal-LM artifact using "
                         "its stored tokenizer and reconstructed graph. No training or gradients."
                     ),
                     "inputSchema": {

@@ -8,6 +8,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tests.test_llama_reconstruction import _write_llama  # noqa: E402
+from tests.test_neox_reconstruction import _write_neox  # noqa: E402
 from uzen.core.nir.executor import execute  # noqa: E402
 from uzen.core.nir.graph import Graph  # noqa: E402
 from uzen.core.nir.types import Ref, TensorType  # noqa: E402
@@ -83,6 +84,24 @@ def test_torch_backend_can_be_requested_explicitly():
     expected = execute(definition.graph, inputs, package).outputs
     for name in expected:
         np.testing.assert_allclose(got[name], expected[name], rtol=1e-5, atol=1e-6)
+
+
+def test_torch_neox_graph_matches_numpy(tmp_path):
+    root, _arrays = _write_neox(tmp_path / "neox-torch")
+    result = ModelImporter().import_source(root)
+    assert result.reconstruction is not None
+    graph = result.reconstruction.definition.graph
+    package = result.artifact_package
+    tokens = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    positions = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    inputs = {"tokens": tokens, "positions": positions}
+
+    expected = execute(graph, inputs, package).outputs
+    got = execute_torch(graph, inputs, package).outputs
+    for name in expected:
+        np.testing.assert_allclose(
+            got[name], expected[name], rtol=1e-5, atol=1e-6, err_msg=name
+        )
 
 
 def test_torch_pos_embedding_honours_the_offset_parameter():

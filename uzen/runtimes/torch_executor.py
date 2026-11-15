@@ -231,20 +231,37 @@ def _rope(inputs, params, bound):
         raise ShapeMismatch(
             f"rope positions {tuple(positions.shape)} do not match (batch={bsz}, seq={seq})"
         )
-    if dim % 2:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else dim
+    if rotary_dim <= 0 or rotary_dim % 2 != 0 or rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} must be positive, even and <= {dim}"
+        )
     theta = float(params.get("theta", 10000.0))
     if theta <= 0:
         raise InvalidOperationParameters("rope theta must be positive")
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=x.device) / dim))
+    half = rotary_dim // 2
+    inv_freq = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float64, device=x.device)
+            / rotary_dim
+        )
+    )
     freqs = torch.cat([inv_freq, inv_freq], dim=0)
     angles = pos.to(torch.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = torch.cos(angles)
     sin = torch.sin(angles)
-    x1 = x[..., : dim // 2]
-    x2 = x[..., dim // 2 :]
+    x_rot = x[..., :rotary_dim]
+    x1 = x_rot[..., :half]
+    x2 = x_rot[..., half:]
     rotated = torch.cat([-x2, x1], dim=-1)
-    return [(x.to(torch.float64) * cos + rotated.to(torch.float64) * sin).to(x.dtype)]
+    rotated_out = x_rot.to(torch.float64) * cos + rotated.to(torch.float64) * sin
+    if rotary_dim == dim:
+        out = rotated_out
+    else:
+        out = torch.cat([rotated_out, x[..., rotary_dim:]], dim=-1)
+    return [out.to(x.dtype)]
 
 
 def _repeat_kv(inputs, params, bound):
@@ -265,10 +282,16 @@ def _split_qkv(inputs, params, bound):
     if x.dim() != 3:
         raise InvalidOperationParameters(f"split_qkv expects (batch, seq, 3*dim), got {tuple(x.shape)}")
     heads = int(params["n_heads"])
+    layout = str(params.get("layout", "grouped"))
     bsz, seq, last = x.shape
     dh = last // (3 * heads)
-    r = x.reshape(bsz, seq, 3, heads, dh).permute(0, 2, 3, 1, 4)
-    return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "grouped":
+        r = x.reshape(bsz, seq, 3, heads, dh).permute(0, 2, 3, 1, 4)
+        return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "interleaved":
+        r = x.reshape(bsz, seq, heads, 3, dh).permute(0, 2, 3, 1, 4)
+        return [r[:, :, 0], r[:, :, 1], r[:, :, 2]]
+    raise InvalidOperationParameters("split_qkv layout must be 'grouped' or 'interleaved'")
 
 
 def _merge_heads(inputs, params, bound):

@@ -12,8 +12,10 @@ transposed into the NIR linear convention, and those transforms are recorded per
 tensor. Llama uses separate Q/K/V/O projections, RMSNorm, SwiGLU, real RoPE, and
 GQA-aware K/V repetition. OPT uses a learned absolute position table with its
 +2 offset, pre-LayerNorm blocks with biased LayerNorm and biased Q/K/V/O and MLP
-projections, and a ReLU feed-forward block. Those mappings and graph nodes are
-explicit for every adapter.
+projections, and a ReLU feed-forward block. GPT-NeoX uses partial rotary
+embeddings over a fused, per-head-interleaved QKV projection and a parallel
+attention/MLP residual. Those mappings and graph nodes are explicit for every
+adapter.
 """
 
 from __future__ import annotations
@@ -135,6 +137,16 @@ def reconstruct_hf_model(
         )
     if model_type == "opt":
         return _reconstruct_opt(
+            arrays,
+            config,
+            architecture=architecture,
+            source_dtypes=source_dtypes,
+            name=name,
+            source_hash=source_hash,
+            on_progress=on_progress,
+        )
+    if model_type == "gpt_neox":
+        return _reconstruct_neox(
             arrays,
             config,
             architecture=architecture,
@@ -1613,6 +1625,593 @@ def _execute_opt(
         return {
             "status": "passed",
             "message": "OPT forward pass produced finite logits with the expected shape",
+            "inputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in inputs.items()},
+            "outputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in result.outputs.items()},
+            "num_ops": result.num_ops,
+            "sample_sequence_length": seq,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "message": str(exc),
+            "inputs": {k: list(v.shape) for k, v in inputs.items()},
+        }
+
+
+# --------------------------------------------------------------------------- #
+# GPT-NeoX adapter: partial RoPE, interleaved fused QKV, parallel residual
+# --------------------------------------------------------------------------- #
+
+
+def _reconstruct_neox(
+    arrays: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    architecture: str | None,
+    source_dtypes: Mapping[str, str] | None,
+    name: str | None,
+    source_hash: str | None,
+    on_progress: Any | None = None,
+) -> ReconstructionResult:
+    progress: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    warnings: list[str] = []
+    missing: list[str] = []
+    extra: list[str] = []
+    shape_errors: list[str] = []
+    reasons: list[str] = []
+
+    def step(stage: str, status: str, message: str) -> None:
+        progress.append({"stage": stage, "status": status, "message": message})
+        if on_progress is not None:
+            on_progress(stage, status, message)
+
+    try:
+        spec = _neox_spec(config, warnings)
+    except ValueError as exc:
+        step("config", "unsupported", str(exc))
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec={},
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=[],
+                missing=[],
+                extra=sorted(arrays),
+                shape_errors=[],
+                unresolved=[str(exc)],
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=0,
+                progress=progress,
+                reasons=[str(exc)],
+            )
+        )
+    step("config", "complete", "GPT-NeoX configuration validated against the supported adapter")
+
+    definition = _build_neox_definition(spec)
+    step(
+        "architecture",
+        "complete",
+        "explicit GPT-NeoX NIR graph with partial RoPE and parallel residual built",
+    )
+    canonical, mapping, missing, extra, shape_errors, unresolved = _neox_tensors(
+        arrays, spec, definition, unresolved
+    )
+    step(
+        "tensor_mapping",
+        "complete" if not missing and not shape_errors else "failed",
+        f"mapped {len(mapping)} tensors; {len(missing)} missing, {len(shape_errors)} shape errors, "
+        f"{len(extra)} unmapped source tensors",
+    )
+    if missing or shape_errors:
+        reasons.append(
+            "all GPT-NeoX NIR parameters must be present with expected shapes; none are invented"
+        )
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="unsupported",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=None,
+                graph_summary=None,
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=None,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    package = WeightPackage.from_arrays(
+        canonical,
+        name=name or "gpt_neox_model",
+        family="transformer_decoder",
+        family_spec=spec,
+        metadata={
+            "reconstruction": {
+                "architecture": architecture,
+                "adapter": "gpt_neox",
+                "source_hash": source_hash,
+                "tensor_mapping": mapping,
+                "graph": definition.graph.to_dict(),
+            },
+            "source_hash": source_hash,
+        },
+        source_dtypes={
+            target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
+            for target, item in ((m["target"], m) for m in mapping)
+        },
+    )
+    validation = definition.graph.validate(package)
+    validation_doc = {
+        "ok": validation.ok,
+        "errors": list(validation.errors),
+        "warnings": list(validation.warnings),
+        "num_nodes": validation.num_nodes,
+        "num_params": validation.num_params,
+        "param_names": list(validation.param_names),
+        "order": list(validation.order),
+    }
+    step(
+        "graph_validation",
+        "complete" if validation.ok else "failed",
+        f"graph validation {'passed' if validation.ok else 'failed'} with {validation.num_nodes} nodes",
+    )
+    if not validation.ok:
+        reasons.append(
+            "GPT-NeoX graph validation failed; no validated artifact should be published"
+        )
+        return ReconstructionResult(
+            report=ReconstructionReport(
+                status="failed",
+                architecture=architecture,
+                family="transformer_decoder",
+                spec=spec,
+                graph=definition.graph.to_dict(),
+                graph_summary=definition.graph.summary(),
+                tensor_mapping=mapping,
+                missing=missing,
+                extra=extra,
+                shape_errors=shape_errors,
+                unresolved=unresolved,
+                warnings=warnings,
+                validation=validation_doc,
+                execution=None,
+                source_tensor_count=len(arrays),
+                mapped_tensor_count=len(canonical),
+                progress=progress,
+                reasons=reasons,
+            )
+        )
+
+    execution = _execute_neox(definition, package, spec)
+    step(
+        "forward_execution",
+        execution.get("status", "failed"),
+        execution.get("message", "forward pass completed"),
+    )
+    if extra:
+        unresolved.append(
+            "source tensors not represented by the GPT-NeoX graph: "
+            + ", ".join(extra[:12])
+        )
+    status = "validated" if execution.get("status") == "passed" and not extra and not unresolved else "partial"
+    if execution.get("status") != "passed":
+        status = "failed"
+        reasons.append(
+            "GPT-NeoX forward execution failed; the graph is not marked validated"
+        )
+    elif status == "partial":
+        reasons.append("GPT-NeoX graph executes, but some source tensors remain unresolved")
+    else:
+        reasons.append(
+            "all GPT-NeoX tensors mapped, graph validated, and forward execution produced finite logits"
+        )
+    report = ReconstructionReport(
+        status=status,
+        architecture=architecture,
+        family="transformer_decoder",
+        spec=spec,
+        graph=definition.graph.to_dict(),
+        graph_summary=definition.graph.summary(),
+        tensor_mapping=mapping,
+        missing=missing,
+        extra=extra,
+        shape_errors=shape_errors,
+        unresolved=unresolved,
+        warnings=warnings,
+        validation=validation_doc,
+        execution=execution,
+        source_tensor_count=len(arrays),
+        mapped_tensor_count=len(canonical),
+        progress=progress,
+        reasons=reasons,
+    )
+    if status == "failed":
+        return ReconstructionResult(report=report, package=None, definition=definition)
+    return ReconstructionResult(report=report, package=package, definition=definition)
+
+
+def _neox_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]:
+    try:
+        d_model = int(config["hidden_size"])
+        n_heads = int(config["num_attention_heads"])
+        n_layers = int(config["num_hidden_layers"])
+        d_ff = int(config["intermediate_size"])
+        vocab_size = int(config["vocab_size"])
+        max_seq = int(config["max_position_embeddings"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"GPT-NeoX configuration is missing a required integer field: {exc}"
+        ) from exc
+    if min(d_model, n_heads, n_layers, d_ff, vocab_size, max_seq) <= 0:
+        raise ValueError(
+            "GPT-NeoX dimensions, layers, vocabulary and context length must be positive"
+        )
+    if d_model % n_heads != 0:
+        raise ValueError(
+            f"hidden_size={d_model} is not divisible by num_attention_heads={n_heads}"
+        )
+    head_dim = d_model // n_heads
+    rotary_pct = float(
+        config.get("partial_rotary_factor")
+        or config.get("rotary_pct")
+        or 1.0
+    )
+    rotary_dim = int(head_dim * rotary_pct)
+    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
+        raise ValueError(
+            f"partial rotary width {rotary_dim} (from {rotary_pct} of head_dim {head_dim}) "
+            "must be positive, even and <= head_dim"
+        )
+    theta = float(config.get("rope_theta") or config.get("rotary_emb_base") or 10000.0)
+    if theta <= 0:
+        raise ValueError("rope_theta must be positive")
+    if config.get("rope_scaling") is not None:
+        raise ValueError("rope_scaling is not implemented; no scaled-RoPE graph was guessed")
+    activation = str(config.get("hidden_act") or "gelu_fast")
+    if activation not in ("gelu_fast", "gelu_new"):
+        raise ValueError(
+            f"hidden_act='{activation}' is not supported; this adapter implements the "
+            "tanh-approximated GELU used by gelu_fast/gelu_new"
+        )
+    eps = float(config.get("layer_norm_eps") or 1e-5)
+    if eps <= 0:
+        raise ValueError("layer_norm_eps must be positive")
+    if config.get("attention_dropout"):
+        warnings.append("attention_dropout is a training-time setting; inference omits it")
+    if config.get("hidden_dropout"):
+        warnings.append("hidden_dropout is a training-time setting; inference omits it")
+    if config.get("type_vocab_size") not in (None, 0, 1):
+        warnings.append("type_vocab_size is present but this GPT-NeoX adapter does not use token types")
+    tie = config.get("tie_word_embeddings")
+    return {
+        "architecture": "gpt_neox",
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "n_layers": n_layers,
+        "d_ff": d_ff,
+        "vocab_size": vocab_size,
+        "max_seq_len": max_seq,
+        "rotary_dim": rotary_dim,
+        "rope_theta": theta,
+        "layer_norm_eps": eps,
+        "activation": "gelu",
+        "parallel_residual": bool(config.get("use_parallel_residual", True)),
+        "attention_bias": bool(config.get("attention_bias", False)),
+        "tie_embeddings": False if tie is None else bool(tie),
+    }
+
+
+def _build_neox_definition(spec: Mapping[str, Any]) -> ArchitectureDefinition:
+    d = int(spec["d_model"])
+    heads = int(spec["n_heads"])
+    head_dim = int(spec["head_dim"])
+    layers = int(spec["n_layers"])
+    ffn = int(spec["d_ff"])
+    vocab = int(spec["vocab_size"])
+    rotary_dim = int(spec["rotary_dim"])
+    theta = float(spec["rope_theta"])
+    eps = float(spec["layer_norm_eps"])
+    parallel = bool(spec["parallel_residual"])
+    attention_bias = bool(spec["attention_bias"])
+    g = Graph(
+        name=f"gpt_neox_L{layers}",
+        metadata={
+            "family": "transformer_decoder",
+            "architecture": "gpt_neox",
+            "spec": dict(spec),
+        },
+    )
+    g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+    g.add_input("positions", TensorType.of(("B", "T"), "int64"))
+    sh: dict[str, tuple[int, ...]] = {
+        "embed.weight": (vocab, d),
+        "lm_head.weight": (vocab, d),
+        "norm.weight": (d,),
+        "norm.bias": (d,),
+    }
+    cur = g.add_node(
+        "embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"}
+    )
+
+    for layer in range(layers):
+        p = f"layers.{layer}"
+        sh[f"{p}.ln1.weight"] = (d,)
+        sh[f"{p}.ln1.bias"] = (d,)
+        sh[f"{p}.ln2.weight"] = (d,)
+        sh[f"{p}.ln2.bias"] = (d,)
+        sh[f"{p}.qkv.weight"] = (3 * d, d)
+        sh[f"{p}.attn_out.weight"] = (d, d)
+        sh[f"{p}.mlp_up.weight"] = (ffn, d)
+        sh[f"{p}.mlp_up.bias"] = (ffn,)
+        sh[f"{p}.mlp_down.weight"] = (d, ffn)
+        sh[f"{p}.mlp_down.bias"] = (d,)
+        if attention_bias:
+            sh[f"{p}.qkv.bias"] = (3 * d,)
+            sh[f"{p}.attn_out.bias"] = (d,)
+
+        ln1 = g.add_node(
+            f"l{layer}_ln1",
+            "layernorm",
+            {"x": cur},
+            {
+                "weight": f"param:{p}.ln1.weight",
+                "bias": f"param:{p}.ln1.bias",
+                "eps": eps,
+            },
+        )
+        qkv_params = {"weight": f"param:{p}.qkv.weight"}
+        if attention_bias:
+            qkv_params["bias"] = f"param:{p}.qkv.bias"
+        qkv = g.add_node(f"l{layer}_qkv", "linear", {"x": ln1}, qkv_params)
+        split = g.add_node(
+            f"l{layer}_split",
+            "split_qkv",
+            {"x": qkv},
+            {"n_heads": heads, "layout": "interleaved"},
+        )
+        q = g.add_node(
+            f"l{layer}_q_rope",
+            "rope",
+            {"x": split, "positions": Ref("input:positions")},
+            {"theta": theta, "rotary_dim": rotary_dim},
+        )
+        k = g.add_node(
+            f"l{layer}_k_rope",
+            "rope",
+            {"x": Ref(f"l{layer}_split", 1), "positions": Ref("input:positions")},
+            {"theta": theta, "rotary_dim": rotary_dim},
+        )
+        attn = g.add_node(
+            f"l{layer}_attn",
+            "attention",
+            {"q": q, "k": k, "v": Ref(f"l{layer}_split", 2)},
+            {"causal": True, "scale": "auto"},
+        )
+        merged = g.add_node(
+            f"l{layer}_merge", "merge_heads", {"x": attn}, {"n_heads": heads}
+        )
+        attn_params = {"weight": f"param:{p}.attn_out.weight"}
+        if attention_bias:
+            attn_params["bias"] = f"param:{p}.attn_out.bias"
+        attn_out = g.add_node(
+            f"l{layer}_attn_out", "linear", {"x": merged}, attn_params
+        )
+
+        if parallel:
+            mlp_input = g.add_node(
+                f"l{layer}_ln2",
+                "layernorm",
+                {"x": cur},
+                {
+                    "weight": f"param:{p}.ln2.weight",
+                    "bias": f"param:{p}.ln2.bias",
+                    "eps": eps,
+                },
+            )
+        else:
+            res1 = g.add_node(f"l{layer}_res1", "add", {"a": cur, "b": attn_out})
+            mlp_input = g.add_node(
+                f"l{layer}_ln2",
+                "layernorm",
+                {"x": res1},
+                {
+                    "weight": f"param:{p}.ln2.weight",
+                    "bias": f"param:{p}.ln2.bias",
+                    "eps": eps,
+                },
+            )
+        up = g.add_node(
+            f"l{layer}_mlp_up",
+            "linear",
+            {"x": mlp_input},
+            {"weight": f"param:{p}.mlp_up.weight", "bias": f"param:{p}.mlp_up.bias"},
+        )
+        act = g.add_node(f"l{layer}_act", "gelu", {"x": up})
+        down = g.add_node(
+            f"l{layer}_mlp_down",
+            "linear",
+            {"x": act},
+            {"weight": f"param:{p}.mlp_down.weight", "bias": f"param:{p}.mlp_down.bias"},
+        )
+        if parallel:
+            res1 = g.add_node(f"l{layer}_res1", "add", {"a": cur, "b": attn_out})
+        cur = g.add_node(f"l{layer}_res2", "add", {"a": res1, "b": down})
+
+    final = g.add_node(
+        "norm",
+        "layernorm",
+        {"x": cur},
+        {"weight": "param:norm.weight", "bias": "param:norm.bias", "eps": eps},
+    )
+    logits = g.add_node(
+        "lm_head",
+        "linear",
+        {"x": final},
+        {"weight": "param:lm_head.weight"},
+    )
+    g.set_output("logits", logits)
+    g.set_output("hidden", final)
+    return ArchitectureDefinition(
+        family="transformer_decoder",
+        spec=dict(spec),
+        graph=g,
+        parameter_shapes=sh,
+        default_inputs={"tokens": ("B", "T"), "positions": ("B", "T")},
+        input_dtypes={"tokens": "int64", "positions": "int64"},
+    )
+
+
+def _neox_tensors(
+    arrays: Mapping[str, np.ndarray],
+    spec: Mapping[str, Any],
+    definition: ArchitectureDefinition,
+    unresolved: list[str],
+) -> tuple[
+    dict[str, np.ndarray],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    expected = dict(definition.parameter_shapes)
+    canonical: dict[str, np.ndarray] = {}
+    mapping: list[dict[str, Any]] = []
+    missing: list[str] = []
+    shape_errors: list[str] = []
+    used: set[str] = set()
+    tie = bool(spec["tie_embeddings"])
+    attention_bias = bool(spec["attention_bias"])
+
+    def add(target: str, source: str | None, transform: str = "identity", note: str = "") -> None:
+        if target not in expected:
+            shape_errors.append(f"adapter produced unexpected target '{target}'")
+            return
+        if source is None or source not in arrays:
+            missing.append(target)
+            mapping.append(
+                {
+                    "target": target,
+                    "source": source,
+                    "transform": transform,
+                    "status": "missing",
+                    "expected_shape": list(expected[target]),
+                    "note": note,
+                }
+            )
+            return
+        arr = arrays[source]
+        shape = [int(d) for d in arr.shape]
+        status = "mapped"
+        if tuple(shape) != tuple(expected[target]):
+            status = "shape_error"
+            shape_errors.append(
+                f"{target}: source {source} shape {shape} != expected {list(expected[target])}"
+            )
+        if status == "mapped":
+            canonical[target] = np.ascontiguousarray(arr)
+            used.add(source)
+        mapping.append(
+            {
+                "target": target,
+                "source": source,
+                "transform": transform,
+                "status": status,
+                "source_shape": shape,
+                "expected_shape": list(expected[target]),
+                "dtype": dtype_name(arr.dtype),
+                "note": note,
+            }
+        )
+
+    add("embed.weight", "gpt_neox.embed_in.weight")
+    add("norm.weight", "gpt_neox.final_layer_norm.weight")
+    add("norm.bias", "gpt_neox.final_layer_norm.bias")
+    embed = arrays.get("gpt_neox.embed_in.weight")
+    lm_head = arrays.get("embed_out.weight")
+    if tie:
+        if lm_head is not None:
+            if embed is not None and lm_head.shape == embed.shape and not np.array_equal(lm_head, embed):
+                unresolved.append(
+                    "tied embed_in/embed_out tensors differ; no tied GPT-NeoX graph is claimed"
+                )
+            add("lm_head.weight", "embed_out.weight", note="tied LM head")
+        else:
+            add(
+                "lm_head.weight",
+                "gpt_neox.embed_in.weight",
+                "tied_embedding",
+                "LM head tied to the word embedding",
+            )
+    else:
+        add("lm_head.weight", "embed_out.weight")
+
+    for layer in range(int(spec["n_layers"])):
+        src = f"gpt_neox.layers.{layer}"
+        dst = f"layers.{layer}"
+        add(f"{dst}.ln1.weight", f"{src}.input_layernorm.weight")
+        add(f"{dst}.ln1.bias", f"{src}.input_layernorm.bias")
+        add(f"{dst}.ln2.weight", f"{src}.post_attention_layernorm.weight")
+        add(f"{dst}.ln2.bias", f"{src}.post_attention_layernorm.bias")
+        add(
+            f"{dst}.qkv.weight",
+            f"{src}.attention.query_key_value.weight",
+            note="per-head-interleaved QKV layout",
+        )
+        add(f"{dst}.attn_out.weight", f"{src}.attention.dense.weight")
+        add(f"{dst}.mlp_up.weight", f"{src}.mlp.dense_h_to_4h.weight")
+        add(f"{dst}.mlp_up.bias", f"{src}.mlp.dense_h_to_4h.bias")
+        add(f"{dst}.mlp_down.weight", f"{src}.mlp.dense_4h_to_h.weight")
+        add(f"{dst}.mlp_down.bias", f"{src}.mlp.dense_4h_to_h.bias")
+        if attention_bias:
+            add(f"{dst}.qkv.bias", f"{src}.attention.query_key_value.bias")
+            add(f"{dst}.attn_out.bias", f"{src}.attention.dense.bias")
+
+    extra = sorted(set(arrays) - used)
+    for tensor_name in extra:
+        unresolved.append(
+            f"source tensor '{tensor_name}' is not represented by the GPT-NeoX graph"
+        )
+    return canonical, mapping, sorted(set(missing)), extra, shape_errors, unresolved
+
+
+def _execute_neox(
+    definition: ArchitectureDefinition, package: WeightPackage, spec: Mapping[str, Any]
+) -> dict[str, Any]:
+    seq = min(4, int(spec["max_seq_len"]))
+    tokens = np.arange(seq, dtype=np.int64).reshape(1, seq)
+    positions = np.arange(seq, dtype=np.int64).reshape(1, seq)
+    inputs = {"tokens": tokens, "positions": positions}
+    try:
+        result = execute(definition.graph, inputs, package, check_finite=True, validate_types=True)
+        logits = result.output("logits")
+        expected = (1, seq, int(spec["vocab_size"]))
+        if tuple(logits.shape) != expected:
+            return {
+                "status": "failed",
+                "message": f"logits shape {tuple(logits.shape)} != expected {expected}",
+                "inputs": {k: list(v.shape) for k, v in inputs.items()},
+            }
+        return {
+            "status": "passed",
+            "message": "GPT-NeoX forward pass produced finite logits with the expected shape",
             "inputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in inputs.items()},
             "outputs": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in result.outputs.items()},
             "num_ops": result.num_ops,

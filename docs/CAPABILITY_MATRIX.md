@@ -121,13 +121,13 @@ single-objective contract.
 | --- | --- |
 | Families: `transformer_decoder`, `mlp`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `moe`, `state_space`, `gnn`, `vae`, `diffusion`, `multimodal`, `hybrid` | implemented |
 | NIR operators (41): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, reductions, activations | implemented |
-| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT graphs; finite output validation, no KV cache |
+| Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX graphs; finite output validation, no KV cache |
 | Tokenizer-backed text inference | implemented for imported GPT-2/Llama/OPT artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
 | Greedy autoregressive generation | implemented; one real forward pass per token, explicit EOS or context-length stopping, no sampling and no KV cache |
 | Weight-only modification with stored-graph preservation | implemented; parent graph metadata is copied to the modified artifact |
 | Source/candidate model output comparison | implemented; same-graph enforcement, recorded tolerances and per-output errors |
 | Per-layer activation capture | implemented; `capture="layers"` returns `l<N>_res2` block outputs, explicit NIR node ids are also accepted |
-| Layer-by-layer Hugging Face parity | implemented for GPT-2/Llama/OPT via transformer forward hooks; per-layer shape and error report, gated live validation |
+| Layer-by-layer Hugging Face parity | implemented for GPT-2/Llama/OPT/GPT-NeoX via transformer forward hooks; per-layer shape and error report, gated live validation |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
 | Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |

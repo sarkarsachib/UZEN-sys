@@ -578,3 +578,166 @@ def compare_opt_activations(
         atol=atol,
         rtol=rtol,
     )
+
+
+def _neox_positions(
+    token_array: np.ndarray,
+    positions: Sequence[Sequence[int]] | Sequence[int] | None,
+) -> np.ndarray:
+    batch, seq = token_array.shape
+    if positions is None:
+        return np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    position_array = np.asarray(positions, dtype=np.int64)
+    if position_array.ndim == 1:
+        position_array = position_array.reshape(1, -1)
+    if position_array.ndim != 2:
+        raise ValueError("positions must be rank 1 or 2")
+    if position_array.shape[0] == 1 and batch > 1:
+        position_array = np.repeat(position_array, batch, axis=0)
+    if position_array.shape != (batch, seq):
+        raise ValueError(
+            f"positions must have shape {(batch, seq)}, got {position_array.shape}"
+        )
+    if int(position_array.min()) < 0:
+        raise ValueError("positions must be non-negative")
+    return position_array
+
+
+def compare_neox_logits(
+    graph: Graph,
+    package: WeightPackage,
+    source: str | Path,
+    *,
+    tokens: Sequence[Sequence[int]] | None = None,
+    positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> dict[str, Any]:
+    """Compare reconstructed GPT-NeoX logits against ``GPTNeoXForCausalLM``.
+
+    GPT-NeoX rotates only the first ``rotary_dim`` channels of each head, so the
+    comparison also exercises the partial-RoPE graph node rather than assuming a
+    full-head rotation. Positions are passed explicitly to both implementations.
+    """
+    if atol < 0 or rtol < 0:
+        raise ValueError("atol and rtol must be non-negative")
+    try:
+        import torch
+        from transformers import GPTNeoXForCausalLM
+    except ImportError as exc:  # pragma: no cover - depends on optional environment
+        raise RuntimeUnavailable(
+            "GPT-NeoX parity requires optional packages: install transformers and torch"
+        ) from exc
+
+    token_array = (
+        np.asarray(tokens, dtype=np.int64)
+        if tokens is not None
+        else np.array([[0, 1, 2, 3]], dtype=np.int64)
+    )
+    if token_array.ndim != 2:
+        raise ValueError("tokens must have shape (batch, sequence)")
+    if token_array.size == 0:
+        raise ValueError("tokens must not be empty")
+    if int(token_array.min()) < 0:
+        raise ValueError("tokens must be non-negative")
+    position_array = _neox_positions(token_array, positions)
+
+    source_path = Path(source)
+    if not source_path.exists():
+        raise FileNotFoundError(f"local reference checkpoint not found: {source_path}")
+
+    model = GPTNeoXForCausalLM.from_pretrained(
+        str(source_path), local_files_only=True
+    ).eval()
+    with torch.no_grad():
+        reference = model(
+            input_ids=torch.as_tensor(token_array),
+            position_ids=torch.as_tensor(position_array),
+        ).logits.detach().cpu().numpy()
+    actual = execute(
+        graph,
+        {"tokens": token_array, "positions": position_array},
+        package,
+    ).output("logits")
+    return _comparison_report(
+        actual,
+        reference,
+        reference_name="transformers.GPTNeoXForCausalLM",
+        source_path=source_path,
+        tokens=token_array,
+        positions=position_array,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+def compare_neox_activations(
+    graph: Graph,
+    package: WeightPackage,
+    source: str | Path,
+    *,
+    tokens: Sequence[Sequence[int]] | None = None,
+    positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> dict[str, Any]:
+    """Compare each reconstructed GPT-NeoX block output with Hugging Face."""
+    if atol < 0 or rtol < 0:
+        raise ValueError("atol and rtol must be non-negative")
+    try:
+        import torch
+        from transformers import GPTNeoXForCausalLM
+    except ImportError as exc:  # pragma: no cover - depends on optional environment
+        raise RuntimeUnavailable(
+            "GPT-NeoX activation parity requires optional packages: install transformers and torch"
+        ) from exc
+
+    token_array = (
+        np.asarray(tokens, dtype=np.int64)
+        if tokens is not None
+        else np.array([[0, 1, 2, 3]], dtype=np.int64)
+    )
+    if token_array.ndim != 2:
+        raise ValueError("tokens must have shape (batch, sequence)")
+    if token_array.size == 0:
+        raise ValueError("tokens must not be empty")
+    if int(token_array.min()) < 0:
+        raise ValueError("tokens must be non-negative")
+    position_array = _neox_positions(token_array, positions)
+
+    source_path = Path(source)
+    if not source_path.exists():
+        raise FileNotFoundError(f"local reference checkpoint not found: {source_path}")
+    node_ids = layer_node_ids(graph)
+    if not node_ids:
+        raise ValueError("graph has no reconstructed transformer layer outputs (l<N>_res2)")
+
+    model = GPTNeoXForCausalLM.from_pretrained(
+        str(source_path), local_files_only=True
+    ).eval()
+    blocks = getattr(getattr(model, "gpt_neox", None), "layers", None)
+    if blocks is None:
+        raise ValueError("Hugging Face GPT-NeoX model does not expose decoder layers")
+    with torch.no_grad():
+        block_outputs = _block_outputs(
+            blocks,
+            lambda: model(
+                input_ids=torch.as_tensor(token_array),
+                position_ids=torch.as_tensor(position_array),
+            ),
+        )
+    captured = execute(
+        graph,
+        {"tokens": token_array, "positions": position_array},
+        package,
+        capture=node_ids,
+    ).intermediates
+    return _activation_report(
+        _compare_block_outputs(captured, block_outputs, node_ids, atol=atol, rtol=rtol),
+        reference_name="transformers.GPTNeoXForCausalLM",
+        source_path=source_path,
+        tokens=token_array,
+        positions=position_array,
+        atol=atol,
+        rtol=rtol,
+    )
