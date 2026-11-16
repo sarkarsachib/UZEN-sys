@@ -1,10 +1,12 @@
 """Declarative Hugging Face decoder-family profiles.
 
 A profile is deliberately data, not a guessed adapter.  ``reconstruct`` is true
-only for families whose config fields and tensor names are handled by the shared
-Llama-like reconstruction path.  Families that need a different attention or
-positional layout stay explicit import profiles and report ``unsupported`` with
-their concrete reason instead of being mapped to the nearest architecture.
+only for families whose config fields and tensor names are handled by an explicit
+reconstruction adapter: the shared Llama-like path for Gemma/Mistral/Llama
+profiles, or the dedicated GPT-J path for its parallel residual and interleaved
+partial RoPE.  Families that need an unimplemented layout stay explicit import
+profiles and report ``unsupported`` with their concrete reason instead of being
+mapped to the nearest architecture.
 """
 
 from __future__ import annotations
@@ -26,6 +28,11 @@ class HFProfile:
     partial_rotary: bool = False
     clip_qkv: bool = False
     sliding_window: bool = False
+    embed_scale: bool = False
+    zero_centered_norm: bool = False
+    legacy_gelu_tanh: bool = False
+    default_tie_embeddings: bool = False
+    adapter: str = "llama"
     reason: str = ""
 
 
@@ -58,12 +65,17 @@ _PROFILES = (
     HFProfile(
         "gemma",
         ("GemmaForCausalLM",),
-        reason="Gemma's embedding scale and GeGLU layout need a dedicated graph",
+        True,
+        embed_scale=True,
+        zero_centered_norm=True,
+        legacy_gelu_tanh=True,
+        default_tie_embeddings=True,
     ),
     HFProfile(
         "gptj",
         ("GPTJForCausalLM",),
-        reason="GPT-J uses separate Q/K/V projections and a parallel residual",
+        True,
+        adapter="gptj",
     ),
     HFProfile(
         "gpt_neo",
@@ -116,6 +128,7 @@ def profile_catalogue() -> list[dict[str, object]]:
             "model_type": profile.model_type,
             "architectures": list(profile.architectures),
             "reconstruct": profile.reconstruct,
+            "adapter": profile.adapter,
             "reason": profile.reason,
         }
         for profile in _PROFILES

@@ -331,8 +331,14 @@ class Uzen:
         max_new_tokens: int = 16,
         eos_token_id: int | None = None,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        strategy: str = "greedy",
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        num_beams: int = 1,
     ) -> dict[str, Any]:
-        """Generate text greedily with the artifact's stored tokenizer and graph."""
+        """Generate text with the artifact's stored tokenizer and graph."""
         if not self.local:
             return self._request(
                 "POST",
@@ -342,6 +348,12 @@ class Uzen:
                     "max_new_tokens": max_new_tokens,
                     "eos_token_id": eos_token_id,
                     "positions": positions,
+                    "strategy": strategy,
+                    "temperature": temperature,
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "seed": seed,
+                    "num_beams": num_beams,
                 },
             )
         result: ModelGeneration = self.service.generate_text(
@@ -350,6 +362,12 @@ class Uzen:
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             positions=positions,
+            strategy=strategy,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            num_beams=num_beams,
         )
         return result.summary()
 

@@ -125,6 +125,104 @@ def test_modified_model_keeps_text_tokenizer(tmp_path):
     assert candidate["outputs"]["logits"]["shape"] == source["outputs"]["logits"]["shape"]
 
 
+def test_gpt2_seeded_sampling_top1_matches_greedy(tmp_path):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    greedy = client.generate_text(artifact_id, text="hello world", max_new_tokens=3)
+    sampled = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=3,
+        strategy="sample",
+        temperature=0.5,
+        top_k=1,
+        seed=5,
+    )
+    assert greedy["generated_token_ids"] == sampled["generated_token_ids"]
+
+
+def test_generation_greedy_sample_top1_and_single_beam_are_equivalent(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    greedy = client.generate_text(
+        artifact_id, text="hello world", max_new_tokens=4, seed=7
+    )
+    sampled = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.8,
+        top_k=1,
+        seed=7,
+    )
+    beam = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="beam",
+        num_beams=1,
+        seed=7,
+    )
+    assert greedy["generated_token_ids"] == sampled["generated_token_ids"]
+    assert greedy["generated_token_ids"] == beam["generated_token_ids"]
+    assert greedy["strategy"] == "greedy"
+    assert sampled["strategy"] == "sample"
+    assert beam["strategy"] == "beam"
+
+
+def test_seeded_sampling_is_deterministic_and_beam_search_runs(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    first = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.9,
+        top_p=0.9,
+        seed=123,
+    )
+    second = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.9,
+        top_p=0.9,
+        seed=123,
+    )
+    assert first["generated_token_ids"] == second["generated_token_ids"]
+    assert first["seed"] == 123
+    assert first["temperature"] == 0.9
+    assert first["top_p"] == 0.9
+
+    beam = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=3,
+        strategy="beam",
+        num_beams=3,
+    )
+    assert 0 <= beam["steps"] <= 3
+    assert beam["num_beams"] == 3
+    assert len(beam["full_token_ids"]) == len(beam["prompt_token_ids"]) + beam["steps"]
+    assert beam["stopped_reason"] in {"eos_token", "max_new_tokens", "max_sequence_length"}
+
+
+def test_generation_rejects_inconsistent_sampling_options(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="sample", temperature=0
+        )
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="greedy", num_beams=2
+        )
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="sample", top_p=0
+        )
+
+
 def test_llama_text_inference_with_positions(tmp_path):
     client, artifact_id = _llama_text_client(tmp_path)
     result = client.forward_text(

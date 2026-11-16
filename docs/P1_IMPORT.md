@@ -185,19 +185,21 @@ notifications loses no diagnostic information.
 * A license is reported when found in model-card frontmatter or `config.json`;
   otherwise it is explicitly `unknown`. Importing a checkpoint does not change or
   infer its license.
-* Reconstruction currently supports explicit GPT-2, Llama, OPT and GPT-NeoX
-  adapters plus the Llama-like profile adapters for Mistral (sliding-window
-  attention), Qwen2, Yi, Aquila, Baichuan, InternLM2, OLMo, MiniCPM and Orion.
-  Profile reconstruction still requires the exact Llama tensor names and config
-  fields; profiles are not guessed. Import profiles for StableLM (biased
-  LayerNorm and GELU), Gemma, GPT-J, GPT-Neo, Falcon, Bloom, MPT and Phi are
-  recognized but report a concrete `unsupported` reason. OPT variants with `word_embed_proj_dim !=
+* Reconstruction currently supports explicit GPT-2, Llama, OPT, GPT-NeoX and
+  GPT-J adapters plus the Llama-like profile adapters for Gemma (zero-centered
+  RMSNorm and embedding scale), Mistral (sliding-window attention), Qwen2, Yi,
+  Aquila, Baichuan, InternLM2, OLMo, MiniCPM and Orion. GPT-J uses a dedicated
+  parallel-residual graph with interleaved partial RoPE. Reconstruction still
+  requires the exact tensor names and config fields for the selected adapter;
+  profiles are not guessed. Import profiles for StableLM (biased LayerNorm and
+  GELU), GPT-Neo, Falcon, Bloom, MPT and Phi are recognized but report a
+  concrete `unsupported` reason. OPT variants with `word_embed_proj_dim !=
   hidden_size`, post-LN OPT, scaled embeddings or non-ReLU activations, GPT-NeoX
   variants with scaled RoPE or unsupported activations, learned architecture
   variants, quantized formats, and arbitrary custom layers remain unsupported
   rather than approximated.
 * Reference-logit parity is checked only in the gated live tests against tiny
-  public fixtures. Llama, GPT-2, OPT, GPT-NeoX, Mistral, Qwen2 and OLMo have live parity;
+  public fixtures. Llama, GPT-2, OPT, GPT-NeoX, Gemma, GPT-J, Qwen2, OLMo and Mistral have live parity;
   the other profile adapters are layout- and execution-tested but are not a
   guarantee for every checkpoint.
 * Text inference requires a `tokenizer.json` payload and the optional `uzen[tokenizer]`

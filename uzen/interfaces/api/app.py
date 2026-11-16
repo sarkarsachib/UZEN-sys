@@ -307,6 +307,12 @@ def create_app(
             max_new_tokens=int(payload.get("max_new_tokens", 16)),
             eos_token_id=payload.get("eos_token_id"),
             positions=payload.get("positions"),
+            strategy=str(payload.get("strategy", "greedy")),
+            temperature=float(payload.get("temperature", 1.0)),
+            top_k=payload.get("top_k"),
+            top_p=payload.get("top_p"),
+            seed=payload.get("seed"),
+            num_beams=int(payload.get("num_beams", 1)),
         )
 
     @app.post(f"/{API_VERSION}/models/compare")

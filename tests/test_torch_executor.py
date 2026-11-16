@@ -234,6 +234,29 @@ def test_torch_rope_matches_numpy_reference():
     np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_torch_interleaved_partial_rope_matches_numpy_reference():
+    rng = np.random.default_rng(23)
+    x = rng.standard_normal((2, 3, 4, 8)).astype(np.float32)
+    positions = np.array([[0, 2, 3, 5]], dtype=np.int64)
+    graph = Graph(
+        name="interleaved-rope-parity",
+        inputs={"x": TensorType.of((2, 3, 4, 8)), "positions": TensorType.of((1, 4), "int64")},
+    )
+    graph.add_node(
+        "rope",
+        "rope",
+        {"x": Ref("input:x"), "positions": Ref("input:positions")},
+        {"theta": 10000.0, "rotary_dim": 4, "interleaved": True},
+    )
+    graph.set_output("y", Ref("rope"))
+    package = WeightPackage.from_arrays({})
+    inputs = {"x": x, "positions": positions}
+
+    expected = execute(graph, inputs, package).outputs["y"]
+    got = execute_torch(graph, inputs, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
 def test_torch_repeat_kv_matches_numpy_reference():
     rng = np.random.default_rng(22)
     x = rng.standard_normal((2, 2, 4, 5)).astype(np.float32)

@@ -415,6 +415,88 @@ def test_live_tiny_olmo_non_affine_norms_match_huggingface(tmp_path):
     assert parity["max_abs_error"] <= 1e-5
 
 
+def test_live_tiny_gemma_matches_huggingface(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from transformers import GemmaForCausalLM
+
+    repo_id = "fxmarty/tiny-random-GemmaForCausalLM"
+    model = GemmaForCausalLM.from_pretrained(repo_id).eval()
+    local = tmp_path / "gemma"
+    model.save_pretrained(local, safe_serialization=True)
+
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.reconstruction["spec"]["profile"] == "gemma"
+    assert result.report.reconstruction["spec"]["zero_centered_norm"] is True
+    assert any(
+        node["op"] == "scale"
+        and node["params"].get("factor") == (result.report.config["hidden_size"] ** 0.5)
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+    assert any(
+        item.get("transform") == "add_one"
+        for item in result.report.reconstruction["tensor_mapping"]
+    )
+
+    parity = compare_llama_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+        model_cls=GemmaForCausalLM,
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
+def test_live_tiny_gptj_matches_huggingface(tmp_path):
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from transformers import GPTJForCausalLM
+
+    repo_id = "hf-internal-testing/tiny-random-GPTJForCausalLM"
+    model = GPTJForCausalLM.from_pretrained(repo_id).eval()
+    local = tmp_path / "gptj"
+    model.save_pretrained(local, safe_serialization=True)
+
+    result = ModelImporter().import_source(local)
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.reconstruction["spec"]["profile"] == "gptj"
+    assert result.report.reconstruction["spec"]["rotary_dim"] == 4
+    assert result.report.reconstruction["spec"]["activation"] == "gelu"
+    assert any(
+        node["op"] == "rope" and node["params"].get("interleaved") is True
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+    assert not any(
+        node["id"] == "l0_ln2"
+        for node in result.report.reconstruction["graph"]["nodes"]
+    )
+
+    parity = compare_llama_logits(
+        result.reconstruction.definition.graph,
+        result.artifact_package,
+        local,
+        tokens=[[0, 1, 2, 3]],
+        positions=[[0, 1, 2, 3]],
+        atol=1e-5,
+        rtol=1e-5,
+        model_cls=GPTJForCausalLM,
+    )
+    assert parity["passed"], parity
+    assert parity["max_abs_error"] <= 1e-5
+
+
 def test_live_tiny_mistral_sliding_window_matches_huggingface(tmp_path):
     """Verify the windowed Mistral path against a real checkpoint."""
     pytest.importorskip("huggingface_hub")

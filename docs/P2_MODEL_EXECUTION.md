@@ -118,26 +118,41 @@ The REST endpoint is `POST /v1/models/{artifact_id}/forward-text`, the CLI form 
 `uzen forward ARTIFACT_ID --text 'hello world'`, and MCP exposes
 `uzen.forward_text`.
 
-## Greedy autoregressive generation
+## Autoregressive generation
 
-`generate_text()` selects the highest-logit token at the final position. For
-decoder-only graphs without learned positional tables (Llama, Mistral, GPT-NeoX
-and the Llama-like profile graphs), it prefills the prompt once into an in-memory
-K/V cache and then runs one single-token decode per generated token. Graphs with
-learned position embeddings (GPT-2, OPT) fall back to full-sequence
-recomputation. This is deterministic greedy decoding, not sampling.
+`generate_text()` supports three decoding strategies. `greedy` selects the
+highest-logit token. `sample` draws from the temperature-scaled distribution with
+optional top-k and nucleus (top-p) truncation; a seed makes the sequence
+reproducible. `beam` scores complete hypotheses by cumulative log-probability and
+returns the best beam. For decoder-only graphs without learned positional tables
+(Llama, Mistral, GPT-NeoX and the Llama-like profile graphs), greedy and sampled
+decoding prefill the prompt once into an in-memory K/V cache and then run one
+single-token decode per generated token. Graphs with learned position embeddings
+(GPT-2, OPT) and beam search use full-sequence recomputation.
 
 ```python
 generated = client.generate_text(
     imported["artifact_id"],
     text="hello world",
     max_new_tokens=8,
+    strategy="sample",  # greedy | sample | beam
+    temperature=0.8,
+    top_k=50,
+    top_p=0.9,
+    seed=123,
+    num_beams=1,
 )
 generated["generated_text"]
 generated["full_text"]
 generated["generated_token_ids"]
 generated["stopped_reason"]  # eos_token | max_new_tokens | max_sequence_length
+generated["strategy"], generated["seed"]
 ```
+
+`top_k` and `top_p` apply only to `sample`. `num_beams` greater than one requires
+`strategy="beam"`. Beam search has no length penalty and does not use the K/V
+cache; it is intended for deterministic best-hypothesis selection, not fast
+long-context decoding.
 
 EOS is taken from an explicit `eos_token_id` or inferred from the tokenizer's
 declared special tokens. The context limit comes from the graph's stored
@@ -146,7 +161,8 @@ exceeding it. Explicit prompt `positions` are extended by one per generated toke
 
 REST uses `POST /v1/models/{artifact_id}/generate-text`, the CLI uses
 `uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8`, and MCP
-exposes `uzen.generate_text`.
+exposes `uzen.generate_text`; all three accept the strategy, temperature, top-k,
+top-p, seed and num-beams options.
 
 ## Modifying a real model
 
@@ -224,15 +240,16 @@ MCP:
 
 * Execution is for causal-LM graphs with `tokens` and optional `positions`
   inputs, which are the graphs produced by the current GPT-2/Llama/OPT/GPT-NeoX
-  adapters.
+  adapters and the explicit Llama-like profile graphs.
 * Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
   `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
 * The K/V cache is process-local and generation-scoped; it is not a paged or
   disk-backed cache, and cached decoding is limited to decoder self-attention
   graphs whose positions are carried by RoPE or explicit inputs. Cross-attention
   graphs are not cached.
-* Generation is greedy only; sampling, beam search and temperature controls are
-  not implemented.
+* Beam search is exhaustive full-sequence scoring with raw cumulative
+  log-probability and no length penalty; it does not use the K/V cache and is
+  not a paged or batched beam implementation.
 * Prompt and generated tokens are limited to the graph's stored maximum sequence
   length.
 * A modification that changes parameter structure is not comparable as the same

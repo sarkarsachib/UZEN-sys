@@ -263,14 +263,23 @@ def _rope(inputs, params, bound):
             / rotary_dim
         )
     )
-    freqs = torch.cat([inv_freq, inv_freq], dim=0)
+    interleaved = bool(params.get("interleaved", False))
+    freqs = (
+        torch.repeat_interleave(inv_freq, 2)
+        if interleaved
+        else torch.cat([inv_freq, inv_freq], dim=0)
+    )
     angles = pos.to(torch.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = torch.cos(angles)
     sin = torch.sin(angles)
     x_rot = x[..., :rotary_dim]
-    x1 = x_rot[..., :half]
-    x2 = x_rot[..., half:]
-    rotated = torch.cat([-x2, x1], dim=-1)
+    if interleaved:
+        pairs = x_rot.reshape(*x_rot.shape[:-1], half, 2)
+        rotated = torch.stack([-pairs[..., 1], pairs[..., 0]], dim=-1).reshape(x_rot.shape)
+    else:
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        rotated = torch.cat([-x2, x1], dim=-1)
     rotated_out = x_rot.to(torch.float64) * cos + rotated.to(torch.float64) * sin
     if rotary_dim == dim:
         out = rotated_out

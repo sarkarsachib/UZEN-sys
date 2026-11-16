@@ -2,9 +2,9 @@
 
 The importer is deliberately conservative. It establishes that every tensor was
 loaded, that a configuration was parsed and that roles were inferred. For the
-explicit GPT-2, Llama, OPT and GPT-NeoX adapters it then reconstructs and validates an NIR
-graph and runs a finite forward pass; other architectures are reported as
-unsupported rather than guessed. Import, reconstruction and execution remain
+explicit GPT-2, Llama, OPT, GPT-NeoX, GPT-J and Gemma adapters it then reconstructs and
+validates an NIR graph and runs a finite forward pass; other architectures are
+reported as unsupported rather than guessed. Import, reconstruction and execution remain
 independent claims.
 
 Supported sources

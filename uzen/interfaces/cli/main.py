@@ -139,12 +139,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fwd.add_argument("--values", action="store_true", help="include output and captured values")
 
-    gen_text = sub.add_parser("generate-text", help="greedily generate text from a model artifact")
+    gen_text = sub.add_parser("generate-text", help="generate text from a model artifact")
     gen_text.add_argument("artifact_id")
     gen_text.add_argument("--text", required=True, help="prompt text")
     gen_text.add_argument("--max-new-tokens", type=int, default=16)
     gen_text.add_argument("--eos-token-id", type=int)
     gen_text.add_argument("--positions", help="JSON prompt position matrix")
+    gen_text.add_argument("--strategy", choices=("greedy", "sample", "beam"), default="greedy")
+    gen_text.add_argument("--temperature", type=float, default=1.0)
+    gen_text.add_argument("--top-k", type=int)
+    gen_text.add_argument("--top-p", type=float)
+    gen_text.add_argument("--seed", type=int)
+    gen_text.add_argument("--num-beams", type=int, default=1)
 
     cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
     cmp_models.add_argument("source_artifact_id")
@@ -370,6 +376,12 @@ def _dispatch(args: argparse.Namespace) -> int:
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=args.eos_token_id,
                 positions=_json_arg(args.positions),
+                strategy=args.strategy,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=args.seed,
+                num_beams=args.num_beams,
             )
         )
         return 0

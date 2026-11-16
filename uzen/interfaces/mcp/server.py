@@ -129,8 +129,9 @@ class MCPServer:
             "uzen.generate_text": (
                 {
                     "description": (
-                        "Greedily generate text from an imported causal-LM artifact using "
-                        "its stored tokenizer and reconstructed graph. No training or gradients."
+                        "Generate text from an imported causal-LM artifact using its "
+                        "stored tokenizer and reconstructed graph. Supports greedy, seeded "
+                        "sampling and beam search. No training or gradients."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -143,6 +144,12 @@ class MCPServer:
                                 "type": "array",
                                 "items": {"type": "array", "items": {"type": "integer"}},
                             },
+                            "strategy": {"type": "string", "enum": ["greedy", "sample", "beam"]},
+                            "temperature": {"type": "number", "minimum": 0},
+                            "top_k": {"type": "integer", "minimum": 1},
+                            "top_p": {"type": "number", "minimum": 0, "maximum": 1},
+                            "seed": {"type": "integer", "minimum": 0},
+                            "num_beams": {"type": "integer", "minimum": 1},
                         },
                         "required": ["artifact_id", "text"],
                     },
@@ -496,6 +503,12 @@ class MCPServer:
             max_new_tokens=int(args.get("max_new_tokens", 16)),
             eos_token_id=args.get("eos_token_id"),
             positions=args.get("positions"),
+            strategy=str(args.get("strategy", "greedy")),
+            temperature=float(args.get("temperature", 1.0)),
+            top_k=args.get("top_k"),
+            top_p=args.get("top_p"),
+            seed=args.get("seed"),
+            num_beams=int(args.get("num_beams", 1)),
         )
 
     def _compare_models(self, args: Mapping[str, Any]) -> Any:

@@ -50,7 +50,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/models/import` | import a local HF directory/file, weights-only `.pt/.pth/.bin/.ckpt`, single-file `.onnx`, or `repo_id` + `revision`; returns the compatibility report or provenance report, plus graph/reconstruction status when available |
 | POST | `/v1/models/{id}/forward` | execute a stored reconstructed graph on tokens/positions; optional `capture` node ids or `["layers"]` |
 | POST | `/v1/models/{id}/forward-text` | tokenize text with the artifact's stored `tokenizer.json`, then execute the graph |
-| POST | `/v1/models/{id}/generate-text` | greedy autoregressive generation with EOS/context stopping |
+| POST | `/v1/models/{id}/generate-text` | greedy, seeded sampling or beam generation with EOS/context stopping |
 | POST | `/v1/models/compare` | compare source and weight-modified model outputs with recorded tolerances |
 | GET | `/v1/models` | model registry |
 | GET | `/v1/weights` | weight artifact registry |

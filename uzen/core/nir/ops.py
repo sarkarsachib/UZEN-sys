@@ -478,14 +478,23 @@ def _rope_run(inputs, params, bound):
     inv_freq = 1.0 / (
         theta ** (np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
     )
-    freqs = np.concatenate([inv_freq, inv_freq], axis=0)
+    interleaved = bool(params.get("interleaved", False))
+    freqs = (
+        np.repeat(inv_freq, 2)
+        if interleaved
+        else np.concatenate([inv_freq, inv_freq], axis=0)
+    )
     angles = pos.astype(np.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = np.cos(angles)
     sin = np.sin(angles)
     x_rot = x[..., :rotary_dim]
-    x1 = x_rot[..., :half]
-    x2 = x_rot[..., half:]
-    rotated = np.concatenate([-x2, x1], axis=-1)
+    if interleaved:
+        pairs = x_rot.reshape(x_rot.shape[:-1] + (half, 2))
+        rotated = np.stack([-pairs[..., 1], pairs[..., 0]], axis=-1).reshape(x_rot.shape)
+    else:
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        rotated = np.concatenate([-x2, x1], axis=-1)
     rotated_out = x_rot.astype(np.float64) * cos + rotated.astype(np.float64) * sin
     if rotary_dim == dim:
         out = rotated_out

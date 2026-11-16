@@ -500,8 +500,14 @@ class JobService:
         max_new_tokens: int = 16,
         eos_token_id: int | None = None,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        strategy: str = "greedy",
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        num_beams: int = 1,
     ) -> ModelGeneration:
-        """Greedily generate tokens from the stored tokenizer and model graph."""
+        """Generate tokens with greedy, seeded-sampling or beam search decoding."""
         return greedy_generate(
             self.get_package(artifact_id),
             self.artifact_manifest(artifact_id),
@@ -511,6 +517,12 @@ class JobService:
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             positions=positions,
+            strategy=strategy,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            num_beams=num_beams,
         )
 
     def compare_models(
