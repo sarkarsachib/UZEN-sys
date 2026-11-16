@@ -141,8 +141,9 @@ single-objective contract.
 | --- | --- |
 | NumPy reference (safetensors + npz, graph execution) | implemented |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
-| Torch-CPU NIR executor (all 43 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
+| Torch-CPU NIR executor (all 44 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
+| Weight-only int8 execution | implemented for 2-D float weights consumed by `linear` nodes: symmetric int8 `[-127, 127]` values with per-output-channel float32 scales, float activations, an explicit per-tensor report, and NumPy/Torch kernels; non-linear and shared weights are excluded explicitly |
 | ONNX interchange for the NIR subset (export/import) | implemented when the `onnx` extra is installed; validated with `onnx.checker`, no embedded executor |
 | CUDA-native kernels | planned — UZEN never claims GPU acceleration it does not have |
 

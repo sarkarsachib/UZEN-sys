@@ -119,6 +119,31 @@ def _linear(inputs, params, bound):
     return [y]
 
 
+def _quantized_linear(inputs, params, bound):
+    x = inputs[0]
+    wq = bound[_pn(params, "weight", "weight")]
+    scale = bound[_pname(params, "scale")]
+    if wq.dtype != torch.int8:
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {_dtype_name(wq)}")
+    if scale.dim() != 1 or scale.shape[0] != wq.shape[0]:
+        raise ShapeMismatch(f"quantized_linear scale {tuple(scale.shape)} != ({wq.shape[0]},)")
+    if scale.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise InvalidOperationParameters("quantized_linear scale must be floating point")
+    if not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
+        raise InvalidOperationParameters("quantized_linear scales must be finite and positive")
+    if x.shape[-1] != wq.shape[1]:
+        raise ShapeMismatch("quantized_linear: input/weight feature dimensions disagree")
+    dtype = torch.promote_types(x.dtype, scale.dtype)
+    dequantized = wq.to(dtype) * scale.to(dtype).unsqueeze(1)
+    y = x.to(dtype) @ dequantized.T
+    if params.get("bias"):
+        bias = bound[_pname(params, "bias")]
+        if tuple(bias.shape) != (wq.shape[0],):
+            raise ShapeMismatch(f"quantized_linear bias shape {tuple(bias.shape)} != ({wq.shape[0]},)")
+        y = y + bias.to(dtype)
+    return [y]
+
+
 def _embedding(inputs, params, bound):
     idx = inputs[0]
     w = bound[_pn(params, "weight", "weight")]
@@ -552,6 +577,7 @@ def _concat(inputs, params, bound):
 
 _KERNELS: dict[str, Callable[..., list[Any]]] = {
     "linear": _linear,
+    "quantized_linear": _quantized_linear,
     "embedding": _embedding,
     "pos_embedding": _pos_embedding,
     "layernorm": _layernorm,

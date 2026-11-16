@@ -164,6 +164,31 @@ REST uses `POST /v1/models/{artifact_id}/generate-text`, the CLI uses
 exposes `uzen.generate_text`; all three accept the strategy, temperature, top-k,
 top-p, seed and num-beams options.
 
+## Weight-only int8 execution
+
+`quantize_int8()` derives an execution copy of a graph and package: 2-D float
+weights used only by `linear` nodes are stored as symmetric int8 values in
+`[-127, 127]` with one float32 scale per output channel. The graph's linear
+nodes are rewritten to `quantized_linear`, which dequantizes weights at run time;
+activations, biases, embeddings and normalization weights stay floating point.
+Weights shared with a non-linear operator are left unchanged and listed as
+excluded rather than quantized inconsistently.
+
+```python
+from uzen.core.wie.quantization import quantize_int8
+
+quantized = quantize_int8(graph, package)
+quantized.report.to_dict()   # per-tensor scales, bytes, errors, exclusions
+result = quantized.execute({"tokens": tokens, "positions": positions})
+```
+
+The report records the scheme, axis, zero point, scale count/min/max/SHA-256,
+original and quantized bytes, bits per weight, saturation count, maximum and mean
+absolute reconstruction error, compression ratio and graph-validation status.
+It is also stored under `metadata.quantization` on the derived package and graph.
+This is weight-only quantization: it does not claim int8 activations, GGUF block
+formats or bit-identical output.
+
 ## Modifying a real model
 
 Weight-only modifications preserve the parent graph metadata and provenance

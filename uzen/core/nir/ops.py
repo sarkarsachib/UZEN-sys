@@ -164,6 +164,55 @@ def _linear_run(inputs, params, bound):
     return [y.astype(_float_dtype_name(x, w), copy=False)]
 
 
+def _quantized_linear_infer(inputs, params, bound):
+    x = inputs[0]
+    w = _require_bound(bound, params.get("weight", "weight").replace("param:", ""), "quantized_linear")
+    scale = _require_bound(bound, str(params.get("scale", "scale")).replace("param:", ""), "quantized_linear")
+    if w.rank != 2:
+        raise InvalidOperationParameters("quantized_linear weight must be 2-D (out, in)")
+    if w.dtype != "int8":
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {w.dtype}")
+    if scale.rank != 1 or scale.shape[0] != w.shape[0]:
+        raise ShapeMismatch(
+            f"quantized_linear scale {scale.shape} must be ({w.shape[0]},)"
+        )
+    if isinstance(x.shape[-1], int) and isinstance(w.shape[1], int) and x.shape[-1] != w.shape[1]:
+        raise ShapeMismatch(
+            f"quantized_linear input feature dim {x.shape[-1]} != weight in_features {w.shape[1]}"
+        )
+    return [TensorType(tuple(x.shape[:-1]) + (w.shape[0],), _float_dtype(x))]
+
+
+def _quantized_linear_run(inputs, params, bound):
+    x = inputs[0]
+    name = str(params.get("weight", "weight")).replace("param:", "")
+    scale_name = str(params.get("scale", "scale")).replace("param:", "")
+    wq = bound[name]
+    scale = bound[scale_name]
+    if wq.dtype != np.int8:
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {wq.dtype}")
+    if scale.dtype.kind not in "fc" or scale.ndim != 1:
+        raise InvalidOperationParameters("quantized_linear scale must be a 1-D float array")
+    if scale.shape[0] != wq.shape[0]:
+        raise ShapeMismatch(f"quantized_linear scale {scale.shape} != ({wq.shape[0]},)")
+    if x.shape[-1] != wq.shape[1]:
+        raise ShapeMismatch(
+            f"quantized_linear: input last dim {x.shape[-1]} != weight in {wq.shape[1]}"
+        )
+    scale64 = scale.astype(np.float64, copy=False)
+    if not np.isfinite(scale64).all() or (scale64 <= 0).any():
+        raise InvalidOperationParameters("quantized_linear scales must be finite and positive")
+    dequantized = wq.astype(np.float64) * scale64[:, None]
+    y = x.astype(np.float64) @ dequantized.T
+    bname = params.get("bias")
+    if bname:
+        b = bound[str(bname).replace("param:", "")]
+        if b.shape != (wq.shape[0],):
+            raise ShapeMismatch(f"quantized_linear bias shape {b.shape} != ({wq.shape[0]},)")
+        y = y + b.astype(np.float64)
+    return [y.astype(x.dtype, copy=False)]
+
+
 def _float_dtype_name(a: np.ndarray, b: np.ndarray) -> str:
     return str(np.result_type(a.dtype, b.dtype))
 
@@ -1159,6 +1208,7 @@ def _reg(
 
 
 _reg("linear", 1, 1, _linear_infer, _linear_run, "y = x @ W^T + b", "nn")
+_reg("quantized_linear", 1, 1, _quantized_linear_infer, _quantized_linear_run, "float activations with int8 per-channel weights", "nn")
 _reg("embedding", 1, 1, _embedding_infer, _embedding_run, "token-id lookup into a weight matrix", "nn")
 _reg("pos_embedding", 1, 1, _pos_embedding_infer, _pos_embedding_run, "add a learned positional table", "nn")
 _reg("layernorm", 1, 1, _layernorm_infer, _layernorm_run, "layer normalization over the last axis", "norm")
