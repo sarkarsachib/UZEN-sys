@@ -271,6 +271,21 @@ class Uzen:
             )
         return self.service.get_package(artifact_id)
 
+    def quantize_model(
+        self,
+        artifact_id: str,
+        *,
+        scheme: str = "int8",
+    ) -> dict[str, Any]:
+        """Persist and return a quantized execution variant of a stored model."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/quantize",
+                {"scheme": scheme},
+            )
+        return self.service.quantize_model(artifact_id, scheme=scheme)
+
     def forward_model(
         self,
         artifact_id: str,
@@ -279,8 +294,13 @@ class Uzen:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
         capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> dict[str, Any]:
-        """Run a stored reconstructed model graph on token IDs."""
+        """Run a stored reconstructed model graph on token IDs.
+
+        ``quantize="int8"`` executes a weight-only int8 copy and includes its
+        quantization report under the response's ``quantization`` key.
+        """
         if not self.local:
             return self._request(
                 "POST",
@@ -290,10 +310,15 @@ class Uzen:
                     "positions": positions,
                     "include_values": include_values,
                     "capture": capture,
+                    "quantize": quantize,
                 },
             )
         execution = self.service.forward_model(
-            artifact_id, tokens=tokens, positions=positions, capture=capture
+            artifact_id,
+            tokens=tokens,
+            positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
         return _execution_payload(execution, include_values=include_values)
 
@@ -305,6 +330,7 @@ class Uzen:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
         capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> dict[str, Any]:
         """Tokenize text with the artifact's stored tokenizer and run its graph."""
         if not self.local:
@@ -316,10 +342,15 @@ class Uzen:
                     "positions": positions,
                     "include_values": include_values,
                     "capture": capture,
+                    "quantize": quantize,
                 },
             )
         result = self.service.forward_text(
-            artifact_id, text=text, positions=positions, capture=capture
+            artifact_id,
+            text=text,
+            positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
         return _text_execution_payload(result, include_values=include_values)
 
@@ -337,8 +368,13 @@ class Uzen:
         top_p: float | None = None,
         seed: int | None = None,
         num_beams: int = 1,
+        quantize: str | None = None,
     ) -> dict[str, Any]:
-        """Generate text with the artifact's stored tokenizer and graph."""
+        """Generate text with the artifact's stored tokenizer and graph.
+
+        ``quantize="int8"`` quantizes the execution copy once and includes its
+        report under the response's ``quantization`` key.
+        """
         if not self.local:
             return self._request(
                 "POST",
@@ -354,6 +390,7 @@ class Uzen:
                     "top_p": top_p,
                     "seed": seed,
                     "num_beams": num_beams,
+                    "quantize": quantize,
                 },
             )
         result: ModelGeneration = self.service.generate_text(
@@ -368,8 +405,51 @@ class Uzen:
             top_p=top_p,
             seed=seed,
             num_beams=num_beams,
+            quantize=quantize,
         )
         return result.summary()
+
+    def compare_quantized_model(
+        self,
+        source_artifact_id: str,
+        quantized_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Compare a source model with its persisted int8 variant."""
+        if not self.local:
+            return self._request(
+                "POST",
+                "/v1/models/compare-quantized",
+                {
+                    "source_artifact_id": source_artifact_id,
+                    "quantized_artifact_id": quantized_artifact_id,
+                    "tokens": [list(row) for row in tokens],
+                    "positions": positions,
+                    "atol": atol,
+                    "rtol": rtol,
+                    "max_abs_error_threshold": max_abs_error_threshold,
+                    "mean_abs_error_threshold": mean_abs_error_threshold,
+                    "max_rel_error_threshold": max_rel_error_threshold,
+                },
+            )
+        return self.service.compare_quantized_model(
+            source_artifact_id,
+            quantized_artifact_id,
+            tokens=tokens,
+            positions=positions,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
 
     def compare_models(
         self,
@@ -380,6 +460,9 @@ class Uzen:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         atol: float = 1e-5,
         rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
     ) -> dict[str, Any]:
         """Compare source and modified model artifacts on identical inputs."""
         if not self.local:
@@ -393,6 +476,9 @@ class Uzen:
                     "positions": positions,
                     "atol": atol,
                     "rtol": rtol,
+                    "max_abs_error_threshold": max_abs_error_threshold,
+                    "mean_abs_error_threshold": mean_abs_error_threshold,
+                    "max_rel_error_threshold": max_rel_error_threshold,
                 },
             )
         return self.service.compare_models(
@@ -402,6 +488,9 @@ class Uzen:
             positions=positions,
             atol=atol,
             rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
         )
 
     # ------------------------------------------------------------------ #

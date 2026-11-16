@@ -216,6 +216,85 @@ def test_cli_forward_runs_real_model(tmp_path, capsys):
     assert payload["captured"]["l0_res2"]["values"]
 
 
+def test_cli_and_mcp_persist_quantized_variant(tmp_path, capsys):
+    client, source_id, _root = _gpt2_client(tmp_path)
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "quantize",
+            source_id,
+            "--scheme",
+            "int8",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["parent_artifact_id"] == source_id
+    assert payload["quantization"]["schema"] == "uzen.quantization/1"
+
+    server = MCPServer(root=client.service.root)
+    listed = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert "uzen.quantize_model" in {tool["name"] for tool in listed["result"]["tools"]}
+    called = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "uzen.quantize_model",
+                "arguments": {"artifact_id": source_id, "scheme": "int8"},
+            },
+        }
+    )
+    mcp_payload = json.loads(called["result"]["content"][0]["text"])
+    assert mcp_payload["artifact_id"] == payload["artifact_id"]
+    assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
+
+
+def test_cli_and_mcp_forward_support_int8(tmp_path, capsys):
+    client, source_id, _root = _gpt2_client(tmp_path)
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "forward",
+            source_id,
+            "--tokens",
+            "[[0,1,2,3]]",
+            "--quantize",
+            "int8",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quantization"]["schema"] == "uzen.quantization/1"
+    assert payload["quantization"]["num_rewritten_nodes"] > 0
+
+    server = MCPServer(root=client.service.root)
+    listed = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+    assert tools["uzen.forward_model"]["inputSchema"]["properties"]["quantize"]["enum"] == ["int8"]
+
+    called = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "uzen.forward_model",
+                "arguments": {
+                    "artifact_id": source_id,
+                    "tokens": [[0, 1, 2, 3]],
+                    "quantize": "int8",
+                },
+            },
+        }
+    )
+    mcp_payload = json.loads(called["result"]["content"][0]["text"])
+    assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
+
+
 def test_mcp_forward_and_compare_tools(tmp_path):
     client, source_id, _root = _gpt2_client(tmp_path)
     candidate_id = client.modify(

@@ -162,7 +162,8 @@ exceeding it. Explicit prompt `positions` are extended by one per generated toke
 REST uses `POST /v1/models/{artifact_id}/generate-text`, the CLI uses
 `uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8`, and MCP
 exposes `uzen.generate_text`; all three accept the strategy, temperature, top-k,
-top-p, seed and num-beams options.
+top-p, seed and num-beams options. Add `--quantize int8` (CLI) or
+`"quantize": "int8"` (REST/MCP) to quantize the execution copy once.
 
 ## Weight-only int8 execution
 
@@ -181,6 +182,26 @@ quantized = quantize_int8(graph, package)
 quantized.report.to_dict()   # per-tensor scales, bytes, errors, exclusions
 result = quantized.execute({"tokens": tokens, "positions": positions})
 ```
+
+Persist a variant with `client.quantize_model(artifact_id, scheme="int8")`,
+`uzen quantize ARTIFACT_ID --scheme int8`, the MCP `uzen.quantize_model` tool, or
+`POST /v1/models/{id}/quantize`. The new artifact stores the int8 graph, lineage
+parent and full quantization report, and can be forwarded or generated from
+directly without quantizing again. `client.compare_quantized_model(source_id,
+variant_id, tokens=..., atol=..., rtol=...)` and
+`POST /v1/models/compare-quantized` report per-output drift between the source and
+its variant; the comparison requires the variant's recorded parent to match the
+supplied source.
+
+Stored-model execution can select the same transform explicitly. The SDK's
+`forward_model(..., quantize="int8")`, `forward_text(..., quantize="int8")` and
+`generate_text(..., quantize="int8")` return the report under `quantization`; the
+matching REST bodies for `/v1/models/{id}/forward`, `/forward-text` and
+`/generate-text` accept `"quantize": "int8"` and include the same report. The CLI
+uses `--quantize int8` on `forward` and `generate-text`, and the MCP tools expose
+the same `quantize` field. Generation quantizes its execution copy once before
+prefill, then reuses it for cached decoding or beam scoring. Unquantized responses carry `"quantization": null`, so
+callers can distinguish an omitted transform from a quantized execution.
 
 The report records the scheme, axis, zero point, scale count/min/max/SHA-256,
 original and quantized bytes, bits per weight, saturation count, maximum and mean
@@ -223,7 +244,12 @@ reports, per output:
 
 The top-level result contains `passed`, `tolerances`, source/candidate artifact
 IDs, and the input shapes. A shape or output-name mismatch is reported, never
-silently coerced.
+silently coerced. It also includes an aggregate `drift` object with element-count
+weighted `mean_abs_error`, `max_abs_error`, `max_rel_error`, output/element
+counts, completeness, `allclose_passed`, `failed_outputs`, and threshold
+failures. Optional `max_abs_error_threshold`, `mean_abs_error_threshold` and
+`max_rel_error_threshold` arguments add explicit aggregate failure limits
+without replacing the per-output `atol`/`rtol` checks.
 
 Parent IDs are deduplicated, so interpolating a model with itself records the
 source once in lineage.
@@ -242,12 +268,16 @@ original import or a separate tokenizer sidecar.
 REST:
 
 * `POST /v1/models/{artifact_id}/forward`
+* `POST /v1/models/{artifact_id}/quantize`
 * `POST /v1/models/compare`
+* `POST /v1/models/compare-quantized`
 
 Python SDK:
 
 * `forward_model(..., capture="layers")`
+* `quantize_model(...)`
 * `compare_models(...)`
+* `compare_quantized_model(...)`
 
 CLI:
 

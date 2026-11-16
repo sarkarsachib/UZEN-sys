@@ -63,6 +63,24 @@ class MCPServer:
                 },
                 self._import_model,
             ),
+            "uzen.quantize_model": (
+                {
+                    "description": (
+                        "Persist a weight-only int8 execution variant of a stored causal-LM "
+                        "artifact. Returns the new artifact id, lineage parent and explicit "
+                        "quantization report."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "scheme": {"type": "string", "enum": ["int8"]},
+                        },
+                        "required": ["artifact_id"],
+                    },
+                },
+                self._quantize_model,
+            ),
             "uzen.forward_model": (
                 {
                     "description": (
@@ -90,6 +108,11 @@ class MCPServer:
                                 ),
                             },
                             "include_values": {"type": "boolean"},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "weight-only int8 execution with a report",
+                            },
                         },
                         "required": ["artifact_id", "tokens"],
                     },
@@ -120,6 +143,11 @@ class MCPServer:
                                 ),
                             },
                             "include_values": {"type": "boolean"},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "weight-only int8 execution with a report",
+                            },
                         },
                         "required": ["artifact_id", "text"],
                     },
@@ -150,6 +178,11 @@ class MCPServer:
                             "top_p": {"type": "number", "minimum": 0, "maximum": 1},
                             "seed": {"type": "integer", "minimum": 0},
                             "num_beams": {"type": "integer", "minimum": 1},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "quantize the execution copy once with a report",
+                            },
                         },
                         "required": ["artifact_id", "text"],
                     },
@@ -478,6 +511,12 @@ class MCPServer:
         if self._progress_callback is not None:
             self._progress_callback(stage, status, message)
 
+    def _quantize_model(self, args: Mapping[str, Any]) -> Any:
+        return self.client.quantize_model(
+            str(args["artifact_id"]),
+            scheme=str(args.get("scheme", "int8")),
+        )
+
     def _forward_model(self, args: Mapping[str, Any]) -> Any:
         return self.client.forward_model(
             str(args["artifact_id"]),
@@ -485,6 +524,7 @@ class MCPServer:
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
             capture=args.get("capture"),
+            quantize=args.get("quantize"),
         )
 
     def _forward_text(self, args: Mapping[str, Any]) -> Any:
@@ -494,6 +534,7 @@ class MCPServer:
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
             capture=args.get("capture"),
+            quantize=args.get("quantize"),
         )
 
     def _generate_text(self, args: Mapping[str, Any]) -> Any:
@@ -509,6 +550,7 @@ class MCPServer:
             top_p=args.get("top_p"),
             seed=args.get("seed"),
             num_beams=int(args.get("num_beams", 1)),
+            quantize=args.get("quantize"),
         )
 
     def _compare_models(self, args: Mapping[str, Any]) -> Any:

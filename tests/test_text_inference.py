@@ -207,6 +207,36 @@ def test_seeded_sampling_is_deterministic_and_beam_search_runs(tmp_path):
     assert beam["stopped_reason"] in {"eos_token", "max_new_tokens", "max_sequence_length"}
 
 
+def test_quantized_generation_is_exposed_through_sdk_and_rest(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    client, artifact_id = _llama_text_client(tmp_path)
+    generated = client.generate_text(
+        artifact_id, text="hello world", max_new_tokens=2, quantize="int8"
+    )
+    report = generated["quantization"]
+    assert report["schema"] == "uzen.quantization/1"
+    assert report["num_rewritten_nodes"] > 0
+    assert report["graph_valid"] is True
+    assert len(generated["full_token_ids"]) == len(generated["prompt_token_ids"]) + generated["steps"]
+
+    service_generation = client.service.generate_text(
+        artifact_id, text="hello world", max_new_tokens=2, quantize="int8"
+    )
+    assert service_generation.quantization == report
+
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    response = api.post(
+        f"/v1/models/{artifact_id}/generate-text",
+        json={"text": "hello world", "max_new_tokens": 2, "quantize": "int8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["quantization"]["schema"] == "uzen.quantization/1"
+    assert body["quantization"]["num_rewritten_nodes"] == report["num_rewritten_nodes"]
+
+
 def test_generation_rejects_inconsistent_sampling_options(tmp_path):
     client, artifact_id = _llama_text_client(tmp_path)
     with pytest.raises(InvalidOperationParameters):
@@ -239,6 +269,67 @@ def test_llama_text_inference_with_positions(tmp_path):
 def test_text_inference_refuses_missing_tokenizer():
     with pytest.raises(InvalidOperationParameters, match="no stored tokenizer"):
         tokenizer_spec_from_manifest({"metadata": {"graph": {}}})
+
+
+def test_persisted_quantized_variant_keeps_tokenizer_and_generates(tmp_path):
+    client, source_id = _llama_text_client(tmp_path)
+    source_tokenizer = client.artifact(source_id)["metadata"]["tokenizer"]
+    variant = client.quantize_model(source_id)
+    variant_id = variant["artifact_id"]
+
+    manifest = client.artifact(variant_id)
+    assert manifest["metadata"]["tokenizer"] == source_tokenizer
+    assert manifest["metadata"]["quantization"]["schema"] == "uzen.quantization/1"
+
+    generated = client.generate_text(
+        variant_id, text="hello world", max_new_tokens=2
+    )
+    assert generated["quantization"] == variant["quantization"]
+    assert len(generated["full_token_ids"]) == (
+        len(generated["prompt_token_ids"]) + generated["steps"]
+    )
+
+
+def test_cli_and_mcp_generate_support_int8(tmp_path, capsys):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "generate-text",
+            artifact_id,
+            "--text",
+            "hello world",
+            "--max-new-tokens",
+            "2",
+            "--quantize",
+            "int8",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quantization"]["schema"] == "uzen.quantization/1"
+    assert payload["quantization"]["num_rewritten_nodes"] > 0
+
+    server = MCPServer(root=client.service.root)
+    called = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "uzen.generate_text",
+                "arguments": {
+                    "artifact_id": artifact_id,
+                    "text": "hello world",
+                    "max_new_tokens": 2,
+                    "quantize": "int8",
+                },
+            },
+        }
+    )
+    mcp_payload = json.loads(called["result"]["content"][0]["text"])
+    assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
 
 
 def test_rest_mcp_and_cli_text_forward(tmp_path, capsys):

@@ -264,6 +264,16 @@ def create_app(
             response["import_report"] = dict(import_report)
         return response
 
+    @app.post(f"/{API_VERSION}/models/{{artifact_id}}/quantize")
+    def quantize_model(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        client = Uzen(root=service.root)
+        return client.quantize_model(
+            artifact_id,
+            scheme=str(payload.get("scheme", "int8")),
+        )
+
     @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward")
     def forward_model(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
         from uzen.interfaces.python_sdk.client import Uzen
@@ -277,6 +287,7 @@ def create_app(
             positions=payload.get("positions"),
             include_values=bool(payload.get("include_values", False)),
             capture=payload.get("capture"),
+            quantize=payload.get("quantize"),
         )
 
     @app.post(f"/{API_VERSION}/models/{{artifact_id}}/forward-text")
@@ -292,6 +303,7 @@ def create_app(
             positions=payload.get("positions"),
             include_values=bool(payload.get("include_values", False)),
             capture=payload.get("capture"),
+            quantize=payload.get("quantize"),
         )
 
     @app.post(f"/{API_VERSION}/models/{{artifact_id}}/generate-text")
@@ -313,6 +325,43 @@ def create_app(
             top_p=payload.get("top_p"),
             seed=payload.get("seed"),
             num_beams=int(payload.get("num_beams", 1)),
+            quantize=payload.get("quantize"),
+        )
+
+    @app.post(f"/{API_VERSION}/models/compare-quantized")
+    def compare_quantized_model(payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.interfaces.python_sdk.client import Uzen
+
+        required = ("source_artifact_id", "quantized_artifact_id", "tokens")
+        missing = [key for key in required if key not in payload]
+        if missing:
+            raise HTTPException(
+                400,
+                detail={"code": "request.invalid", "message": f"provide {', '.join(missing)}"},
+            )
+        client = Uzen(root=service.root)
+        return client.compare_quantized_model(
+            payload["source_artifact_id"],
+            payload["quantized_artifact_id"],
+            tokens=payload["tokens"],
+            positions=payload.get("positions"),
+            atol=float(payload.get("atol", 1e-5)),
+            rtol=float(payload.get("rtol", 1e-5)),
+            max_abs_error_threshold=(
+                float(payload["max_abs_error_threshold"])
+                if payload.get("max_abs_error_threshold") is not None
+                else None
+            ),
+            mean_abs_error_threshold=(
+                float(payload["mean_abs_error_threshold"])
+                if payload.get("mean_abs_error_threshold") is not None
+                else None
+            ),
+            max_rel_error_threshold=(
+                float(payload["max_rel_error_threshold"])
+                if payload.get("max_rel_error_threshold") is not None
+                else None
+            ),
         )
 
     @app.post(f"/{API_VERSION}/models/compare")
@@ -334,6 +383,21 @@ def create_app(
             positions=payload.get("positions"),
             atol=float(payload.get("atol", 1e-5)),
             rtol=float(payload.get("rtol", 1e-5)),
+            max_abs_error_threshold=(
+                float(payload["max_abs_error_threshold"])
+                if payload.get("max_abs_error_threshold") is not None
+                else None
+            ),
+            mean_abs_error_threshold=(
+                float(payload["mean_abs_error_threshold"])
+                if payload.get("mean_abs_error_threshold") is not None
+                else None
+            ),
+            max_rel_error_threshold=(
+                float(payload["max_rel_error_threshold"])
+                if payload.get("max_rel_error_threshold") is not None
+                else None
+            ),
         )
 
     @app.get(f"/{API_VERSION}/models")

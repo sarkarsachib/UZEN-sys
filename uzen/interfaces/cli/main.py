@@ -13,6 +13,7 @@ Examples::
     uzen import model.safetensors --family transformer_decoder
     uzen modify ARTIFACT_ID interpolate --other OTHER_ID --param t=0.5
     uzen forward ARTIFACT_ID --text 'hello world'
+    uzen quantize ARTIFACT_ID --scheme int8
     uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8
     uzen generate --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen evaluate ARTIFACT_ID --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
@@ -126,6 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--family")
     ev.add_argument("--spec")
 
+    quant = sub.add_parser("quantize", help="persist a quantized model artifact variant")
+    quant.add_argument("artifact_id")
+    quant.add_argument("--scheme", choices=("int8",), default="int8")
+
     fwd = sub.add_parser("forward", help="execute a stored reconstructed model graph")
     fwd.add_argument("artifact_id")
     fwd_input = fwd.add_mutually_exclusive_group(required=True)
@@ -138,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="NIR node ids to capture, or 'layers' for transformer block outputs",
     )
     fwd.add_argument("--values", action="store_true", help="include output and captured values")
+    fwd.add_argument("--quantize", choices=("int8",), help="weight-only int8 execution with a report")
 
     gen_text = sub.add_parser("generate-text", help="generate text from a model artifact")
     gen_text.add_argument("artifact_id")
@@ -151,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_text.add_argument("--top-p", type=float)
     gen_text.add_argument("--seed", type=int)
     gen_text.add_argument("--num-beams", type=int, default=1)
+    gen_text.add_argument("--quantize", choices=("int8",), help="quantize the execution copy once")
 
     cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
     cmp_models.add_argument("source_artifact_id")
@@ -344,6 +351,15 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if cmd == "quantize":
+        _emit(
+            _client(args).quantize_model(
+                args.artifact_id,
+                scheme=args.scheme,
+            )
+        )
+        return 0
+
     if cmd == "forward":
         client = _client(args)
         if args.text is not None:
@@ -354,6 +370,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     positions=_json_arg(args.positions),
                     include_values=args.values,
                     capture=args.capture,
+                    quantize=args.quantize,
                 )
             )
         else:
@@ -364,6 +381,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     positions=_json_arg(args.positions),
                     include_values=args.values,
                     capture=args.capture,
+                    quantize=args.quantize,
                 )
             )
         return 0
@@ -382,6 +400,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 top_p=args.top_p,
                 seed=args.seed,
                 num_beams=args.num_beams,
+                quantize=args.quantize,
             )
         )
         return 0

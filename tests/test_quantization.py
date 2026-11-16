@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from uzen.core.nir.executor import execute
 from uzen.core.nir.graph import Graph
@@ -12,6 +13,8 @@ from uzen.core.nir.types import Ref, TensorType
 from uzen.core.nws.tensors import WeightPackage
 from uzen.core.wie.importer import ModelImporter
 from uzen.core.wie.quantization import quantize_int8
+from uzen.errors import InvalidOperationParameters
+from uzen.interfaces.python_sdk.client import Uzen
 from uzen.runtimes.torch_executor import execute_torch
 from tests.test_llama_reconstruction import _write_llama
 
@@ -145,6 +148,251 @@ def test_int8_quantized_llama_execution_is_near_the_float_reference(tmp_path):
     actual = quantized.execute(inputs).output("logits")
     assert np.isfinite(actual).all()
     assert float(np.max(np.abs(actual - reference))) < 0.2
+
+
+def test_int8_forward_is_exposed_through_sdk_and_rest(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    root, _arrays = _write_llama(tmp_path / "int8-api-llama")
+    client = Uzen(root=tmp_path / "int8-api-workspace")
+    artifact_id = client.import_model(root)["artifact_id"]
+    tokens = [[0, 1, 2, 3]]
+    positions = [[0, 1, 2, 3]]
+
+    plain = client.forward_model(
+        artifact_id, tokens=tokens, positions=positions, include_values=True
+    )
+    assert plain["quantization"] is None
+
+    quantized = client.forward_model(
+        artifact_id,
+        tokens=tokens,
+        positions=positions,
+        include_values=True,
+        quantize="int8",
+    )
+    report = quantized["quantization"]
+    assert report["schema"] == "uzen.quantization/1"
+    assert report["num_rewritten_nodes"] > 0
+    assert report["graph_valid"] is True
+    assert report["tensors"]
+    assert quantized["outputs"]["logits"]["shape"] == [1, 4, 32]
+    plain_values = np.asarray(plain["outputs"]["logits"]["values"])
+    quantized_values = np.asarray(quantized["outputs"]["logits"]["values"])
+    assert quantized_values.shape == plain_values.shape
+    assert float(np.max(np.abs(quantized_values - plain_values))) < 0.2
+
+    service_execution = client.service.forward_model(
+        artifact_id, tokens=tokens, positions=positions, quantize="int8"
+    )
+    assert service_execution.quantization == report
+
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    response = api.post(
+        f"/v1/models/{artifact_id}/forward",
+        json={
+            "tokens": tokens,
+            "positions": positions,
+            "include_values": True,
+            "quantize": "int8",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["quantization"]["schema"] == "uzen.quantization/1"
+    assert body["quantization"]["num_rewritten_nodes"] == report["num_rewritten_nodes"]
+    np.testing.assert_allclose(
+        np.asarray(body["outputs"]["logits"]["values"]), quantized_values, rtol=1e-7, atol=1e-7
+    )
+
+    with pytest.raises(InvalidOperationParameters, match="quantize must be 'int8'"):
+        client.forward_model(artifact_id, tokens=tokens, quantize="int4")
+
+
+def test_int8_variant_is_persisted_and_reusable(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    root, _arrays = _write_llama(tmp_path / "int8-variant-llama")
+    client = Uzen(root=tmp_path / "int8-variant-workspace")
+    source_id = client.import_model(root)["artifact_id"]
+
+    variant = client.quantize_model(source_id)
+    variant_id = variant["artifact_id"]
+    assert variant_id != source_id
+    assert variant["parent_artifact_id"] == source_id
+    assert variant["quantization"]["schema"] == "uzen.quantization/1"
+    assert variant["quantization"]["num_rewritten_nodes"] > 0
+
+    manifest = client.artifact(variant_id)
+    assert manifest["lineage"]["parents"] == [source_id]
+    assert manifest["lineage"]["operation"] == "quantize.int8"
+    assert manifest["metadata"]["quantization"]["schema"] == "uzen.quantization/1"
+    assert manifest["metadata"]["quantized_from"] == source_id
+    assert any(
+        node["op"] == "quantized_linear"
+        for node in manifest["metadata"]["graph"]["nodes"]
+    )
+
+    repeated = client.quantize_model(source_id)
+    assert repeated["artifact_id"] == variant_id
+    with pytest.raises(InvalidOperationParameters, match="already contains a quantized graph"):
+        client.quantize_model(variant_id)
+    with pytest.raises(InvalidOperationParameters, match="scheme must be 'int8'"):
+        client.quantize_model(source_id, scheme="int4")
+
+    tokens = [[0, 1, 2, 3]]
+    positions = [[0, 1, 2, 3]]
+    source_execution = client.forward_model(
+        source_id, tokens=tokens, positions=positions, include_values=True
+    )
+    variant_execution = client.forward_model(
+        variant_id, tokens=tokens, positions=positions, include_values=True
+    )
+    assert variant_execution["quantization"] == variant["quantization"]
+    assert variant_execution["outputs"]["logits"]["shape"] == [1, 4, 32]
+    source_values = np.asarray(source_execution["outputs"]["logits"]["values"])
+    variant_values = np.asarray(variant_execution["outputs"]["logits"]["values"])
+    assert float(np.max(np.abs(variant_values - source_values))) < 0.2
+
+    reopened = Uzen(root=client.service.root)
+    reopened_execution = reopened.forward_model(
+        variant_id, tokens=tokens, positions=positions, include_values=True
+    )
+    assert reopened_execution["quantization"] == variant["quantization"]
+    np.testing.assert_allclose(
+        np.asarray(reopened_execution["outputs"]["logits"]["values"]),
+        variant_values,
+    )
+
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    created = api.post(f"/v1/models/{source_id}/quantize", json={})
+    assert created.status_code == 200, created.text
+    assert created.json()["artifact_id"] == variant_id
+    forwarded = api.post(
+        f"/v1/models/{variant_id}/forward",
+        json={"tokens": tokens, "positions": positions, "include_values": True},
+    )
+    assert forwarded.status_code == 200, forwarded.text
+    assert forwarded.json()["quantization"] == variant["quantization"]
+
+
+def test_quantized_comparison_reports_output_drift(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    root, _arrays = _write_llama(tmp_path / "int8-drift-llama")
+    client = Uzen(root=tmp_path / "int8-drift-workspace")
+    source_id = client.import_model(root)["artifact_id"]
+    variant = client.quantize_model(source_id)
+    variant_id = variant["artifact_id"]
+    tokens = [[0, 1, 2, 3]]
+    positions = [[0, 1, 2, 3]]
+
+    comparison = client.compare_quantized_model(
+        source_id,
+        variant_id,
+        tokens=tokens,
+        positions=positions,
+        atol=0.2,
+        rtol=0.2,
+    )
+    assert comparison["source_vs_quantized"] is True
+    assert comparison["quantization"] == variant["quantization"]
+    assert comparison["passed"] is True
+    logits = comparison["outputs"]["logits"]
+    assert logits["shape"] == [1, 4, 32]
+    assert logits["max_abs_error"] > 0
+    assert logits["max_abs_error"] < 0.2
+    assert logits["num_elements"] == 128
+    drift = comparison["drift"]
+    numeric_outputs = [
+        output
+        for output in comparison["outputs"].values()
+        if "max_abs_error" in output
+    ]
+    assert drift["complete"] is True
+    assert drift["allclose_passed"] is True
+    assert drift["failed_outputs"] == []
+    assert drift["passed"] is True
+    assert drift["max_abs_error"] == max(
+        output["max_abs_error"] for output in numeric_outputs
+    )
+    assert drift["mean_abs_error"] == pytest.approx(
+        sum(
+            output["mean_abs_error"] * output["num_elements"]
+            for output in numeric_outputs
+        )
+        / sum(output["num_elements"] for output in numeric_outputs)
+    )
+    assert drift["max_rel_error"] == max(
+        output["max_rel_error"] for output in numeric_outputs
+    )
+    assert drift["num_outputs"] == len(comparison["outputs"])
+    assert drift["num_elements"] == sum(
+        output["num_elements"] for output in numeric_outputs
+    )
+    assert drift["thresholds"] == {
+        "max_abs_error": None,
+        "mean_abs_error": None,
+        "max_rel_error": None,
+    }
+    assert drift["failures"] == []
+
+    thresholded = client.compare_quantized_model(
+        source_id,
+        variant_id,
+        tokens=tokens,
+        positions=positions,
+        atol=0.2,
+        rtol=0.2,
+        max_abs_error_threshold=0.001,
+    )
+    assert thresholded["passed"] is False
+    assert thresholded["outputs"]["logits"]["passed"] is True
+    assert thresholded["drift"]["thresholds"]["max_abs_error"] == 0.001
+    assert thresholded["drift"]["allclose_passed"] is True
+    assert thresholded["drift"]["passed"] is False
+    assert thresholded["drift"]["failures"]
+
+    with pytest.raises(InvalidOperationParameters, match="threshold must be non-negative"):
+        client.compare_quantized_model(
+            source_id,
+            variant_id,
+            tokens=tokens,
+            mean_abs_error_threshold=-1,
+        )
+
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    response = api.post(
+        "/v1/models/compare-quantized",
+        json={
+            "source_artifact_id": source_id,
+            "quantized_artifact_id": variant_id,
+            "tokens": tokens,
+            "positions": positions,
+            "atol": 0.2,
+            "rtol": 0.2,
+            "max_abs_error_threshold": 0.2,
+            "mean_abs_error_threshold": 0.2,
+            "max_rel_error_threshold": 1e9,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_vs_quantized"] is True
+    assert body["quantization"]["schema"] == "uzen.quantization/1"
+    assert body["outputs"]["logits"]["max_abs_error"] == logits["max_abs_error"]
+    assert body["drift"]["thresholds"] == {
+        "max_abs_error": 0.2,
+        "mean_abs_error": 0.2,
+        "max_rel_error": 1e9,
+    }
+    assert body["drift"]["passed"] is True
+
+    with pytest.raises(InvalidOperationParameters, match="not a persisted quantized"):
+        client.compare_quantized_model(source_id, source_id, tokens=tokens)
 
 
 def test_int8_excludes_weights_shared_with_non_linear_operators():

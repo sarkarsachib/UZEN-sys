@@ -37,6 +37,7 @@ class ModelExecution:
     outputs: dict[str, np.ndarray]
     num_ops: int
     intermediates: dict[str, np.ndarray] = field(default_factory=dict)
+    quantization: dict[str, Any] | None = None
 
     def output(self, name: str = "logits") -> np.ndarray:
         try:
@@ -63,6 +64,7 @@ class ModelExecution:
                 for name, value in self.intermediates.items()
             },
             "num_ops": self.num_ops,
+            "quantization": self.quantization,
         }
 
 
@@ -97,6 +99,7 @@ class ModelGeneration:
     top_p: float | None = None
     seed: int | None = None
     num_beams: int = 1
+    quantization: dict[str, Any] | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -120,6 +123,7 @@ class ModelGeneration:
             "top_p": self.top_p,
             "seed": self.seed,
             "num_beams": self.num_beams,
+            "quantization": self.quantization,
         }
 
 
@@ -136,6 +140,11 @@ def graph_from_manifest(manifest: Mapping[str, Any]) -> Graph:
         return Graph.from_dict(graph_doc)
     except Exception as exc:
         raise GraphValidationError(f"stored NIR graph could not be restored: {exc}") from exc
+
+
+def _stored_quantization(graph: Graph) -> dict[str, Any] | None:
+    report = graph.metadata.get("quantization")
+    return dict(report) if isinstance(report, Mapping) else None
 
 
 def _causal_inputs(
@@ -227,27 +236,48 @@ def execute_stored_model(
     tokens: Sequence[Sequence[int]],
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
     capture: Sequence[str] | str | None = None,
+    quantize: str | None = None,
     cache: KVCache | None = None,
 ) -> ModelExecution:
     graph = graph_from_manifest(manifest)
     inputs = _causal_inputs(graph, tokens, positions)
     capture_ids = _resolve_capture(graph, capture)
-    validation = graph.validate(package)
+    stored_quantization = _stored_quantization(graph)
+    quantization: dict[str, Any] | None = stored_quantization
+    execution_graph = graph
+    execution_package = package
+    if quantize is not None:
+        if quantize != "int8":
+            raise InvalidOperationParameters("quantize must be 'int8' when provided")
+        if stored_quantization is None:
+            from uzen.core.wie.quantization import quantize_int8
+
+            quantized = quantize_int8(graph, package)
+            execution_graph = quantized.graph
+            execution_package = quantized.package
+            quantization = quantized.report.to_dict()
+    validation = execution_graph.validate(execution_package)
     if not validation.ok:
         raise GraphValidationError(
             "stored graph does not validate against the artifact package",
             errors=list(validation.errors),
         )
     result = execute(
-        graph, inputs, package, capture=capture_ids, validate_types=True, cache=cache
+        execution_graph,
+        inputs,
+        execution_package,
+        capture=capture_ids,
+        validate_types=True,
+        cache=cache,
     )
     return ModelExecution(
         artifact_id=artifact_id,
-        graph_name=graph.name,
+        graph_name=execution_graph.name,
         inputs=inputs,
         outputs=dict(result.outputs),
         intermediates=dict(result.intermediates),
         num_ops=result.num_ops,
+        quantization=quantization,
     )
 
 
@@ -504,6 +534,7 @@ def greedy_generate(
     top_p: float | None = None,
     seed: int | None = None,
     num_beams: int = 1,
+    quantize: str | None = None,
 ) -> ModelGeneration:
     """Generate tokens from real forward passes.
 
@@ -530,6 +561,21 @@ def greedy_generate(
     )
 
     graph = graph_from_manifest(manifest)
+    stored_quantization = _stored_quantization(graph)
+    quantization: dict[str, Any] | None = stored_quantization
+    if quantize is not None:
+        if quantize != "int8":
+            raise InvalidOperationParameters("quantize must be 'int8' when provided")
+        if stored_quantization is None:
+            from uzen.core.wie.quantization import quantize_int8
+
+            quantized = quantize_int8(graph, package)
+            graph = quantized.graph
+            package = quantized.package
+            metadata = dict(manifest.get("metadata") or {})
+            metadata["graph"] = graph.to_dict()
+            manifest = {**dict(manifest), "metadata": metadata}
+            quantization = quantized.report.to_dict()
     spec = tokenizer_spec_from_manifest(manifest)
     tokenizer = load_tokenizer(root, spec)
     encoded = encode_with_tokenizer(tokenizer, text)
@@ -671,6 +717,7 @@ def greedy_generate(
         top_p=top_p,
         seed=seed,
         num_beams=num_beams,
+        quantization=quantization,
     )
 
 
@@ -683,6 +730,7 @@ def execute_stored_text(
     text: str,
     positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
     capture: Sequence[str] | str | None = None,
+    quantize: str | None = None,
 ) -> ModelTextExecution:
     """Tokenize text with the artifact's stored tokenizer, then execute its graph."""
     spec = tokenizer_spec_from_manifest(manifest)
@@ -694,6 +742,7 @@ def execute_stored_text(
         tokens=[encoded.token_ids],
         positions=positions,
         capture=capture,
+        quantize=quantize,
     )
     return ModelTextExecution(
         text=encoded.text,
@@ -710,10 +759,21 @@ def compare_executions(
     *,
     atol: float = 1e-5,
     rtol: float = 1e-5,
+    max_abs_error_threshold: float | None = None,
+    mean_abs_error_threshold: float | None = None,
+    max_rel_error_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Compare two executions on identical inputs with explicit tolerances."""
     if atol < 0 or rtol < 0:
         raise InvalidOperationParameters("atol and rtol must be non-negative")
+    thresholds = {
+        "max_abs_error": max_abs_error_threshold,
+        "mean_abs_error": mean_abs_error_threshold,
+        "max_rel_error": max_rel_error_threshold,
+    }
+    for name, value in thresholds.items():
+        if value is not None and value < 0:
+            raise InvalidOperationParameters(f"{name} threshold must be non-negative")
     source_names = set(source.outputs)
     candidate_names = set(candidate.outputs)
     if source_names != candidate_names:
@@ -723,10 +783,28 @@ def compare_executions(
             "source_outputs": sorted(source_names),
             "candidate_outputs": sorted(candidate_names),
             "tolerances": {"atol": atol, "rtol": rtol},
+            "drift": {
+                "complete": False,
+                "max_abs_error": None,
+                "mean_abs_error": None,
+                "max_rel_error": None,
+                "num_outputs": 0,
+                "num_elements": 0,
+                "allclose_passed": False,
+                "failed_outputs": [],
+                "thresholds": thresholds,
+                "failures": ["output names differ"],
+                "passed": False,
+            },
         }
 
     outputs: dict[str, dict[str, Any]] = {}
     all_passed = True
+    complete = True
+    total_difference = 0.0
+    total_elements = 0
+    max_abs_error = 0.0
+    max_rel_error = 0.0
     for name in sorted(source_names):
         actual = source.outputs[name]
         other = candidate.outputs[name]
@@ -738,6 +816,7 @@ def compare_executions(
                 "candidate_shape": list(other.shape),
             }
             all_passed = False
+            complete = False
             continue
         difference = np.abs(actual.astype(np.float64) - other.astype(np.float64))
         relative = difference / np.maximum(np.abs(actual.astype(np.float64)), 1e-8)
@@ -751,10 +830,52 @@ def compare_executions(
             "max_rel_error": float(relative.max()) if relative.size else 0.0,
             "num_elements": int(difference.size),
         }
+        if difference.size:
+            total_difference += float(difference.sum())
+            total_elements += int(difference.size)
+            max_abs_error = max(max_abs_error, float(difference.max()))
+            max_rel_error = max(max_rel_error, float(relative.max()))
         all_passed = all_passed and passed
+
+    failures: list[str] = []
+    if not complete:
+        if any(value is not None for value in thresholds.values()):
+            failures.append("aggregate thresholds unavailable because outputs are incomplete")
+        aggregate = {
+            "max_abs_error": None,
+            "mean_abs_error": None,
+            "max_rel_error": None,
+        }
+    else:
+        aggregate = {
+            "max_abs_error": max_abs_error,
+            "mean_abs_error": (
+                total_difference / total_elements if total_elements else 0.0
+            ),
+            "max_rel_error": max_rel_error,
+        }
+        for name, threshold in thresholds.items():
+            if threshold is not None and aggregate[name] > threshold:
+                failures.append(
+                    f"{name} {aggregate[name]:.6g} exceeds threshold {threshold:.6g}"
+                )
+    drift = {
+        "complete": complete,
+        **aggregate,
+        "num_outputs": len(outputs),
+        "num_elements": total_elements if complete else None,
+        "allclose_passed": all_passed,
+        "failed_outputs": [
+            name for name, output in outputs.items() if not output.get("passed")
+        ],
+        "thresholds": thresholds,
+        "failures": failures,
+        "passed": complete and not failures and all_passed,
+    }
     return {
-        "passed": all_passed,
+        "passed": all_passed and drift["passed"],
         "tolerances": {"atol": atol, "rtol": rtol},
+        "drift": drift,
         "source_artifact_id": source.artifact_id,
         "candidate_artifact_id": candidate.artifact_id,
         "inputs": {

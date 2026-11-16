@@ -48,10 +48,12 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/architectures/synthesize` | build a model from a family spec |
 | POST | `/v1/architectures/research` | compare architecture variants |
 | POST | `/v1/models/import` | import a local HF directory/file, weights-only `.pt/.pth/.bin/.ckpt`, single-file `.onnx`, or `repo_id` + `revision`; returns the compatibility report or provenance report, plus graph/reconstruction status when available |
-| POST | `/v1/models/{id}/forward` | execute a stored reconstructed graph on tokens/positions; optional `capture` node ids or `["layers"]` |
-| POST | `/v1/models/{id}/forward-text` | tokenize text with the artifact's stored `tokenizer.json`, then execute the graph |
-| POST | `/v1/models/{id}/generate-text` | greedy, seeded sampling or beam generation with EOS/context stopping |
+| POST | `/v1/models/{id}/quantize` | persist a weight-only int8 artifact variant; returns the new artifact id and quantization report |
+| POST | `/v1/models/{id}/forward` | execute a stored reconstructed graph on tokens/positions; optional `capture` node ids or `["layers"]`; `quantize: "int8"` returns the quantization report |
+| POST | `/v1/models/{id}/forward-text` | tokenize text with the artifact's stored `tokenizer.json`, then execute the graph; accepts `quantize: "int8"` |
+| POST | `/v1/models/{id}/generate-text` | greedy, seeded sampling or beam generation with EOS/context stopping; `quantize: "int8"` quantizes once and returns the report |
 | POST | `/v1/models/compare` | compare source and weight-modified model outputs with recorded tolerances |
+| POST | `/v1/models/compare-quantized` | compare a floating-point source with its persisted quantized variant; reports per-output and aggregate drift, optional failure thresholds, and the quantization report |
 | GET | `/v1/models` | model registry |
 | GET | `/v1/weights` | weight artifact registry |
 | POST | `/v1/weights/analyze` | WIE inspection (`artifact_id` or `path`) |

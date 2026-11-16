@@ -462,8 +462,9 @@ class JobService:
         tokens: Sequence[Sequence[int]],
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> ModelExecution:
-        """Execute the stored graph recovered from an imported model artifact."""
+        """Execute the stored graph, optionally with weight-only int8 quantization."""
         return execute_stored_model(
             self.get_package(artifact_id),
             self.artifact_manifest(artifact_id),
@@ -471,6 +472,7 @@ class JobService:
             tokens=tokens,
             positions=positions,
             capture=capture,
+            quantize=quantize,
         )
 
     def forward_text(
@@ -480,6 +482,7 @@ class JobService:
         text: str,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> ModelTextExecution:
         """Run text through the stored tokenizer and reconstructed model graph."""
         return execute_stored_text(
@@ -490,6 +493,7 @@ class JobService:
             text=text,
             positions=positions,
             capture=capture,
+            quantize=quantize,
         )
 
     def generate_text(
@@ -506,8 +510,9 @@ class JobService:
         top_p: float | None = None,
         seed: int | None = None,
         num_beams: int = 1,
+        quantize: str | None = None,
     ) -> ModelGeneration:
-        """Generate tokens with greedy, seeded-sampling or beam search decoding."""
+        """Generate tokens with greedy, sampled or beam decoding, optionally int8."""
         return greedy_generate(
             self.get_package(artifact_id),
             self.artifact_manifest(artifact_id),
@@ -523,7 +528,141 @@ class JobService:
             top_p=top_p,
             seed=seed,
             num_beams=num_beams,
+            quantize=quantize,
         )
+
+    def quantize_model(
+        self,
+        artifact_id: str,
+        *,
+        scheme: str = "int8",
+    ) -> dict[str, Any]:
+        """Persist a weight-only int8 variant of a stored model artifact."""
+        if scheme != "int8":
+            raise InvalidOperationParameters("quantization scheme must be 'int8'")
+        source_manifest = self.artifact_manifest(artifact_id)
+        graph = graph_from_manifest(source_manifest)
+        if graph.metadata.get("quantization") is not None:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' already contains a quantized graph"
+            )
+        package = self.get_package(artifact_id)
+        from uzen.core.wie.quantization import quantize_int8
+
+        quantized = quantize_int8(graph, package)
+        report = quantized.report.to_dict()
+        if report["num_rewritten_nodes"] == 0:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' has no quantizable linear weights"
+            )
+        source_metadata = dict(source_manifest.get("metadata") or {})
+        metadata: dict[str, Any] = {
+            "graph": quantized.graph.to_dict(),
+            "quantization": report,
+            "quantized_from": artifact_id,
+        }
+        if isinstance(source_metadata.get("tokenizer"), Mapping):
+            metadata["tokenizer"] = dict(source_metadata["tokenizer"])
+        record = self.store.put(
+            quantized.package,
+            operation="quantize.int8",
+            parents=[artifact_id],
+            reuse_existing=True,
+            operations=[
+                {
+                    "op": "quantize.weight_only_int8",
+                    "scheme": report["scheme"],
+                    "bits": report["bits"],
+                    "num_rewritten_nodes": report["num_rewritten_nodes"],
+                    "source_artifact_id": artifact_id,
+                }
+            ],
+            metadata=metadata,
+            note="weight-only int8 execution variant with quantization report",
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=quantized.package.name,
+            family=quantized.package.family,
+            operation="quantize.int8",
+            numel=quantized.package.numel(),
+            num_tensors=len(quantized.package),
+        )
+        if quantized.package.family not in (None, "unknown", "generic"):
+            self.db.register_model(
+                artifact_id=record.artifact_id,
+                family=quantized.package.family,
+                spec={"quantization": report, "parent_artifact_id": artifact_id},
+            )
+        return {
+            "artifact_id": record.artifact_id,
+            "parent_artifact_id": artifact_id,
+            "graph_name": quantized.graph.name,
+            "summary": record.manifest.summary,
+            "quantization": report,
+        }
+
+    def compare_quantized_model(
+        self,
+        source_artifact_id: str,
+        quantized_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Measure output drift between a source model and its quantized variant."""
+        if atol < 0 or rtol < 0:
+            raise InvalidOperationParameters("atol and rtol must be non-negative")
+        source_manifest = self.artifact_manifest(source_artifact_id)
+        candidate_manifest = self.artifact_manifest(quantized_artifact_id)
+        source_metadata = dict(source_manifest.get("metadata") or {})
+        candidate_metadata = dict(candidate_manifest.get("metadata") or {})
+        if isinstance(source_metadata.get("quantization"), Mapping):
+            raise InvalidOperationParameters(
+                "source artifact is already quantized; compare it with a floating-point source"
+            )
+        candidate_graph = graph_from_manifest(candidate_manifest)
+        report = candidate_graph.metadata.get("quantization")
+        if not isinstance(report, Mapping):
+            raise InvalidOperationParameters(
+                "candidate artifact is not a persisted quantized variant"
+            )
+        if candidate_metadata.get("quantized_from") != source_artifact_id:
+            raise InvalidOperationParameters(
+                "candidate artifact was not persisted from the supplied source artifact"
+            )
+        source = execute_stored_model(
+            self.get_package(source_artifact_id),
+            source_manifest,
+            artifact_id=source_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        candidate = execute_stored_model(
+            self.get_package(quantized_artifact_id),
+            candidate_manifest,
+            artifact_id=quantized_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        comparison = compare_executions(
+            source,
+            candidate,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
+        comparison["source_vs_quantized"] = True
+        comparison["quantization"] = dict(report)
+        return comparison
 
     def compare_models(
         self,
@@ -534,6 +673,9 @@ class JobService:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         atol: float = 1e-5,
         rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
     ) -> dict[str, Any]:
         """Compare two model artifacts on exactly the same inputs and graph."""
         source_manifest = self.artifact_manifest(source_artifact_id)
@@ -559,7 +701,15 @@ class JobService:
             tokens=tokens,
             positions=positions,
         )
-        return compare_executions(source, candidate, atol=atol, rtol=rtol)
+        return compare_executions(
+            source,
+            candidate,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
 
     # ------------------------------------------------------------------ #
     # jobs
