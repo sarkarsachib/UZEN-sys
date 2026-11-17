@@ -9,7 +9,10 @@ import pytest
 
 from tests.test_gpt2_reconstruction import _write_gpt2
 from tests.test_llama_reconstruction import _write_llama
-from uzen.core.wie.tokenization import tokenizer_spec_from_manifest
+from uzen.core.wie.tokenization import (
+    legacy_bpe_tokenizer_json,
+    tokenizer_spec_from_manifest,
+)
 from uzen.errors import InvalidOperationParameters
 from uzen.interfaces.cli.main import main as cli_main
 from uzen.interfaces.mcp.server import MCPServer
@@ -64,6 +67,61 @@ def _llama_text_client(tmp_path):
     client = Uzen(root=tmp_path / "llama-text-workspace")
     imported = client.import_model(root)
     return client, imported["artifact_id"]
+
+
+def test_legacy_bpe_tokenizer_without_model_type_is_supported(tmp_path):
+    root, _arrays = _write_gpt2(tmp_path / "legacy-tokenizer")
+    _write_text_tokenizer(root, 16, metaspace=False)
+    tokenizer_file = root / "tokenizer.json"
+    document = json.loads(tokenizer_file.read_text())
+    document["model"].pop("type")
+    tokenizer_file.write_text(json.dumps(document))
+
+    client = Uzen(root=tmp_path / "legacy-tokenizer-workspace")
+    imported = client.import_model(root)
+    artifact_id = imported["artifact_id"]
+    spec = client.artifact(artifact_id)["metadata"]["tokenizer"]
+    assert spec["model_type"] == "BPE"
+
+    result = client.forward_text(artifact_id, text="hello world")
+    assert result["tokens"][0]
+    assert result["outputs"]["logits"]["shape"][0] == 1
+
+
+def test_legacy_vocab_and_merges_are_assembled_into_a_tokenizer(tmp_path):
+    root = tmp_path / "legacy-bpe"
+    root.mkdir()
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=32,
+        special_tokens=["<unk>"],
+        show_progress=False,
+        min_frequency=1,
+    )
+    tokenizer.train_from_iterator(
+        ["hello world", "hello there", "the world is wide", "a small model"],
+        trainer=trainer,
+    )
+    document = json.loads(tokenizer.to_str())
+    (root / "vocab.json").write_text(json.dumps(document["model"]["vocab"]))
+    (root / "merges.txt").write_text(
+        "#version: 0.2\n"
+        + "\n".join(" ".join(pair) for pair in document["model"]["merges"])
+        + "\n"
+    )
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"unk_token": "<unk>", "add_prefix_space": False})
+    )
+
+    assembled = legacy_bpe_tokenizer_json(root)
+
+    assert assembled is not None
+    loaded = Tokenizer.from_str(assembled.decode("utf-8"))
+    encoding = loaded.encode("hello world")
+    assert encoding.ids
+    assert loaded.decode(encoding.ids) == "hello world"
 
 
 def test_gpt2_text_inference_uses_stored_tokenizer(tmp_path):

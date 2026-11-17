@@ -194,6 +194,45 @@ def test_rest_forward_and_compare_routes(tmp_path):
     assert compared.json()["passed"] is True
 
 
+def test_cli_compare_models_supports_aggregate_thresholds(tmp_path, capsys):
+    client, source_id, _root = _gpt2_client(tmp_path)
+    changed_id = client.modify(
+        source_id, "scale", params={"factor": 0.5}
+    )["artifact_id"]
+
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "compare-models",
+            source_id,
+            changed_id,
+            "--tokens",
+            "[[0,1,2,3]]",
+            "--atol",
+            "1.0",
+            "--rtol",
+            "1.0",
+            "--max-abs-error-threshold",
+            "0.001",
+            "--mean-abs-error-threshold",
+            "0.001",
+            "--max-rel-error-threshold",
+            "0.001",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outputs"]["logits"]["passed"] is True
+    assert payload["drift"]["thresholds"] == {
+        "max_abs_error": 0.001,
+        "mean_abs_error": 0.001,
+        "max_rel_error": 0.001,
+    }
+    assert payload["drift"]["passed"] is False
+    assert payload["passed"] is False
+
+
 def test_cli_forward_runs_real_model(tmp_path, capsys):
     client, source_id, _root = _gpt2_client(tmp_path)
     status = cli_main(
@@ -295,6 +334,68 @@ def test_cli_and_mcp_forward_support_int8(tmp_path, capsys):
     assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
 
 
+def test_cli_and_mcp_compare_quantized_variant(tmp_path, capsys):
+    client, source_id, _root = _gpt2_client(tmp_path)
+    quantized = client.quantize_model(source_id)
+    quantized_id = quantized["artifact_id"]
+
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "compare-quantized",
+            source_id,
+            quantized_id,
+            "--tokens",
+            "[[0,1,2,3]]",
+            "--atol",
+            "1.0",
+            "--rtol",
+            "1.0",
+            "--max-abs-error-threshold",
+            "1.0",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source_vs_quantized"] is True
+    assert payload["quantization"] == quantized["quantization"]
+    assert payload["drift"]["thresholds"]["max_abs_error"] == 1.0
+    assert payload["drift"]["passed"] is True
+
+    server = MCPServer(root=client.service.root)
+    listed = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+    assert "uzen.compare_quantized_model" in tools
+    assert (
+        tools["uzen.compare_quantized_model"]["inputSchema"]["properties"][
+            "max_abs_error_threshold"
+        ]["minimum"]
+        == 0
+    )
+
+    called = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "uzen.compare_quantized_model",
+                "arguments": {
+                    "source_artifact_id": source_id,
+                    "quantized_artifact_id": quantized_id,
+                    "tokens": [[0, 1, 2, 3]],
+                    "atol": 1.0,
+                    "rtol": 1.0,
+                },
+            },
+        }
+    )
+    mcp_payload = json.loads(called["result"]["content"][0]["text"])
+    assert mcp_payload["source_vs_quantized"] is True
+    assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
+
+
 def test_mcp_forward_and_compare_tools(tmp_path):
     client, source_id, _root = _gpt2_client(tmp_path)
     candidate_id = client.modify(
@@ -303,8 +404,14 @@ def test_mcp_forward_and_compare_tools(tmp_path):
     server = MCPServer(root=client.service.root)
 
     listed = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-    names = {tool["name"] for tool in listed["result"]["tools"]}
-    assert {"uzen.forward_model", "uzen.compare_models"} <= names
+    tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+    assert {"uzen.forward_model", "uzen.compare_models"} <= set(tools)
+    assert (
+        tools["uzen.compare_models"]["inputSchema"]["properties"][
+            "max_abs_error_threshold"
+        ]["minimum"]
+        == 0
+    )
 
     forwarded = server.handle(
         {
@@ -337,9 +444,18 @@ def test_mcp_forward_and_compare_tools(tmp_path):
                     "source_artifact_id": source_id,
                     "candidate_artifact_id": candidate_id,
                     "tokens": [[0, 1, 2, 3]],
+                    "max_abs_error_threshold": 1.0,
+                    "mean_abs_error_threshold": 1.0,
+                    "max_rel_error_threshold": 1e9,
                 },
             },
         }
     )
     comparison = json.loads(compared["result"]["content"][0]["text"])
     assert comparison["passed"] is True
+    assert comparison["drift"]["thresholds"] == {
+        "max_abs_error": 1.0,
+        "mean_abs_error": 1.0,
+        "max_rel_error": 1e9,
+    }
+    assert comparison["drift"]["passed"] is True

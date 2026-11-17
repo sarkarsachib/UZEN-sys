@@ -117,7 +117,9 @@ local.import_model(path_or_repo_id, revision="main")  # artifact id, compatibili
 local.forward_model(artifact_id, tokens=[[0, 1, 2, 3]], capture="layers")
 local.forward_text(artifact_id, text="hello world")
 local.generate_text(artifact_id, text="hello world", max_new_tokens=8)
+local.quantize_model(artifact_id)
 local.compare_models(source_id, candidate_id, tokens=[[0, 1, 2, 3]])
+local.compare_quantized_model(source_id, quantized_id, tokens=[[0, 1, 2, 3]])
 local.analyze(artifact_id)
 local.generate(family=..., spec=..., seed=0)
 local.modify(artifact_id, "svd_truncate", params={"rank": 32})
@@ -131,15 +133,17 @@ local.operations(); local.policy(); local.families()
 ## CLI
 
 `uzen --help` lists groups: `ops`, `policy`, `families`, `inspect`, `import`,
-`analyze`, `modify`, `generate`, `evaluate`, `forward`, `generate-text`,
-`compare-models`, `align`, `research`, `artifacts`, `job`, `serve`, `worker`, `mcp`,
-`sdk`. `uzen forward` accepts exactly one of `--tokens` or `--text`; `--text` uses the
+`analyze`, `modify`, `generate`, `evaluate`, `quantize`, `forward`, `generate-text`,
+`compare-models`, `compare-quantized`, `align`, `research`, `artifacts`, `job`,
+`serve`, `worker`, `mcp`, `sdk`. `uzen forward` accepts exactly one of `--tokens` or `--text`; `--text` uses the
 imported tokenizer. Errors print `{"error": {...}}` to stderr and exit 2.
 
 ## MCP
 
-Tools: `uzen.import_model`, `uzen.forward_model`, `uzen.forward_text`,
-`uzen.generate_text`, `uzen.compare_models`, `uzen.inspect_model`, `uzen.analyze_weights`, `uzen.plan_engineering`,
+Tools: `uzen.import_model`, `uzen.quantize_model`, `uzen.forward_model`,
+`uzen.forward_text`, `uzen.generate_text`, `uzen.compare_models`,
+`uzen.compare_quantized_model`, `uzen.inspect_model`, `uzen.analyze_weights`,
+`uzen.plan_engineering`,
 `uzen.generate_weights`, `uzen.modify_weights`, `uzen.reconstruct_weights`,
 `uzen.research_weight_architecture`, `uzen.research_model_architecture`,
 `uzen.modify_architecture`, `uzen.create_model`, `uzen.evaluate_candidate`,
@@ -157,5 +161,16 @@ fabricated success.
 4. Execute locally through `JobService` (registered operations only).
 5. `report` with state, result/error, duration.
 
-Artifact transport in this build: shared filesystem (`exchange_dir`) or inline
-tensors. Object-store transport is planned.
+Artifact transport in this build: shared filesystem (`exchange_dir`), inline
+tensors, or an S3-compatible object store.
+`ObjectStoreArtifactTransport` (`uzen/infrastructure/storage/object_store.py`)
+pushes and fetches content-addressed artifacts with their parent lineage and
+stored tokenizer sidecar. It signs every request with AWS Signature Version 4,
+streams single and multipart uploads, and verifies SHA-256 plus the UZEN tensor
+fingerprint before publishing a fetched artifact.
+
+Configure it with `UZEN_S3_BUCKET`, `UZEN_S3_ACCESS_KEY`, `UZEN_S3_SECRET_KEY` and
+optionally `UZEN_S3_ENDPOINT`, `UZEN_S3_REGION`, `UZEN_S3_PREFIX`,
+`UZEN_S3_PATH_STYLE` and `UZEN_S3_SESSION_TOKEN`. Missing credentials raise
+`storage.object_store_unavailable`; the transport is invoked explicitly by a
+worker or caller, not implicitly by the daemon.

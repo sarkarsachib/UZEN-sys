@@ -210,11 +210,49 @@ class MCPServer:
                             },
                             "atol": {"type": "number"},
                             "rtol": {"type": "number"},
+                            "max_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "mean_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "max_rel_error_threshold": {"type": "number", "minimum": 0},
                         },
                         "required": ["source_artifact_id", "candidate_artifact_id", "tokens"],
                     },
                 },
                 self._compare_models,
+            ),
+            "uzen.compare_quantized_model": (
+                {
+                    "description": (
+                        "Compare a floating-point source model with its persisted quantized "
+                        "variant on identical token/position inputs. Returns per-output and "
+                        "aggregate drift, optional threshold failures and the quantization report."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_artifact_id": {"type": "string"},
+                            "quantized_artifact_id": {"type": "string"},
+                            "tokens": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "atol": {"type": "number", "minimum": 0},
+                            "rtol": {"type": "number", "minimum": 0},
+                            "max_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "mean_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "max_rel_error_threshold": {"type": "number", "minimum": 0},
+                        },
+                        "required": [
+                            "source_artifact_id",
+                            "quantized_artifact_id",
+                            "tokens",
+                        ],
+                    },
+                },
+                self._compare_quantized_model,
             ),
             "uzen.inspect_model": (
                 {
@@ -561,6 +599,22 @@ class MCPServer:
             positions=args.get("positions"),
             atol=float(args.get("atol", 1e-5)),
             rtol=float(args.get("rtol", 1e-5)),
+            max_abs_error_threshold=args.get("max_abs_error_threshold"),
+            mean_abs_error_threshold=args.get("mean_abs_error_threshold"),
+            max_rel_error_threshold=args.get("max_rel_error_threshold"),
+        )
+
+    def _compare_quantized_model(self, args: Mapping[str, Any]) -> Any:
+        return self.client.compare_quantized_model(
+            str(args["source_artifact_id"]),
+            str(args["quantized_artifact_id"]),
+            tokens=args["tokens"],
+            positions=args.get("positions"),
+            atol=float(args.get("atol", 1e-5)),
+            rtol=float(args.get("rtol", 1e-5)),
+            max_abs_error_threshold=args.get("max_abs_error_threshold"),
+            mean_abs_error_threshold=args.get("mean_abs_error_threshold"),
+            max_rel_error_threshold=args.get("max_rel_error_threshold"),
         )
 
     def _inspect_model(self, args: Mapping[str, Any]) -> Any:

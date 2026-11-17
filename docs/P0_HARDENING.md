@@ -12,9 +12,22 @@ safetensors and CPU torch extras installed) ran:
 206 passed
 ```
 
-No skips remained once the optional extras were installed. `torch 2.15.0+cpu`
-reported `cuda=False`; no CUDA capability is claimed. After the hardening tests
-were added, the suite reported **237 passed**.
+After the hardening tests were added, the suite reported **237 passed**.
+
+Phase 1 was re-verified on 2026-11-16 with Python 3.12.3, the core/dev/API/
+tokenizer/safetensors/Hugging Face/ONNX extras and `torch 2.15.0+cpu`:
+
+```text
+.venv/bin/python -m pytest -o addopts="" -q -rs
+354 passed, 27 skipped in 7.34s
+```
+
+All 27 skips are the opt-in live Hugging Face tests (`UZEN_LIVE_HF=1`); there are
+no missing-dependency skips. `ruff check uzen tests examples`, `uv pip check` and
+`git diff --check` pass. A wheel was built and installed into a clean temporary
+environment; its metadata reports `License-Expression: MIT`, matching `LICENSE`.
+The CI workflow parses with jobs `core`, `optional-runtimes`, `live-hf`,
+`syntax` and `package`, covering Python 3.10–3.13.
 
 ## Enforced weight immutability
 

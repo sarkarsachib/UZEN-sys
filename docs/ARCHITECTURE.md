@@ -56,6 +56,14 @@ parents, operations and seeds — so retries are idempotent and re-running a job
 mutate an existing artifact. Publication is atomic (write temp dir, then rename), and
 `verify()` re-hashes the payload against the manifest checksum.
 
+Remote transport (`uzen.infrastructure.storage.object_store`) moves the same
+artifact directories through any S3-compatible endpoint. The client implements
+SigV4 with the standard library, streams uploads (multipart above a configurable
+threshold), retries transient failures with a fresh signature, and verifies both
+the object SHA-256 and the tensor fingerprint before publishing a downloaded
+artifact. Parent lineage and the artifact's stored tokenizer are transported with
+it, so a fetched artifact verifies and executes exactly like a local one.
+
 ## NIR — Neural Intermediate Representation
 
 A typed dataflow graph, not a layer list:
@@ -182,6 +190,11 @@ retry re-reads the same authorized scope.
 detected capabilities (CPU/memory/Python/torch, supported operation codes, supported
 families). They never execute user-supplied scripts: only registered operations over
 artifacts.
+
+Worker authentication uses versioned HMAC envelopes (`uzen.worker.envelope/2`) with
+signing-key rotation, an optional signed expiry, a bounded timestamp window and either
+an in-process or durable SQLite nonce guard. Scoped hashed credentials support
+rotation and revocation; plaintext secrets are never persisted.
 
 ## Design boundaries
 

@@ -342,6 +342,7 @@ def reconstruct_hf_model(
         source_dtypes={
             target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
             for target, item in ((m["target"], m) for m in mapping)
+            if target is not None
         },
     )
     validation = definition.graph.validate(package)
@@ -485,6 +486,26 @@ def _gpt2_spec(config: Mapping[str, Any], warnings: list[str]) -> dict[str, Any]
     }
 
 
+def _normalize_gpt2_keys(
+    arrays: Mapping[str, np.ndarray], warnings: list[str]
+) -> Mapping[str, np.ndarray]:
+    """Accept the prefixless key layout used by OpenAI GPT-2 safetensors files."""
+    if "transformer.wte.weight" in arrays or "wte.weight" not in arrays:
+        return arrays
+    renaming: dict[str, str] = {}
+    for key in arrays:
+        if key.startswith("h."):
+            renaming[key] = f"transformer.{key}"
+        elif key in {"wte.weight", "wpe.weight", "ln_f.weight", "ln_f.bias"}:
+            renaming[key] = f"transformer.{key}"
+    if not renaming:
+        return arrays
+    warnings.append(
+        "normalized prefixless GPT-2 safetensors keys to the 'transformer.' layout"
+    )
+    return {renaming.get(key, key): value for key, value in arrays.items()}
+
+
 def _gpt2_tensors(
     arrays: Mapping[str, np.ndarray],
     spec: Mapping[str, Any],
@@ -499,6 +520,7 @@ def _gpt2_tensors(
     list[str],
     list[str],
 ]:
+    arrays = _normalize_gpt2_keys(arrays, warnings)
     expected = dict(definition.parameter_shapes)
     canonical: dict[str, np.ndarray] = {}
     mapping: list[dict[str, Any]] = []
@@ -585,6 +607,32 @@ def _gpt2_tensors(
         add(f"{dst}.mlp_up.bias", f"{src}.mlp.c_fc.bias")
         add(f"{dst}.mlp_down.weight", f"{src}.mlp.c_proj.weight", "transpose", "GPT-2 Conv1D (in,out) -> NIR (out,in)")
         add(f"{dst}.mlp_down.bias", f"{src}.mlp.c_proj.bias")
+        for buffer in ("attn.bias", "attn.masked_bias"):
+            source = f"{src}.{buffer}"
+            if source not in arrays:
+                continue
+            buffer_array = arrays[source]
+            mapping.append(
+                {
+                    "target": None,
+                    "source": source,
+                    "transform": "ignored",
+                    "status": "ignored",
+                    "source_shape": [int(d) for d in buffer_array.shape],
+                    "dtype": dtype_name(buffer_array.dtype),
+                    "note": (
+                        "GPT-2 causal-mask buffer; the NIR attention node applies "
+                        "causality directly, so no parameter is bound"
+                    ),
+                }
+            )
+            used.add(source)
+
+    if any(item["status"] == "ignored" for item in mapping):
+        warnings.append(
+            "ignored GPT-2 attention mask buffers because causal masking is part "
+            "of the NIR attention operator"
+        )
 
     extra = sorted(set(arrays) - used)
     for name in extra:
@@ -734,6 +782,7 @@ def _reconstruct_llama(
         source_dtypes={
             target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
             for target, item in ((m["target"], m) for m in mapping)
+            if target is not None
         },
     )
     validation = definition.graph.validate(package)
@@ -1646,6 +1695,7 @@ def _reconstruct_gptj(
         source_dtypes={
             target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
             for target, item in ((m["target"], m) for m in mapping)
+            if target is not None
         },
     )
     validation = definition.graph.validate(package)
@@ -1891,6 +1941,7 @@ def _reconstruct_opt(
         source_dtypes={
             target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
             for target, item in ((m["target"], m) for m in mapping)
+            if target is not None
         },
     )
     validation = definition.graph.validate(package)
@@ -2456,6 +2507,7 @@ def _reconstruct_neox(
         source_dtypes={
             target: source_dtypes[item["source"]] if source_dtypes and item["source"] in source_dtypes else item["dtype"]
             for target, item in ((m["target"], m) for m in mapping)
+            if target is not None
         },
     )
     validation = definition.graph.validate(package)

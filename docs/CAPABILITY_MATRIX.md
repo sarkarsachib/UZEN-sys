@@ -139,12 +139,12 @@ single-objective contract.
 
 | Runtime | Status |
 | --- | --- |
-| NumPy reference (safetensors + npz, graph execution) | implemented |
+| NumPy reference (safetensors, sharded safetensors index, npz, GGUF including dequantization; atomic writes; graph execution) | implemented |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
 | Torch-CPU NIR executor (all 44 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
 | Weight-only int8 execution | implemented for 2-D float weights consumed by `linear` nodes: symmetric int8 `[-127, 127]` values with per-output-channel float32 scales, float activations, an explicit per-tensor report, and NumPy/Torch kernels; non-linear and shared weights are excluded explicitly |
-| ONNX interchange for the NIR subset (export/import) | implemented when the `onnx` extra is installed; validated with `onnx.checker`, no embedded executor |
+| ONNX interchange for the NIR subset (export/import) | implemented when the `onnx` extra is installed; opset 20 export, standard `Gelu(approximate="tanh")` maps to NIR `gelu`, the Erf GELU form is refused, validated with `onnx.checker`, no embedded executor |
 | CUDA-native kernels | planned — UZEN never claims GPU acceleration it does not have |
 
 ## Formats
@@ -152,11 +152,12 @@ single-objective contract.
 | Format | Status |
 | --- | --- |
 | `.safetensors` (own codec, strict header validation) | implemented |
+| Sharded safetensors (`model.safetensors.index.json`) | implemented with exact weight-map checks; validated on real `distilgpt2` (4 shards, 82 tensors) and `openai-community/gpt2` (5 shards, 160 tensors), where single-file and sharded imports produce identical digests, logits and tokens, and a missing declared shard is refused |
 | `.npz` | implemented (NumPy runtime) |
 | `.pt/.pth/.bin/.ckpt` | PyTorch adapter with `weights_only=True`; pickle objects refused |
 | `.pkl` and other pickle formats | **unsupported by design** (`format.unsupported`) |
 | `.gguf` (v3 container) | implemented: F32/F16 exact; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K read (dequantized); Q8_0 write; registry-driven inspection; requantization with error report; remaining K-quant/IQ refused by code |
-| `.onnx` | implemented for the exportable NIR subset (requires `onnx`); unmapped operators are refused |
+| `.onnx` | implemented for the exportable NIR subset (requires `onnx`, opset 20); unmapped operators and the Erf GELU form are refused |
 
 ## Interfaces
 
@@ -167,15 +168,17 @@ single-objective contract.
 | REST API (FastAPI, OpenAPI) | implemented (optional extra) |
 | MCP stdio server (13 tools) | implemented |
 | Worker protocol + daemon (local and remote) | implemented |
-| Object-store artifact transport | planned (shared filesystem adapter implemented) |
+| Object-store artifact transport | implemented for S3-compatible endpoints: local SigV4 signing, streamed single and multipart uploads, SHA-256 verification before publication, parent-lineage closure and stored-tokenizer sidecars; validated against a real S3-compatible server and by an independently signature-checking test server |
 | Redis/durable queue adapter | planned (SQLite-backed lease queue implemented) |
 
 ## Known limitations (explicit)
 
 1. **No distributed scheduler.** The job service claims jobs with SQLite leases; a
    multi-node deployment needs a shared database and an object store.
-2. **Remote artifact transfer** between control plane and worker currently assumes a
-   shared filesystem or inline tensors.
+2. **Remote artifact transfer** between control plane and worker supports a shared
+   filesystem, inline tensors and S3-compatible object storage. The worker daemon
+   does not fetch artifacts implicitly; callers invoke
+   `ObjectStoreArtifactTransport` explicitly (see `examples/object_store_transport_demo.py`).
 3. **LLM planning** requires an OpenAI-compatible endpoint; without one it raises rather
    than pretending an LLM was consulted.
 4. **Activation alignment** requires a runnable NIR graph and real inputs; it will not

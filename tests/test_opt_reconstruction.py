@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from uzen.core.wie.importer import ModelImporter
 from uzen.infrastructure.storage.safetensors_io import write_safetensors
@@ -114,6 +115,35 @@ def _write_opt(
     }
     (root / "config.json").write_text(json.dumps(config))
     return root, arrays
+
+
+def test_opt_pytorch_bin_fallback_uses_weights_only_loader(tmp_path):
+    torch = pytest.importorskip("torch")
+    root, arrays = _write_opt(tmp_path / "opt-bin")
+    (root / "model.safetensors").unlink()
+    torch.save(
+        {name: torch.from_numpy(value) for name, value in arrays.items()},
+        root / "pytorch_model.bin",
+    )
+
+    result = ModelImporter().import_source(root)
+
+    assert result.ok
+    assert result.report.compatibility.overall == "validated"
+    assert result.report.compatibility.execution == "passed"
+    assert result.report.reconstruction["execution"]["outputs"]["logits"]["shape"] == [
+        1,
+        4,
+        32,
+    ]
+    assert any(
+        "pytorch_model.bin" in warning and "weights_only=True" in warning
+        for warning in result.report.warnings
+    )
+    assert {item["path"] for item in result.report.files} == {
+        "config.json",
+        "pytorch_model.bin",
+    }
 
 
 def test_opt_reconstruction_validates_executes_and_ties_lm_head(tmp_path):

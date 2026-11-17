@@ -249,7 +249,11 @@ weighted `mean_abs_error`, `max_abs_error`, `max_rel_error`, output/element
 counts, completeness, `allclose_passed`, `failed_outputs`, and threshold
 failures. Optional `max_abs_error_threshold`, `mean_abs_error_threshold` and
 `max_rel_error_threshold` arguments add explicit aggregate failure limits
-without replacing the per-output `atol`/`rtol` checks.
+without replacing the per-output `atol`/`rtol` checks. The same three limits are
+available on both comparison interfaces: `compare-models` accepts
+`--max-abs-error-threshold`, `--mean-abs-error-threshold` and
+`--max-rel-error-threshold`, while the MCP `uzen.compare_models` and
+`uzen.compare_quantized_model` tools accept the equivalent snake-case fields.
 
 Parent IDs are deduplicated, so interpolating a model with itself records the
 source once in lineage.
@@ -284,12 +288,15 @@ CLI:
 ```bash
 uzen forward ARTIFACT_ID --tokens '[[0,1,2,3]]'
 uzen compare-models SOURCE CANDIDATE --tokens '[[0,1,2,3]]'
+uzen compare-quantized SOURCE QUANTIZED --tokens '[[0,1,2,3]]' \
+  --max-abs-error-threshold 0.01
 ```
 
 MCP:
 
 * `uzen.forward_model`
 * `uzen.compare_models`
+* `uzen.compare_quantized_model`
 
 ## Limits
 

@@ -14,6 +14,7 @@ Examples::
     uzen modify ARTIFACT_ID interpolate --other OTHER_ID --param t=0.5
     uzen forward ARTIFACT_ID --text 'hello world'
     uzen quantize ARTIFACT_ID --scheme int8
+    uzen compare-quantized SOURCE QUANTIZED --tokens '[[0,1,2,3]]'
     uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8
     uzen generate --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen evaluate ARTIFACT_ID --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
@@ -166,6 +167,23 @@ def build_parser() -> argparse.ArgumentParser:
     cmp_models.add_argument("--positions", help="JSON position matrix")
     cmp_models.add_argument("--atol", type=float, default=1e-5)
     cmp_models.add_argument("--rtol", type=float, default=1e-5)
+    cmp_models.add_argument("--max-abs-error-threshold", type=float)
+    cmp_models.add_argument("--mean-abs-error-threshold", type=float)
+    cmp_models.add_argument("--max-rel-error-threshold", type=float)
+
+    cmp_quant = sub.add_parser(
+        "compare-quantized",
+        help="compare a source model with its persisted quantized variant",
+    )
+    cmp_quant.add_argument("source_artifact_id")
+    cmp_quant.add_argument("quantized_artifact_id")
+    cmp_quant.add_argument("--tokens", required=True, help="JSON token matrix")
+    cmp_quant.add_argument("--positions", help="JSON position matrix")
+    cmp_quant.add_argument("--atol", type=float, default=1e-5)
+    cmp_quant.add_argument("--rtol", type=float, default=1e-5)
+    cmp_quant.add_argument("--max-abs-error-threshold", type=float)
+    cmp_quant.add_argument("--mean-abs-error-threshold", type=float)
+    cmp_quant.add_argument("--max-rel-error-threshold", type=float)
 
     align = sub.add_parser("align", help="align one artifact to another")
     align.add_argument("source")
@@ -414,6 +432,25 @@ def _dispatch(args: argparse.Namespace) -> int:
                 positions=_json_arg(args.positions),
                 atol=args.atol,
                 rtol=args.rtol,
+                max_abs_error_threshold=args.max_abs_error_threshold,
+                mean_abs_error_threshold=args.mean_abs_error_threshold,
+                max_rel_error_threshold=args.max_rel_error_threshold,
+            )
+        )
+        return 0
+
+    if cmd == "compare-quantized":
+        _emit(
+            _client(args).compare_quantized_model(
+                args.source_artifact_id,
+                args.quantized_artifact_id,
+                tokens=_json_arg(args.tokens),
+                positions=_json_arg(args.positions),
+                atol=args.atol,
+                rtol=args.rtol,
+                max_abs_error_threshold=args.max_abs_error_threshold,
+                mean_abs_error_threshold=args.mean_abs_error_threshold,
+                max_rel_error_threshold=args.max_rel_error_threshold,
             )
         )
         return 0
