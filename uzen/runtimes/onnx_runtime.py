@@ -41,7 +41,10 @@ except Exception as exc:  # pragma: no cover - exercised only without the extra
     ONNX_AVAILABLE = False
     ONNX_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
-ONNX_OPSET = 17
+# Opset 20 is the first standard opset with ``Gelu``; UZEN's ``gelu`` is the tanh
+# approximation, exported as ``Gelu(approximate="tanh")`` instead of a hand-rolled
+# Pow/Mul/Tanh chain, so the export/import pair stays symmetric.
+ONNX_OPSET = 20
 ONNX_IR_VERSION = 8
 
 _DTYPE_TO_ONNX = {
@@ -216,20 +219,7 @@ class _Exporter:
         elif op == "softmax":
             self.emit("Softmax", [arg("x")], out(), axis=int(params.get("axis", -1)))
         elif op == "gelu":
-            x = arg("x")
-            three = self.constant(node_id, np.asarray(3.0, dtype=np.float32))
-            c044 = self.constant(node_id, np.asarray(0.044715, dtype=np.float32))
-            c_sqrt = self.constant(node_id, np.asarray(np.sqrt(2.0 / np.pi), dtype=np.float32))
-            half = self.constant(node_id, np.asarray(0.5, dtype=np.float32))
-            one = self.constant(node_id, np.asarray(1.0, dtype=np.float32))
-            x3 = self.emit("Pow", [x, three], f"{node_id}__x3")
-            scaled = self.emit("Mul", [x3, c044], f"{node_id}__scaled")
-            inner = self.emit("Add", [x, scaled], f"{node_id}__inner")
-            inner = self.emit("Mul", [inner, c_sqrt], f"{node_id}__sqrt2pi")
-            tanh = self.emit("Tanh", [inner], f"{node_id}__tanh")
-            plus1 = self.emit("Add", [tanh, one], f"{node_id}__plus1")
-            halfx = self.emit("Mul", [x, half], f"{node_id}__halfx")
-            self.emit("Mul", [halfx, plus1], out())
+            self.emit("Gelu", [arg("x")], out(), approximate="tanh")
         elif op == "silu":
             x = arg("x")
             sig = self.emit("Sigmoid", [x], f"{node_id}__sigmoid")
@@ -537,6 +527,17 @@ def import_onnx(source: str | Path | Any) -> tuple[Graph, WeightPackage, dict[st
                 single(nid, "tanh", node)
             elif op_type == "Sigmoid":
                 single(nid, "sigmoid", node)
+            elif op_type == "Gelu":
+                approximate = next((a.s for a in node.attribute if a.name == "approximate"), b"none")
+                if isinstance(approximate, bytes):
+                    approximate = approximate.decode("utf-8", "replace")
+                if str(approximate) != "tanh":
+                    raise UnsupportedOperator(
+                        "ONNX Gelu with approximate='none' (the Erf formulation) has no "
+                        "faithful NIR equivalent: NIR 'gelu' is the tanh approximation, "
+                        "so this model is refused instead of being rewritten"
+                    )
+                single(nid, "gelu", node)
             elif op_type == "Softmax":
                 axis = int(next((a.i for a in node.attribute if a.name == "axis"), -1))
                 single(nid, "softmax", node, axis=axis)

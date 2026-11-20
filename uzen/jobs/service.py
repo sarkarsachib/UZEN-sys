@@ -29,11 +29,13 @@ from uzen.core.vel.verify import verify
 from uzen.core.wie.inspector import WeightIntelligenceEngine
 from uzen.core.wie.model_execution import (
     ModelExecution,
+    ModelGeneration,
     ModelTextExecution,
     compare_executions,
     execute_stored_model,
     execute_stored_text,
     graph_from_manifest,
+    greedy_generate,
 )
 from uzen.core.wie.tokenization import store_tokenizer
 from uzen.engines.mar.engine import ModelArchitectureResearch
@@ -41,15 +43,18 @@ from uzen.engines.war.engine import WeightArchitectureResearch
 from uzen.engines.wge.engine import WeightGenerationEngine
 from uzen.engines.wme.engine import WeightModificationEngine
 from uzen.errors import (
+    ArtifactIntegrityError,
     ArtifactNotFound,
     InvalidOperationParameters,
     JobNotFound,
     JobStateError,
+    UnsupportedFormat,
     UzenError,
 )
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
+from uzen.jobs.scheduling import requirements_from_request
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
-from uzen.util.canonical import utc_now_iso
+from uzen.util.canonical import sha256_file, utc_now_iso
 
 
 class JobService:
@@ -88,11 +93,21 @@ class JobService:
         if p.is_dir():
             record, _report = self.import_model(p, name=name, family=family)
             return record
+        suffix = p.suffix.lower()
+        if suffix in (".pt", ".pth", ".bin", ".ckpt"):
+            return self._import_torch_checkpoint(p, name=name, family=family)
+        if suffix == ".onnx":
+            return self._import_onnx_model(p, name=name, family=family)
+        graph_doc: dict[str, Any] | None = None
         report = self.wie.inspect_file(p)
         if report.format == "safetensors":
-            from uzen.infrastructure.storage.safetensors_io import read_safetensors
+            from uzen.infrastructure.storage.safetensors_io import (
+                decode_graph_metadata,
+                read_safetensors,
+            )
 
             arrays, header = read_safetensors(p)
+            graph_doc = decode_graph_metadata(header.metadata)
         elif report.format == "npz":
             data = np.load(p, allow_pickle=False)
             arrays = {k: np.asarray(data[k]) for k in data.files}
@@ -105,22 +120,51 @@ class JobService:
         else:
             raise InvalidOperationParameters(f"unsupported import format '{report.format}'")
         guessed = report.family_guess.get("family", "generic")
+        source_hash = sha256_file(p)
         package = WeightPackage.from_arrays(
             arrays,
             name=name or p.stem,
             family=family or (guessed if guessed != "unknown" else "generic"),
             metadata={
                 "imported_from": str(p),
-                "source_sha256": report.metadata.get("sha256"),
+                "source_sha256": report.metadata.get("sha256") or source_hash,
                 "family_inference": report.family_guess,
             },
         )
+        import_report: dict[str, Any] = {
+            "format": report.format,
+            "source_kind": f"{report.format}_file",
+            "source": str(p),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": p.stat().st_size,
+            "adapter": "legacy_artifact_importer",
+            "graph_reconstructed": False,
+            "num_tensors": len(package),
+            "family_guess": report.family_guess,
+        }
+        artifact_metadata: dict[str, Any] = {
+            "source_path": str(p),
+            "family_guess": report.family_guess,
+            "import_report": import_report,
+        }
+        if graph_doc is not None:
+            from uzen.core.nir.graph import Graph
+
+            Graph.from_dict(graph_doc).require_valid(package)
+            import_report["graph_reconstructed"] = True
+            import_report["graph_name"] = graph_doc.get("name")
+            artifact_metadata["graph"] = graph_doc
         record = self.store.put(
             package,
             operation="import",
             reuse_existing=True,
-            metadata={"source_path": str(p), "family_guess": report.family_guess},
-            note="imported source artifact (immutable origin)",
+            metadata=artifact_metadata,
+            note=(
+                "imported source artifact with embedded NIR graph"
+                if graph_doc is not None
+                else "imported source artifact (immutable origin)"
+            ),
         )
         self.db.index_artifact(
             artifact_id=record.artifact_id,
@@ -136,6 +180,175 @@ class JobService:
                 artifact_id=record.artifact_id,
                 family=package.family,
                 spec={"inferred": report.family_guess},
+            )
+        return record
+
+    def _import_torch_checkpoint(
+        self,
+        path: Path,
+        *,
+        name: str | None,
+        family: str | None,
+    ) -> ArtifactRecord:
+        """Import a PyTorch state dict without allowing arbitrary pickle execution."""
+        from uzen.runtimes.pytorch_runtime import PyTorchRuntime
+
+        source_hash = sha256_file(path)
+        package = PyTorchRuntime(device="cpu").load(path)
+        if sha256_file(path) != source_hash:
+            raise ArtifactIntegrityError(
+                "PyTorch checkpoint changed while it was being imported", path=str(path)
+            )
+        source_dtypes = {
+            key: meta.source_dtype
+            for key, meta in package.metas.items()
+            if meta.source_dtype is not None
+        }
+        package = WeightPackage.from_arrays(
+            package.tensors,
+            name=name or package.name,
+            family=family or package.family,
+            metadata={
+                **dict(package.metadata),
+                "imported_from": str(path),
+                "source_sha256": source_hash,
+            },
+            source_dtypes=source_dtypes,
+        )
+        import_report: dict[str, Any] = {
+            "format": "pytorch",
+            "source_kind": "pytorch_checkpoint",
+            "source": str(path),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": path.stat().st_size,
+            "adapter": "pytorch",
+            "weights_only": True,
+            "graph_reconstructed": False,
+            "num_tensors": len(package),
+            "source_dtypes": source_dtypes,
+        }
+        return self._store_imported_package(
+            package,
+            source=path,
+            source_hash=source_hash,
+            import_report=import_report,
+            note="imported PyTorch weights-only state dict (no graph reconstruction)",
+        )
+
+    def _import_onnx_model(
+        self,
+        path: Path,
+        *,
+        name: str | None,
+        family: str | None,
+    ) -> ArtifactRecord:
+        """Lift a supported ONNX model into NIR and store its graph and weights."""
+        import onnx
+
+        from uzen.runtimes.onnx_runtime import import_onnx
+
+        model = onnx.load(str(path), load_external_data=False)
+        if any(
+            initializer.data_location == onnx.TensorProto.EXTERNAL
+            for initializer in model.graph.initializer
+        ):
+            raise UnsupportedFormat(
+                "ONNX models with external tensor data are not imported because the "
+                "sidecar files would not be covered by the recorded source hash; "
+                "save the model as a single-file ONNX model first"
+            )
+        source_hash = sha256_file(path)
+        graph, package, onnx_metadata = import_onnx(model)
+        if sha256_file(path) != source_hash:
+            raise ArtifactIntegrityError(
+                "ONNX model changed while it was being imported", path=str(path)
+            )
+        source_dtypes = {
+            key: meta.source_dtype
+            for key, meta in package.metas.items()
+            if meta.source_dtype is not None
+        }
+        package = WeightPackage.from_arrays(
+            package.tensors,
+            name=name or package.name,
+            family=family or package.family,
+            metadata={
+                **dict(package.metadata),
+                "imported_from": str(path),
+                "source_sha256": source_hash,
+                "onnx": dict(onnx_metadata),
+            },
+            source_dtypes=source_dtypes,
+        )
+        graph.require_valid(package)
+        import_report: dict[str, Any] = {
+            "format": "onnx",
+            "source_kind": "onnx_model",
+            "source": str(path),
+            "source_hash": source_hash,
+            "source_sha256": source_hash,
+            "source_bytes": path.stat().st_size,
+            "adapter": "onnx",
+            "graph_reconstructed": True,
+            "graph_name": graph.name,
+            "num_nodes": len(graph.nodes),
+            "num_tensors": len(package),
+            "onnx": dict(onnx_metadata),
+        }
+        return self._store_imported_package(
+            package,
+            source=path,
+            source_hash=source_hash,
+            import_report=import_report,
+            graph_doc=graph.to_dict(),
+            note="imported ONNX model with validated NIR graph",
+        )
+
+    def _store_imported_package(
+        self,
+        package: WeightPackage,
+        *,
+        source: Path,
+        source_hash: str,
+        import_report: Mapping[str, Any],
+        graph_doc: Mapping[str, Any] | None = None,
+        note: str,
+    ) -> ArtifactRecord:
+        metadata: dict[str, Any] = {
+            "source_path": str(source),
+            "import_report": dict(import_report),
+        }
+        if graph_doc is not None:
+            metadata["graph"] = dict(graph_doc)
+        record = self.store.put(
+            package,
+            operation="import",
+            reuse_existing=True,
+            operations=[
+                {
+                    "op": "import.source",
+                    "format": str(import_report["format"]),
+                    "sha256": source_hash,
+                }
+            ],
+            metadata=metadata,
+            note=note,
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=package.name,
+            family=package.family,
+            operation="import",
+            numel=package.numel(),
+            num_tensors=len(package),
+        )
+        if package.family not in (None, "unknown", "generic"):
+            self.db.register_model(
+                artifact_id=record.artifact_id,
+                family=package.family,
+                spec={"import": dict(import_report)},
             )
         return record
 
@@ -167,14 +380,19 @@ class JobService:
         graph_doc = (
             reconstruction.graph
             if reconstruction is not None and reconstruction.graph_reconstructed
-            else None
+            else artifact_package.metadata.get("graph")
         )
         metadata: dict[str, Any] = {
             "source_path": str(source),
             "import_report": report,
         }
         if graph_doc is not None:
+            from uzen.core.nir.graph import Graph
+
+            Graph.from_dict(graph_doc).require_valid(artifact_package)
             metadata["graph"] = graph_doc
+            if reconstruction is None:
+                report["metadata"]["graph_restored_from_metadata"] = True
         tokenizer_spec = None
         if result.tokenizer_json is not None:
             tokenizer_spec = store_tokenizer(self.root, result.tokenizer_json)
@@ -244,14 +462,18 @@ class JobService:
         *,
         tokens: Sequence[Sequence[int]],
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> ModelExecution:
-        """Execute the stored graph recovered from an imported model artifact."""
+        """Execute the stored graph, optionally with weight-only int8 quantization."""
         return execute_stored_model(
             self.get_package(artifact_id),
             self.artifact_manifest(artifact_id),
             artifact_id=artifact_id,
             tokens=tokens,
             positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
 
     def forward_text(
@@ -260,6 +482,8 @@ class JobService:
         *,
         text: str,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> ModelTextExecution:
         """Run text through the stored tokenizer and reconstructed model graph."""
         return execute_stored_text(
@@ -269,7 +493,177 @@ class JobService:
             artifact_id=artifact_id,
             text=text,
             positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
+
+    def generate_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        max_new_tokens: int = 16,
+        eos_token_id: int | None = None,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        strategy: str = "greedy",
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        num_beams: int = 1,
+        quantize: str | None = None,
+    ) -> ModelGeneration:
+        """Generate tokens with greedy, sampled or beam decoding, optionally int8."""
+        return greedy_generate(
+            self.get_package(artifact_id),
+            self.artifact_manifest(artifact_id),
+            root=self.root,
+            artifact_id=artifact_id,
+            text=text,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            positions=positions,
+            strategy=strategy,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            num_beams=num_beams,
+            quantize=quantize,
+        )
+
+    def quantize_model(
+        self,
+        artifact_id: str,
+        *,
+        scheme: str = "int8",
+    ) -> dict[str, Any]:
+        """Persist a weight-only int8 variant of a stored model artifact."""
+        if scheme != "int8":
+            raise InvalidOperationParameters("quantization scheme must be 'int8'")
+        source_manifest = self.artifact_manifest(artifact_id)
+        graph = graph_from_manifest(source_manifest)
+        if graph.metadata.get("quantization") is not None:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' already contains a quantized graph"
+            )
+        package = self.get_package(artifact_id)
+        from uzen.core.wie.quantization import quantize_int8
+
+        quantized = quantize_int8(graph, package)
+        report = quantized.report.to_dict()
+        if report["num_rewritten_nodes"] == 0:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' has no quantizable linear weights"
+            )
+        source_metadata = dict(source_manifest.get("metadata") or {})
+        metadata: dict[str, Any] = {
+            "graph": quantized.graph.to_dict(),
+            "quantization": report,
+            "quantized_from": artifact_id,
+        }
+        if isinstance(source_metadata.get("tokenizer"), Mapping):
+            metadata["tokenizer"] = dict(source_metadata["tokenizer"])
+        record = self.store.put(
+            quantized.package,
+            operation="quantize.int8",
+            parents=[artifact_id],
+            reuse_existing=True,
+            operations=[
+                {
+                    "op": "quantize.weight_only_int8",
+                    "scheme": report["scheme"],
+                    "bits": report["bits"],
+                    "num_rewritten_nodes": report["num_rewritten_nodes"],
+                    "source_artifact_id": artifact_id,
+                }
+            ],
+            metadata=metadata,
+            note="weight-only int8 execution variant with quantization report",
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=quantized.package.name,
+            family=quantized.package.family,
+            operation="quantize.int8",
+            numel=quantized.package.numel(),
+            num_tensors=len(quantized.package),
+        )
+        if quantized.package.family not in (None, "unknown", "generic"):
+            self.db.register_model(
+                artifact_id=record.artifact_id,
+                family=quantized.package.family,
+                spec={"quantization": report, "parent_artifact_id": artifact_id},
+            )
+        return {
+            "artifact_id": record.artifact_id,
+            "parent_artifact_id": artifact_id,
+            "graph_name": quantized.graph.name,
+            "summary": record.manifest.summary,
+            "quantization": report,
+        }
+
+    def compare_quantized_model(
+        self,
+        source_artifact_id: str,
+        quantized_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Measure output drift between a source model and its quantized variant."""
+        if atol < 0 or rtol < 0:
+            raise InvalidOperationParameters("atol and rtol must be non-negative")
+        source_manifest = self.artifact_manifest(source_artifact_id)
+        candidate_manifest = self.artifact_manifest(quantized_artifact_id)
+        source_metadata = dict(source_manifest.get("metadata") or {})
+        candidate_metadata = dict(candidate_manifest.get("metadata") or {})
+        if isinstance(source_metadata.get("quantization"), Mapping):
+            raise InvalidOperationParameters(
+                "source artifact is already quantized; compare it with a floating-point source"
+            )
+        candidate_graph = graph_from_manifest(candidate_manifest)
+        report = candidate_graph.metadata.get("quantization")
+        if not isinstance(report, Mapping):
+            raise InvalidOperationParameters(
+                "candidate artifact is not a persisted quantized variant"
+            )
+        if candidate_metadata.get("quantized_from") != source_artifact_id:
+            raise InvalidOperationParameters(
+                "candidate artifact was not persisted from the supplied source artifact"
+            )
+        source = execute_stored_model(
+            self.get_package(source_artifact_id),
+            source_manifest,
+            artifact_id=source_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        candidate = execute_stored_model(
+            self.get_package(quantized_artifact_id),
+            candidate_manifest,
+            artifact_id=quantized_artifact_id,
+            tokens=tokens,
+            positions=positions,
+        )
+        comparison = compare_executions(
+            source,
+            candidate,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
+        comparison["source_vs_quantized"] = True
+        comparison["quantization"] = dict(report)
+        return comparison
 
     def compare_models(
         self,
@@ -280,6 +674,9 @@ class JobService:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         atol: float = 1e-5,
         rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
     ) -> dict[str, Any]:
         """Compare two model artifacts on exactly the same inputs and graph."""
         source_manifest = self.artifact_manifest(source_artifact_id)
@@ -305,7 +702,15 @@ class JobService:
             tokens=tokens,
             positions=positions,
         )
-        return compare_executions(source, candidate, atol=atol, rtol=rtol)
+        return compare_executions(
+            source,
+            candidate,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
 
     # ------------------------------------------------------------------ #
     # jobs
@@ -340,8 +745,25 @@ class JobService:
                     scope=job_request.task_scope.value,
                 )
             spec.validate_params(dict(entry.get("params") or {}))
-        row = self.db.create_job(request, idempotency_key=idempotency_key)
-        self.db.append_event(row.id, "queued", {"scope": job_request.task_scope.value})
+        # The capability requirement set is derived from the request itself and stored
+        # with the job, so dispatch can decide eligibility inside the claiming statement
+        # without re-parsing the request (and without trusting the worker's word).
+        requirements = requirements_from_request(request)
+        row = self.db.create_job(
+            request,
+            idempotency_key=idempotency_key,
+            requirements=requirements,
+            priority=int(request.get("priority") or 0),
+        )
+        self.db.append_event(
+            row.id,
+            "queued",
+            {
+                "scope": job_request.task_scope.value,
+                "requirements": requirements.to_dict(),
+                "priority": row.priority,
+            },
+        )
         return row.to_dict()
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -364,10 +786,31 @@ class JobService:
 
     # ------------------------------------------------------------------ #
 
-    def run(self, job_id: str) -> dict[str, Any]:
+    def run(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a job, either as the control plane or as a worker holding a lease.
+
+        A leased execution (``worker_id`` and ``token`` supplied) settles the job through
+        :meth:`Database.finish_from_worker`, so the dispatch record, the attempt number and
+        the idempotency guard are the same ones a remote worker goes through. A local
+        execution settles it directly. Either way the caller never declares success: the
+        state comes from the executed work or from the recorded error.
+        """
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
             raise JobStateError(f"job '{job_id}' already finished ({row.state})")
+        leased = worker_id is not None and token is not None
+        if leased and (row.dispatch_token != token or row.worker_id != worker_id):
+            raise JobStateError(
+                f"job '{job_id}' is not leased to worker '{worker_id}' with that token",
+                job_id=job_id,
+                current_worker=row.worker_id,
+            )
         if self.db.is_cancel_requested(job_id):
             self.db.transition(job_id, "CANCELLED", payload={"reason": "cancel requested"})
             return self.db.get_job(job_id).to_dict()
@@ -378,11 +821,10 @@ class JobService:
             if isinstance(result, dict) and "artifact_id" in result:
                 result.setdefault("output_artifact_id", result["artifact_id"])
         except UzenError as exc:
-            self.db.set_error(job_id, {"error": exc.to_dict(), "timestamp": utc_now_iso()})
-            self.db.release_lease(job_id)
+            self._settle_failure(job_id, {"error": exc.to_dict(), "timestamp": utc_now_iso()}, worker_id, token)
             return self.db.get_job(job_id).to_dict()
         except Exception as exc:  # unexpected: recorded with type for diagnosis
-            self.db.set_error(
+            self._settle_failure(
                 job_id,
                 {
                     "error": {
@@ -392,13 +834,39 @@ class JobService:
                     },
                     "timestamp": utc_now_iso(),
                 },
+                worker_id,
+                token,
             )
-            self.db.release_lease(job_id)
             return self.db.get_job(job_id).to_dict()
         self.db.transition(job_id, "VALIDATING", progress=0.9)
-        self.db.set_result(job_id, result)
-        self.db.release_lease(job_id)
+        if leased:
+            assert worker_id is not None and token is not None
+            self.db.finish_from_worker(
+                job_id, worker_id=worker_id, token=token, state="SUCCEEDED", result=result
+            )
+        else:
+            self.db.set_result(job_id, result)
+            self.db.release_lease(job_id)
         return self.db.get_job(job_id).to_dict()
+
+    def _settle_failure(
+        self,
+        job_id: str,
+        error: Mapping[str, Any],
+        worker_id: str | None,
+        token: str | None,
+    ) -> None:
+        if worker_id is not None and token is not None:
+            self.db.finish_from_worker(
+                job_id,
+                worker_id=worker_id,
+                token=token,
+                state="FAILED",
+                error=dict(error.get("error") or {}),
+            )
+            return
+        self.db.set_error(job_id, error)
+        self.db.release_lease(job_id)
 
     def run_pending(self, limit: int = 1) -> list[dict[str, Any]]:
         out = []

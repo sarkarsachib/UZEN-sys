@@ -2,9 +2,10 @@
 
 The importer is deliberately conservative. It establishes that every tensor was
 loaded, that a configuration was parsed and that roles were inferred. For the
-explicit GPT-2 adapter it then reconstructs and validates an NIR graph and runs
-a finite forward pass; other architectures are reported as unsupported rather
-than guessed. Import, reconstruction and execution remain independent claims.
+explicit GPT-2, Llama, OPT, GPT-NeoX, GPT-J and Gemma adapters it then reconstructs and
+validates an NIR graph and runs a finite forward pass; other architectures are
+reported as unsupported rather than guessed. Import, reconstruction and execution remain
+independent claims.
 
 Supported sources
 -----------------
@@ -13,9 +14,12 @@ Supported sources
 * a single ``.safetensors`` file with optional adjacent metadata;
 * a Hugging Face repository id through the optional ``huggingface_hub`` extra.
 
-No pickle is read, no remote code is executed and no missing shard is silently
-ignored. Source file hashes, revision/license metadata and tokenizer/vocabulary
-metadata are recorded in the report and in the artifact manifest.
+No arbitrary pickle is unpickled, no remote code is executed and no missing
+shard is silently ignored. When a Hub checkpoint has no safetensors payload, a
+single `pytorch_model.bin` may be loaded through PyTorch's weights-only loader;
+the fallback is recorded explicitly. Source file hashes, revision/license
+metadata and tokenizer/vocabulary metadata are recorded in the report and in the
+artifact manifest.
 """
 
 from __future__ import annotations
@@ -33,8 +37,9 @@ from uzen.core.nws.roles import infer_role
 from uzen.core.nws.tensors import WeightPackage
 from uzen.core.wie.inspector import WeightIntelligenceEngine
 from uzen.core.wie.reconstruction import reconstruct_hf_model
+from uzen.core.wie.tokenization import legacy_bpe_tokenizer_json
 from uzen.errors import ArtifactIntegrityError, RuntimeUnavailable, UnsupportedFormat
-from uzen.infrastructure.storage.safetensors_io import read_safetensors
+from uzen.infrastructure.storage.safetensors_io import decode_graph_metadata, read_safetensors
 from uzen.util.canonical import ContentHasher, sha256_file, utc_now_iso
 
 HF_ALLOW_PATTERNS = [
@@ -571,6 +576,18 @@ class ModelImporter:
                 repo_id=repo_id,
                 revision=revision,
             ) from exc
+        snapshot_path = Path(snapshot)
+        if not any(snapshot_path.glob("*.safetensors")):
+            kwargs["allow_patterns"] = [*HF_ALLOW_PATTERNS, "pytorch_model.bin"]
+            try:
+                snapshot = hub.snapshot_download(**kwargs)
+            except Exception as exc:
+                raise RuntimeUnavailable(
+                    f"could not download the weights-only PyTorch fallback for "
+                    f"Hugging Face repository '{repo_id}': {exc}",
+                    repo_id=repo_id,
+                    revision=revision,
+                ) from exc
         result = self._import_directory(
             Path(snapshot),
             name=name,
@@ -650,12 +667,20 @@ class ModelImporter:
                     tokenizer_json = candidate
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 tokenizer_json = None
+        if tokenizer_json is None:
+            tokenizer_json = legacy_bpe_tokenizer_json(root)
+            if tokenizer_json is not None:
+                warnings.append(
+                    "assembled tokenizer.json from legacy vocab.json + merges.txt; "
+                    "no tokenizer code was executed"
+                )
         for entry in tokenizer.get("files", []):
             files.append(SourceFile(**entry))
 
         arrays: dict[str, np.ndarray] = {}
         records: list[TensorRecord] = []
         source_dtypes: dict[str, str] = {}
+        graph_document: dict[str, Any] | None = None
         directory_kind = source_kind or (
             "huggingface_directory" if (root / "config.json").exists()
             else "safetensors_directory"
@@ -670,6 +695,7 @@ class ModelImporter:
                 problems.append(str(exc))
             else:
                 arrays.update(shard_arrays)
+                graph_document = decode_graph_metadata(header.metadata)
                 for tensor_name, entry in header.entries.items():
                     records.append(self._record(tensor_name, entry, single_file.name, shard_arrays[tensor_name]))
                     if entry.dtype_code == "BF16":
@@ -698,10 +724,50 @@ class ModelImporter:
         else:
             candidates = sorted(root.glob("*.safetensors"))
             if not candidates:
-                problems.append(
-                    "no safetensors payload found; expected model.safetensors, "
-                    "model.safetensors.index.json or *.safetensors"
-                )
+                pytorch_file = root / "pytorch_model.bin"
+                if pytorch_file.exists():
+                    try:
+                        from uzen.runtimes.pytorch_runtime import PyTorchRuntime
+
+                        torch_package = PyTorchRuntime().load(pytorch_file)
+                    except (RuntimeUnavailable, UnsupportedFormat, OSError) as exc:
+                        problems.append(str(exc))
+                    else:
+                        arrays.update(torch_package.tensors)
+                        for tensor_name in torch_package.names():
+                            array = torch_package.get(tensor_name)
+                            meta = torch_package.metas[tensor_name]
+                            records.append(
+                                TensorRecord(
+                                    name=tensor_name,
+                                    shape=[int(d) for d in array.shape],
+                                    dtype=dtype_name(array.dtype),
+                                    stored_dtype=meta.source_dtype,
+                                    role=infer_role(tensor_name, array.shape).value,
+                                    source_file=pytorch_file.name,
+                                    nbytes=int(array.nbytes),
+                                )
+                            )
+                            if meta.source_dtype == "bfloat16":
+                                source_dtypes[tensor_name] = "bfloat16"
+                        files.append(
+                            SourceFile(
+                                path=pytorch_file.name,
+                                role="weights",
+                                sha256=sha256_file(pytorch_file),
+                                bytes=pytorch_file.stat().st_size,
+                            )
+                        )
+                        warnings.append(
+                            "no safetensors payload found; loaded pytorch_model.bin "
+                            "through PyTorch weights_only=True, not arbitrary pickle"
+                        )
+                else:
+                    problems.append(
+                        "no safetensors or pytorch_model.bin payload found; expected "
+                        "model.safetensors, model.safetensors.index.json, "
+                        "*.safetensors or pytorch_model.bin"
+                    )
                 loaded_kind = directory_kind
             elif len(candidates) == 1:
                 loaded_kind = source_kind or directory_kind
@@ -712,6 +778,7 @@ class ModelImporter:
                     problems.append(str(exc))
                 else:
                     arrays.update(shard_arrays)
+                    graph_document = decode_graph_metadata(header.metadata)
                     for tensor_name, entry in header.entries.items():
                         records.append(self._record(tensor_name, entry, file.name, shard_arrays[tensor_name]))
                         if entry.dtype_code == "BF16":
@@ -884,32 +951,36 @@ class ModelImporter:
         )
 
         if report.ok and arrays:
+            package_metadata: dict[str, Any] = {
+                "import_source": display_source,
+                "source_kind": report.source_kind,
+                "source_hash": report.source_hash,
+                "repo_id": repo_id,
+                "revision": revision,
+                "license": license_info,
+                "architecture": architecture,
+                "tokenizer": {
+                    "status": tokenizer.get("status"),
+                    "vocab_size": tokenizer.get("vocab_size"),
+                    "files": tokenizer.get("files", []),
+                },
+                "compatibility": compatibility.to_dict(),
+                "reconstruction": {
+                    "status": reconstruction_doc.get("status"),
+                    "architecture": reconstruction_doc.get("architecture"),
+                    "spec": reconstruction_doc.get("spec"),
+                    "graph_summary": reconstruction_doc.get("graph_summary"),
+                    "tensor_mapping": reconstruction_doc.get("tensor_mapping"),
+                },
+            }
+            if graph_document is not None:
+                package_metadata["graph"] = graph_document
+                report.metadata["graph_restored_from_metadata"] = True
             package = WeightPackage.from_arrays(
                 arrays,
                 name=name or default_name,
                 family=selected_family,
-                metadata={
-                    "import_source": display_source,
-                    "source_kind": report.source_kind,
-                    "source_hash": report.source_hash,
-                    "repo_id": repo_id,
-                    "revision": revision,
-                    "license": license_info,
-                    "architecture": architecture,
-                    "tokenizer": {
-                        "status": tokenizer.get("status"),
-                        "vocab_size": tokenizer.get("vocab_size"),
-                        "files": tokenizer.get("files", []),
-                    },
-                    "compatibility": compatibility.to_dict(),
-                    "reconstruction": {
-                        "status": reconstruction_doc.get("status"),
-                        "architecture": reconstruction_doc.get("architecture"),
-                        "spec": reconstruction_doc.get("spec"),
-                        "graph_summary": reconstruction_doc.get("graph_summary"),
-                        "tensor_mapping": reconstruction_doc.get("tensor_mapping"),
-                    },
-                },
+                metadata=package_metadata,
                 source_dtypes=source_dtypes,
             )
             canonical = (

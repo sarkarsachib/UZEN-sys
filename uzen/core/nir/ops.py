@@ -12,6 +12,7 @@ weight package. The executor resolves these and the validator checks shapes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -163,6 +164,55 @@ def _linear_run(inputs, params, bound):
     return [y.astype(_float_dtype_name(x, w), copy=False)]
 
 
+def _quantized_linear_infer(inputs, params, bound):
+    x = inputs[0]
+    w = _require_bound(bound, params.get("weight", "weight").replace("param:", ""), "quantized_linear")
+    scale = _require_bound(bound, str(params.get("scale", "scale")).replace("param:", ""), "quantized_linear")
+    if w.rank != 2:
+        raise InvalidOperationParameters("quantized_linear weight must be 2-D (out, in)")
+    if w.dtype != "int8":
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {w.dtype}")
+    if scale.rank != 1 or scale.shape[0] != w.shape[0]:
+        raise ShapeMismatch(
+            f"quantized_linear scale {scale.shape} must be ({w.shape[0]},)"
+        )
+    if isinstance(x.shape[-1], int) and isinstance(w.shape[1], int) and x.shape[-1] != w.shape[1]:
+        raise ShapeMismatch(
+            f"quantized_linear input feature dim {x.shape[-1]} != weight in_features {w.shape[1]}"
+        )
+    return [TensorType(tuple(x.shape[:-1]) + (w.shape[0],), _float_dtype(x))]
+
+
+def _quantized_linear_run(inputs, params, bound):
+    x = inputs[0]
+    name = str(params.get("weight", "weight")).replace("param:", "")
+    scale_name = str(params.get("scale", "scale")).replace("param:", "")
+    wq = bound[name]
+    scale = bound[scale_name]
+    if wq.dtype != np.int8:
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {wq.dtype}")
+    if scale.dtype.kind not in "fc" or scale.ndim != 1:
+        raise InvalidOperationParameters("quantized_linear scale must be a 1-D float array")
+    if scale.shape[0] != wq.shape[0]:
+        raise ShapeMismatch(f"quantized_linear scale {scale.shape} != ({wq.shape[0]},)")
+    if x.shape[-1] != wq.shape[1]:
+        raise ShapeMismatch(
+            f"quantized_linear: input last dim {x.shape[-1]} != weight in {wq.shape[1]}"
+        )
+    scale64 = scale.astype(np.float64, copy=False)
+    if not np.isfinite(scale64).all() or (scale64 <= 0).any():
+        raise InvalidOperationParameters("quantized_linear scales must be finite and positive")
+    dequantized = wq.astype(np.float64) * scale64[:, None]
+    y = x.astype(np.float64) @ dequantized.T
+    bname = params.get("bias")
+    if bname:
+        b = bound[str(bname).replace("param:", "")]
+        if b.shape != (wq.shape[0],):
+            raise ShapeMismatch(f"quantized_linear bias shape {b.shape} != ({wq.shape[0]},)")
+        y = y + b.astype(np.float64)
+    return [y.astype(x.dtype, copy=False)]
+
+
 def _float_dtype_name(a: np.ndarray, b: np.ndarray) -> str:
     return str(np.result_type(a.dtype, b.dtype))
 
@@ -191,6 +241,18 @@ def _embedding_run(inputs, params, bound):
 def _pos_embedding_infer(inputs, params, bound):
     x = inputs[0]
     w = _require_bound(bound, str(params.get("weight", "weight")).replace("param:", ""), "pos_embedding")
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    t = x.shape[1]
+    if (
+        isinstance(t, int)
+        and isinstance(w.shape[0], int)
+        and offset + t > w.shape[0]
+    ):
+        raise ShapeMismatch(
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
+        )
     return [_same(x.shape, _float_dtype(x, w))]
 
 
@@ -200,11 +262,14 @@ def _pos_embedding_run(inputs, params, bound):
     if x.ndim < 3:
         raise InvalidOperationParameters(f"pos_embedding expects (batch, seq, dim), got {x.shape}")
     t = x.shape[1]
-    if t > w.shape[0]:
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    if offset + t > w.shape[0]:
         raise ShapeMismatch(
-            f"sequence length {t} exceeds positional embedding table size {w.shape[0]}"
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
         )
-    return [x + w[:t].reshape((1, t) + tuple(x.shape[2:]))]
+    return [x + w[offset : offset + t].reshape((1, t) + tuple(x.shape[2:]))]
 
 
 def _layernorm_infer(inputs, params, bound):
@@ -287,9 +352,29 @@ def _gelu(x):
     return 0.5 * x64 * (1.0 + np.tanh(c * (x64 + 0.044715 * x64**3)))
 
 
+def _gelu_exact(x):
+    x64 = x.astype(np.float64, copy=False)
+    erf = np.frompyfunc(math.erf, 1, 1)(x64 / np.sqrt(2.0)).astype(np.float64)
+    return 0.5 * x64 * (1.0 + erf)
+
+
 def _silu(x):
     x64 = x.astype(np.float64, copy=False)
     return x64 / (1.0 + np.exp(-x64))
+
+
+def _clip_infer(inputs, params, bound):
+    lower = _param_float(params, "min", -1.0)
+    upper = _param_float(params, "max", 1.0)
+    if lower > upper:
+        raise InvalidOperationParameters("clip min must not exceed max")
+    return [_same(inputs[0].shape, _float_dtype(inputs[0]))]
+
+
+def _clip_run(inputs, params, bound):
+    lower = float(params.get("min", -1.0))
+    upper = float(params.get("max", 1.0))
+    return [np.clip(inputs[0], lower, upper).astype(inputs[0].dtype, copy=False)]
 
 
 def _softmax_infer(inputs, params, bound):
@@ -335,6 +420,10 @@ def _split_qkv_infer(inputs, params, bound):
     heads = _param_int(params, "n_heads", 0)
     if heads <= 0:
         raise InvalidOperationParameters("split_qkv requires n_heads > 0")
+    if str(params.get("layout", "grouped")) not in ("grouped", "interleaved"):
+        raise InvalidOperationParameters(
+            "split_qkv layout must be 'grouped' or 'interleaved'"
+        )
     last = x.shape[-1]
     if not isinstance(last, int):
         raise InvalidOperationParameters("split_qkv requires a concrete last dimension")
@@ -355,11 +444,18 @@ def _split_qkv_run(inputs, params, bound):
             f"split_qkv expects (batch, seq, 3*dim), got shape {x.shape}"
         )
     heads = int(params["n_heads"])
+    layout = str(params.get("layout", "grouped"))
     bsz, seq, last = x.shape
     dh = last // (3 * heads)
-    # (B, T, 3, H, Dh) -> (B, 3, H, T, Dh)
-    r = np.transpose(x.reshape(bsz, seq, 3, heads, dh), (0, 2, 3, 1, 4))
-    return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "grouped":
+        # (B, T, 3, H, Dh) -> (B, 3, H, T, Dh)
+        r = np.transpose(x.reshape(bsz, seq, 3, heads, dh), (0, 2, 3, 1, 4))
+        return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "interleaved":
+        # (B, T, H, 3, Dh) -> (B, H, 3, T, Dh)
+        r = np.transpose(x.reshape(bsz, seq, heads, 3, dh), (0, 2, 3, 1, 4))
+        return [r[:, :, 0], r[:, :, 1], r[:, :, 2]]
+    raise InvalidOperationParameters("split_qkv layout must be 'grouped' or 'interleaved'")
 
 
 def _merge_heads_infer(inputs, params, bound):
@@ -390,8 +486,15 @@ def _rope_infer(inputs, params, bound):
         raise InvalidOperationParameters("rope expects (batch, heads, seq, head_dim)")
     if positions.rank not in (1, 2):
         raise InvalidOperationParameters("rope positions must be rank 1 or 2")
-    if isinstance(x.shape[-1], int) and x.shape[-1] % 2 != 0:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    dim = x.shape[-1]
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else (dim if isinstance(dim, int) else 0)
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise InvalidOperationParameters("rope rotary_dim must be a positive even integer")
+    if isinstance(dim, int) and rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} exceeds head dimension {dim}"
+        )
     theta = _param_float(params, "theta", 10000.0)
     if theta <= 0:
         raise InvalidOperationParameters("rope theta must be positive")
@@ -411,18 +514,42 @@ def _rope_run(inputs, params, bound):
         raise ShapeMismatch(
             f"rope positions {positions.shape} do not match (batch={bsz}, seq={seq})"
         )
-    if dim % 2:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else dim
+    if rotary_dim <= 0 or rotary_dim % 2 != 0 or rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} must be positive, even and <= {dim}"
+        )
     theta = float(params.get("theta", 10000.0))
-    inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
-    freqs = np.concatenate([inv_freq, inv_freq], axis=0)
+    if theta <= 0:
+        raise InvalidOperationParameters("rope theta must be positive")
+    half = rotary_dim // 2
+    inv_freq = 1.0 / (
+        theta ** (np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
+    )
+    interleaved = bool(params.get("interleaved", False))
+    freqs = (
+        np.repeat(inv_freq, 2)
+        if interleaved
+        else np.concatenate([inv_freq, inv_freq], axis=0)
+    )
     angles = pos.astype(np.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = np.cos(angles)
     sin = np.sin(angles)
-    x1 = x[..., : dim // 2]
-    x2 = x[..., dim // 2 :]
-    rotated = np.concatenate([-x2, x1], axis=-1)
-    return [(x.astype(np.float64) * cos + rotated.astype(np.float64) * sin).astype(x.dtype, copy=False)]
+    x_rot = x[..., :rotary_dim]
+    if interleaved:
+        pairs = x_rot.reshape(x_rot.shape[:-1] + (half, 2))
+        rotated = np.stack([-pairs[..., 1], pairs[..., 0]], axis=-1).reshape(x_rot.shape)
+    else:
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        rotated = np.concatenate([-x2, x1], axis=-1)
+    rotated_out = x_rot.astype(np.float64) * cos + rotated.astype(np.float64) * sin
+    if rotary_dim == dim:
+        out = rotated_out
+    else:
+        out = np.concatenate([rotated_out, x[..., rotary_dim:]], axis=-1)
+    return [out.astype(x.dtype, copy=False)]
 
 
 def _repeat_kv_infer(inputs, params, bound):
@@ -461,7 +588,26 @@ def _attention_infer(inputs, params, bound):
         raise ShapeMismatch("attention: q/k head_dim mismatch")
     if k.shape[-2] != v.shape[-2]:
         raise ShapeMismatch("attention: k/v sequence length mismatch")
+    window = params.get("window")
+    if window is not None and int(window) <= 0:
+        raise InvalidOperationParameters("attention window must be a positive integer")
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        if not isinstance(slopes, (list, tuple)) or not slopes:
+            raise InvalidOperationParameters("attention alibi_slopes must be a non-empty list")
+        if len(slopes) != int(q.shape[1]):
+            raise InvalidOperationParameters(
+                f"attention alibi_slopes has {len(slopes)} entries for {q.shape[1]} heads"
+            )
+        if not all(float(s) > 0 for s in slopes):
+            raise InvalidOperationParameters("attention alibi slopes must be positive")
     return [TensorType(tuple(q.shape), _float_dtype(q, k, v))]
+
+
+def _attention_positions(t: int, s: int) -> tuple[np.ndarray, np.ndarray]:
+    # Query positions are the last ``t`` positions, which also makes cached
+    # one-token decoding use the correct absolute distance for masks and ALiBi.
+    return np.arange(s - t, s)[:, None], np.arange(s)[None, :]
 
 
 def _attention_run(inputs, params, bound):
@@ -470,14 +616,19 @@ def _attention_run(inputs, params, bound):
     scale = 1.0 / np.sqrt(q.shape[-1]) if scale == "auto" else float(scale)
     scores = np.einsum("bhtd,bhsd->bhts", q, k) * scale
     causal = bool(params.get("causal", True))
+    t, s = scores.shape[-2], scores.shape[-1]
+    qpos, kpos = _attention_positions(t, s)
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        distance = (qpos - kpos) if causal else np.abs(qpos - kpos)
+        scores = scores - np.asarray(slopes, dtype=np.float64)[None, :, None, None] * distance[None, None, :, :]
+    mask = np.zeros((t, s), dtype=bool)
     if causal:
-        t, s = scores.shape[-2], scores.shape[-1]
-        if t != s:
-            raise InvalidOperationParameters(
-                f"causal attention requires square scores, got {t} x {s}"
-            )
-        mask = np.triu(np.ones((t, s), dtype=bool), k=1)
-        scores = np.where(mask, -np.inf, scores)
+        mask |= kpos > qpos
+    window = params.get("window")
+    if window is not None:
+        mask |= np.abs(qpos - kpos) > int(window)
+    scores = np.where(mask[None, None, :, :], -np.inf, scores)
     m = np.max(scores, axis=-1, keepdims=True)
     m = np.where(np.isfinite(m), m, 0.0)
     e = np.exp(scores - m)
@@ -1057,6 +1208,7 @@ def _reg(
 
 
 _reg("linear", 1, 1, _linear_infer, _linear_run, "y = x @ W^T + b", "nn")
+_reg("quantized_linear", 1, 1, _quantized_linear_infer, _quantized_linear_run, "float activations with int8 per-channel weights", "nn")
 _reg("embedding", 1, 1, _embedding_infer, _embedding_run, "token-id lookup into a weight matrix", "nn")
 _reg("pos_embedding", 1, 1, _pos_embedding_infer, _pos_embedding_run, "add a learned positional table", "nn")
 _reg("layernorm", 1, 1, _layernorm_infer, _layernorm_run, "layer normalization over the last axis", "norm")
@@ -1065,14 +1217,16 @@ _reg("add", 2, 2, _binary_infer("add"), _binary_run(lambda a, b: a + b), "elemen
 _reg("sub", 2, 2, _binary_infer("sub"), _binary_run(lambda a, b: a - b), "elementwise subtraction", "math")
 _reg("mul", 2, 2, _binary_infer("mul"), _binary_run(lambda a, b: a * b), "elementwise product", "math")
 _reg("scale", 1, 1, _scale_infer, _scale_run, "scalar multiplication", "math")
+_reg("clip", 1, 1, _clip_infer, _clip_run, "elementwise clamp to [min, max]", "math")
 _reg("matmul", 2, 2, _matmul_infer, _matmul_run, "batched matrix multiplication", "math")
 _reg("relu", 1, 1, _unary_infer, _activate(lambda x: np.maximum(x, 0)), "rectified linear unit", "activation")
 _reg("gelu", 1, 1, _unary_infer, _activate(_gelu), "Gaussian error linear unit (tanh approximation)", "activation")
+_reg("gelu_exact", 1, 1, _unary_infer, _activate(_gelu_exact), "Gaussian error linear unit (exact erf)", "activation")
 _reg("silu", 1, 1, _unary_infer, _activate(_silu), "sigmoid linear unit (swish)", "activation")
 _reg("tanh", 1, 1, _unary_infer, _activate(np.tanh), "hyperbolic tangent", "activation")
 _reg("sigmoid", 1, 1, _unary_infer, _activate(lambda x: 1.0 / (1.0 + np.exp(-x))), "logistic sigmoid", "activation")
 _reg("softmax", 1, 1, _softmax_infer, _softmax_run, "numerically stable softmax", "activation")
-_reg("split_qkv", 1, 1, _split_qkv_infer, _split_qkv_run, "fused QKV projection -> three head tensors", "attention")
+_reg("split_qkv", 1, 1, _split_qkv_infer, _split_qkv_run, "fused QKV projection -> three head tensors (grouped or interleaved)", "attention")
 _reg("rope", 2, 2, _rope_infer, _rope_run, "rotary position embedding (Llama rotate-half)", "attention", ports=("x", "positions"))
 _reg("repeat_kv", 1, 1, _repeat_kv_infer, _repeat_kv_run, "repeat grouped-query KV heads to query-head count", "attention")
 _reg("merge_heads", 1, 1, _merge_heads_infer, _merge_heads_run, "merge attention heads back to model width", "attention")

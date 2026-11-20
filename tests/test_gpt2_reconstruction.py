@@ -97,6 +97,38 @@ def test_gpt2_reconstruction_validates_graph_and_executes(tmp_path):
     assert execution["outputs"]["logits"]["shape"] == [1, 4, 16]
 
 
+def test_gpt2_prefixless_openai_safetensors_layout_is_normalized(tmp_path):
+    root, arrays = _write_gpt2(tmp_path / "gpt2-prefixless")
+    prefixless = {
+        key.removeprefix("transformer."): value for key, value in arrays.items()
+    }
+    prefixless["h.0.attn.bias"] = np.zeros((1, 1, 8, 8), dtype=np.float32)
+    write_safetensors(root / "model.safetensors", prefixless)
+
+    result = ModelImporter().import_source(root)
+
+    assert result.ok
+    assert result.report.compatibility.reconstruction == "validated"
+    assert result.report.compatibility.execution == "passed"
+    assert any(
+        "prefixless GPT-2" in warning
+        for warning in result.report.reconstruction["warnings"]
+    )
+    mapping = {m["target"]: m for m in result.report.reconstruction["tensor_mapping"]}
+    assert mapping["embed.weight"]["source"] == "transformer.wte.weight"
+    assert mapping["layers.0.qkv.weight"]["source"] == (
+        "transformer.h.0.attn.c_attn.weight"
+    )
+    ignored = [
+        item
+        for item in result.report.reconstruction["tensor_mapping"]
+        if item["status"] == "ignored"
+    ]
+    assert [item["source"] for item in ignored] == ["transformer.h.0.attn.bias"]
+    assert ignored[0]["target"] is None
+    assert result.report.reconstruction["extra"] == []
+
+
 def test_gpt2_service_stores_graph_and_canonical_package(tmp_path):
     root, _arrays = _write_gpt2(tmp_path / "gpt2-service")
     service = JobService(tmp_path / "workspace")

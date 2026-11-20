@@ -1,15 +1,24 @@
-# Blend two compatible parameter sets, then rescale the result.
+# Production-style release pipeline in WPL.
 #
-# Run with:  uzen job submit examples/blend.request.json --run
-# (the request references this WPL body through the API/SDK; see docs/API.md)
-program "blend_models" {
+# The base checkpoint anchors the deltas. Two transformed task checkpoints are
+# blended, then merged with TIES (magnitude trimming + sign election) and scaled
+# for the release. The program is statically checkable without executing it:
+#
+#   python -c "from pathlib import Path; from uzen.core.wpl.compiler import describe_program; import json; print(json.dumps(describe_program(Path('examples/blend.wpl').read_text()), indent=2))"
+#
+# The same program is embedded and executed end-to-end in examples/quickstart.py.
+program "release_blend" {
     input base: package
-    input other: package
+    input tuned_a: package
+    input tuned_b: package
+
     param t: float = 0.35
+    param density: float = 0.6
     param factor: float = 1.0
 
-    step blend = linear_interpolate(base, other, t=t)
-    step result = scale(blend, factor=factor)
+    step blend = w.arithmetic.linear_interpolate(tuned_a, tuned_b, t=t)
+    step consensus = w.merge.ties(base, blend, density=density)
+    step release = w.arithmetic.scale(consensus, factor=factor)
 
-    output merged = result
+    output weights = release
 }

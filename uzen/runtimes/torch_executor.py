@@ -119,6 +119,31 @@ def _linear(inputs, params, bound):
     return [y]
 
 
+def _quantized_linear(inputs, params, bound):
+    x = inputs[0]
+    wq = bound[_pn(params, "weight", "weight")]
+    scale = bound[_pname(params, "scale")]
+    if wq.dtype != torch.int8:
+        raise InvalidOperationParameters(f"quantized_linear weight must be int8, got {_dtype_name(wq)}")
+    if scale.dim() != 1 or scale.shape[0] != wq.shape[0]:
+        raise ShapeMismatch(f"quantized_linear scale {tuple(scale.shape)} != ({wq.shape[0]},)")
+    if scale.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise InvalidOperationParameters("quantized_linear scale must be floating point")
+    if not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
+        raise InvalidOperationParameters("quantized_linear scales must be finite and positive")
+    if x.shape[-1] != wq.shape[1]:
+        raise ShapeMismatch("quantized_linear: input/weight feature dimensions disagree")
+    dtype = torch.promote_types(x.dtype, scale.dtype)
+    dequantized = wq.to(dtype) * scale.to(dtype).unsqueeze(1)
+    y = x.to(dtype) @ dequantized.T
+    if params.get("bias"):
+        bias = bound[_pname(params, "bias")]
+        if tuple(bias.shape) != (wq.shape[0],):
+            raise ShapeMismatch(f"quantized_linear bias shape {tuple(bias.shape)} != ({wq.shape[0]},)")
+        y = y + bias.to(dtype)
+    return [y]
+
+
 def _embedding(inputs, params, bound):
     idx = inputs[0]
     w = bound[_pn(params, "weight", "weight")]
@@ -135,11 +160,14 @@ def _pos_embedding(inputs, params, bound):
     if x.dim() < 3:
         raise InvalidOperationParameters(f"pos_embedding expects (batch, seq, dim), got {tuple(x.shape)}")
     t = x.shape[1]
-    if t > w.shape[0]:
+    offset = int(params.get("offset", 0))
+    if offset < 0:
+        raise InvalidOperationParameters("pos_embedding offset must be non-negative")
+    if offset + t > w.shape[0]:
         raise ShapeMismatch(
-            f"sequence length {t} exceeds positional embedding table size {w.shape[0]}"
+            f"sequence length {t} at offset {offset} exceeds positional embedding table size {w.shape[0]}"
         )
-    return [x + w[:t].reshape((1, t) + tuple(x.shape[2:]))]
+    return [x + w[offset : offset + t].reshape((1, t) + tuple(x.shape[2:]))]
 
 
 def _layernorm(inputs, params, bound):
@@ -173,6 +201,11 @@ def _gelu64(x):
     return 0.5 * x64 * (1.0 + torch.tanh(c * (x64 + 0.044715 * x64**3)))
 
 
+def _gelu_exact64(x):
+    x64 = x.to(torch.float64)
+    return 0.5 * x64 * (1.0 + torch.erf(x64 / float(np.sqrt(2.0))))
+
+
 def _silu64(x):
     x64 = x.to(torch.float64)
     return x64 / (1.0 + torch.exp(-x64))
@@ -194,12 +227,22 @@ def _attention(inputs, params, bound):
     scale = params.get("scale", "auto")
     scale = 1.0 / float(np.sqrt(q.shape[-1])) if scale == "auto" else float(scale)
     scores = torch.einsum("bhtd,bhsd->bhts", q64, k64) * scale
-    if bool(params.get("causal", True)):
-        t, s = scores.shape[-2], scores.shape[-1]
-        if t != s:
-            raise InvalidOperationParameters(f"causal attention requires square scores, got {t} x {s}")
-        mask = torch.triu(torch.ones((t, s), dtype=torch.bool, device=scores.device), diagonal=1)
-        scores = scores.masked_fill(mask, float("-inf"))
+    causal = bool(params.get("causal", True))
+    t, s = scores.shape[-2], scores.shape[-1]
+    qpos = torch.arange(s - t, s, device=scores.device)[:, None]
+    kpos = torch.arange(s, device=scores.device)[None, :]
+    slopes = params.get("alibi_slopes")
+    if slopes is not None:
+        distances = (qpos - kpos) if causal else (qpos - kpos).abs()
+        slope_t = torch.as_tensor(slopes, dtype=torch.float64, device=scores.device)
+        scores = scores - slope_t[None, :, None, None] * distances[None, None, :, :]
+    mask = torch.zeros((t, s), dtype=torch.bool, device=scores.device)
+    if causal:
+        mask = mask | (kpos > qpos)
+    window = params.get("window")
+    if window is not None:
+        mask = mask | ((qpos - kpos).abs() > int(window))
+    scores = scores.masked_fill(mask[None, None, :, :], float("-inf"))
     m = scores.max(dim=-1, keepdim=True).values
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     e = torch.exp(scores - m)
@@ -228,20 +271,46 @@ def _rope(inputs, params, bound):
         raise ShapeMismatch(
             f"rope positions {tuple(positions.shape)} do not match (batch={bsz}, seq={seq})"
         )
-    if dim % 2:
-        raise InvalidOperationParameters("rope requires an even head dimension")
+    raw = params.get("rotary_dim")
+    rotary_dim = int(raw) if raw is not None else dim
+    if rotary_dim <= 0 or rotary_dim % 2 != 0 or rotary_dim > dim:
+        raise InvalidOperationParameters(
+            f"rope rotary_dim={rotary_dim} must be positive, even and <= {dim}"
+        )
     theta = float(params.get("theta", 10000.0))
     if theta <= 0:
         raise InvalidOperationParameters("rope theta must be positive")
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=x.device) / dim))
-    freqs = torch.cat([inv_freq, inv_freq], dim=0)
+    half = rotary_dim // 2
+    inv_freq = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float64, device=x.device)
+            / rotary_dim
+        )
+    )
+    interleaved = bool(params.get("interleaved", False))
+    freqs = (
+        torch.repeat_interleave(inv_freq, 2)
+        if interleaved
+        else torch.cat([inv_freq, inv_freq], dim=0)
+    )
     angles = pos.to(torch.float64)[:, None, :, None] * freqs[None, None, None, :]
     cos = torch.cos(angles)
     sin = torch.sin(angles)
-    x1 = x[..., : dim // 2]
-    x2 = x[..., dim // 2 :]
-    rotated = torch.cat([-x2, x1], dim=-1)
-    return [(x.to(torch.float64) * cos + rotated.to(torch.float64) * sin).to(x.dtype)]
+    x_rot = x[..., :rotary_dim]
+    if interleaved:
+        pairs = x_rot.reshape(*x_rot.shape[:-1], half, 2)
+        rotated = torch.stack([-pairs[..., 1], pairs[..., 0]], dim=-1).reshape(x_rot.shape)
+    else:
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        rotated = torch.cat([-x2, x1], dim=-1)
+    rotated_out = x_rot.to(torch.float64) * cos + rotated.to(torch.float64) * sin
+    if rotary_dim == dim:
+        out = rotated_out
+    else:
+        out = torch.cat([rotated_out, x[..., rotary_dim:]], dim=-1)
+    return [out.to(x.dtype)]
 
 
 def _repeat_kv(inputs, params, bound):
@@ -262,10 +331,16 @@ def _split_qkv(inputs, params, bound):
     if x.dim() != 3:
         raise InvalidOperationParameters(f"split_qkv expects (batch, seq, 3*dim), got {tuple(x.shape)}")
     heads = int(params["n_heads"])
+    layout = str(params.get("layout", "grouped"))
     bsz, seq, last = x.shape
     dh = last // (3 * heads)
-    r = x.reshape(bsz, seq, 3, heads, dh).permute(0, 2, 3, 1, 4)
-    return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "grouped":
+        r = x.reshape(bsz, seq, 3, heads, dh).permute(0, 2, 3, 1, 4)
+        return [r[:, 0], r[:, 1], r[:, 2]]
+    if layout == "interleaved":
+        r = x.reshape(bsz, seq, heads, 3, dh).permute(0, 2, 3, 1, 4)
+        return [r[:, :, 0], r[:, :, 1], r[:, :, 2]]
+    raise InvalidOperationParameters("split_qkv layout must be 'grouped' or 'interleaved'")
 
 
 def _merge_heads(inputs, params, bound):
@@ -502,6 +577,7 @@ def _concat(inputs, params, bound):
 
 _KERNELS: dict[str, Callable[..., list[Any]]] = {
     "linear": _linear,
+    "quantized_linear": _quantized_linear,
     "embedding": _embedding,
     "pos_embedding": _pos_embedding,
     "layernorm": _layernorm,
@@ -510,9 +586,11 @@ _KERNELS: dict[str, Callable[..., list[Any]]] = {
     "sub": lambda i, p, b: [i[0] - i[1]],
     "mul": lambda i, p, b: [i[0] * i[1]],
     "scale": lambda i, p, b: [(i[0] * float(p.get("factor", 1.0))).to(i[0].dtype)],
+    "clip": lambda i, p, b: [torch.clamp(i[0], float(p.get("min", -1.0)), float(p.get("max", 1.0))).to(i[0].dtype)],
     "matmul": _matmul,
     "relu": lambda i, p, b: [torch.clamp_min(i[0], 0).to(i[0].dtype)],
     "gelu": lambda i, p, b: [_gelu64(i[0]).to(i[0].dtype)],
+    "gelu_exact": lambda i, p, b: [_gelu_exact64(i[0]).to(i[0].dtype)],
     "silu": lambda i, p, b: [_silu64(i[0]).to(i[0].dtype)],
     "tanh": lambda i, p, b: [torch.tanh(i[0]).to(i[0].dtype)],
     "sigmoid": lambda i, p, b: [torch.sigmoid(i[0]).to(i[0].dtype)],

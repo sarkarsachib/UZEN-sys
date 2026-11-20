@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from uzen.core.nws.tensors import WeightPackage
-from uzen.core.wie.model_execution import ModelExecution, ModelTextExecution
+from uzen.core.wie.model_execution import ModelExecution, ModelGeneration, ModelTextExecution
 from uzen.errors import UzenError
 from uzen.jobs.service import JobService
 
@@ -45,6 +45,13 @@ def _execution_payload(execution: ModelExecution, *, include_values: bool) -> di
                 "values": execution.outputs[name].tolist(),
             }
             for name in execution.outputs
+        }
+        payload["captured"] = {
+            name: {
+                **payload["captured"][name],
+                "values": execution.intermediates[name].tolist(),
+            }
+            for name in execution.intermediates
         }
     return payload
 
@@ -164,13 +171,18 @@ class Uzen:
                     path, name=name, family=family, revision=revision, repo_id=repo_id
                 )
             record = self.service.import_artifact(path, name=name, family=family)
-            return {
+            result = {
                 "artifact_id": record.artifact_id,
                 "name": record.manifest.name,
                 "family": record.manifest.family,
                 "num_tensors": record.num_tensors,
                 "checksum": record.manifest.checksum,
             }
+            import_report = record.manifest.metadata.get("import_report")
+            if isinstance(import_report, Mapping):
+                result["format"] = import_report.get("format")
+                result["import_report"] = dict(import_report)
+            return result
         return self._request(
             "POST",
             "/v1/models/import",
@@ -259,6 +271,21 @@ class Uzen:
             )
         return self.service.get_package(artifact_id)
 
+    def quantize_model(
+        self,
+        artifact_id: str,
+        *,
+        scheme: str = "int8",
+    ) -> dict[str, Any]:
+        """Persist and return a quantized execution variant of a stored model."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/quantize",
+                {"scheme": scheme},
+            )
+        return self.service.quantize_model(artifact_id, scheme=scheme)
+
     def forward_model(
         self,
         artifact_id: str,
@@ -266,8 +293,14 @@ class Uzen:
         tokens: Sequence[Sequence[int]],
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
+        capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> dict[str, Any]:
-        """Run a stored reconstructed model graph on token IDs."""
+        """Run a stored reconstructed model graph on token IDs.
+
+        ``quantize="int8"`` executes a weight-only int8 copy and includes its
+        quantization report under the response's ``quantization`` key.
+        """
         if not self.local:
             return self._request(
                 "POST",
@@ -276,10 +309,16 @@ class Uzen:
                     "tokens": [list(row) for row in tokens],
                     "positions": positions,
                     "include_values": include_values,
+                    "capture": capture,
+                    "quantize": quantize,
                 },
             )
         execution = self.service.forward_model(
-            artifact_id, tokens=tokens, positions=positions
+            artifact_id,
+            tokens=tokens,
+            positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
         return _execution_payload(execution, include_values=include_values)
 
@@ -290,6 +329,8 @@ class Uzen:
         text: str,
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         include_values: bool = False,
+        capture: Sequence[str] | str | None = None,
+        quantize: str | None = None,
     ) -> dict[str, Any]:
         """Tokenize text with the artifact's stored tokenizer and run its graph."""
         if not self.local:
@@ -300,12 +341,115 @@ class Uzen:
                     "text": text,
                     "positions": positions,
                     "include_values": include_values,
+                    "capture": capture,
+                    "quantize": quantize,
                 },
             )
         result = self.service.forward_text(
-            artifact_id, text=text, positions=positions
+            artifact_id,
+            text=text,
+            positions=positions,
+            capture=capture,
+            quantize=quantize,
         )
         return _text_execution_payload(result, include_values=include_values)
+
+    def generate_text(
+        self,
+        artifact_id: str,
+        *,
+        text: str,
+        max_new_tokens: int = 16,
+        eos_token_id: int | None = None,
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        strategy: str = "greedy",
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        num_beams: int = 1,
+        quantize: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate text with the artifact's stored tokenizer and graph.
+
+        ``quantize="int8"`` quantizes the execution copy once and includes its
+        report under the response's ``quantization`` key.
+        """
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/models/{artifact_id}/generate-text",
+                {
+                    "text": text,
+                    "max_new_tokens": max_new_tokens,
+                    "eos_token_id": eos_token_id,
+                    "positions": positions,
+                    "strategy": strategy,
+                    "temperature": temperature,
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "seed": seed,
+                    "num_beams": num_beams,
+                    "quantize": quantize,
+                },
+            )
+        result: ModelGeneration = self.service.generate_text(
+            artifact_id,
+            text=text,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            positions=positions,
+            strategy=strategy,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+            num_beams=num_beams,
+            quantize=quantize,
+        )
+        return result.summary()
+
+    def compare_quantized_model(
+        self,
+        source_artifact_id: str,
+        quantized_artifact_id: str,
+        *,
+        tokens: Sequence[Sequence[int]],
+        positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Compare a source model with its persisted int8 variant."""
+        if not self.local:
+            return self._request(
+                "POST",
+                "/v1/models/compare-quantized",
+                {
+                    "source_artifact_id": source_artifact_id,
+                    "quantized_artifact_id": quantized_artifact_id,
+                    "tokens": [list(row) for row in tokens],
+                    "positions": positions,
+                    "atol": atol,
+                    "rtol": rtol,
+                    "max_abs_error_threshold": max_abs_error_threshold,
+                    "mean_abs_error_threshold": mean_abs_error_threshold,
+                    "max_rel_error_threshold": max_rel_error_threshold,
+                },
+            )
+        return self.service.compare_quantized_model(
+            source_artifact_id,
+            quantized_artifact_id,
+            tokens=tokens,
+            positions=positions,
+            atol=atol,
+            rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
+        )
 
     def compare_models(
         self,
@@ -316,6 +460,9 @@ class Uzen:
         positions: Sequence[Sequence[int]] | Sequence[int] | None = None,
         atol: float = 1e-5,
         rtol: float = 1e-5,
+        max_abs_error_threshold: float | None = None,
+        mean_abs_error_threshold: float | None = None,
+        max_rel_error_threshold: float | None = None,
     ) -> dict[str, Any]:
         """Compare source and modified model artifacts on identical inputs."""
         if not self.local:
@@ -329,6 +476,9 @@ class Uzen:
                     "positions": positions,
                     "atol": atol,
                     "rtol": rtol,
+                    "max_abs_error_threshold": max_abs_error_threshold,
+                    "mean_abs_error_threshold": mean_abs_error_threshold,
+                    "max_rel_error_threshold": max_rel_error_threshold,
                 },
             )
         return self.service.compare_models(
@@ -338,6 +488,9 @@ class Uzen:
             positions=positions,
             atol=atol,
             rtol=rtol,
+            max_abs_error_threshold=max_abs_error_threshold,
+            mean_abs_error_threshold=mean_abs_error_threshold,
+            max_rel_error_threshold=max_rel_error_threshold,
         )
 
     # ------------------------------------------------------------------ #

@@ -7,18 +7,32 @@ each new operator against an independently written reference computation.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from uzen.core.nir.executor import execute
 from uzen.core.nir.graph import Graph
-from uzen.core.nir.ops import OPERATORS, _gelu
+from uzen.core.nir.ops import OPERATORS, _gelu, _gelu_exact
 from uzen.core.nir.types import Ref, TensorType
-from uzen.core.nws.families import build_architecture, family_catalogue
+from uzen.core.nws.families import FAMILY_ORDER, build_architecture, family_catalogue
 from uzen.core.nws.tensors import WeightPackage
 from uzen.errors import InvalidOperationParameters, ShapeMismatch
 
 FAMILY_SPECS = {
+    "linear_residual": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "gated_mlp": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "conv_residual": dict(channels=2, height=8, width=8, num_classes=3),
+    "transformer_encoder": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "albert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "bert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "vit": dict(in_channels=1, height=8, width=8, patch=2, d_model=8, n_heads=2, n_layers=1, d_ff=16, num_classes=3),
+    "set_transformer": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8, num_classes=3),
+    "siamese": dict(input_dim=6, hidden_dim=10, num_classes=2),
+    "retrieval": dict(vocab_size=16, d_model=8, hidden_dim=16, embed_dim=4, max_seq_len=8),
+    "perceiver": dict(vocab_size=16, d_model=8, n_heads=2, latent_count=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "seq2seq": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8),
     "moe": dict(vocab_size=16, d_model=8, n_experts=4, top_k=2, d_ff=16, num_classes=3),
     "state_space": dict(vocab_size=16, d_model=8, state_dim=4, num_classes=3),
     "gnn": dict(in_features=5, hidden_dim=6, num_classes=3, n_layers=2),
@@ -46,6 +60,108 @@ def test_family_builds_validates_and_runs(family, spec):
 def test_catalogue_lists_the_new_families():
     names = {entry["family"] for entry in family_catalogue()}
     assert set(FAMILY_SPECS) <= names
+
+
+def test_catalogue_is_ordered_from_simple_to_advanced():
+    names = [entry["family"] for entry in family_catalogue()]
+    assert names == list(FAMILY_ORDER)
+    ordered = [
+        "linear_residual",
+        "gated_mlp",
+        "conv_residual",
+        "siamese",
+        "retrieval",
+        "set_transformer",
+        "transformer_encoder",
+        "albert",
+        "bert",
+        "vit",
+        "perceiver",
+        "seq2seq",
+    ]
+    new_names = [name for name in names if name in set(ordered)]
+    assert new_names == ordered
+
+
+def test_exact_gelu_matches_erf_and_differs_from_the_tanh_approximation():
+    x = np.array([-3.0, -1.0, 0.0, 1.0, 3.0], dtype=np.float32)
+    expected = np.array(
+        [0.5 * float(v) * (1.0 + math.erf(float(v) / math.sqrt(2.0))) for v in x],
+        dtype=np.float64,
+    )
+    got = _gelu_exact(x)
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
+    assert not np.allclose(_gelu(x), got, rtol=0, atol=1e-6)
+
+
+def test_attention_window_masks_keys_outside_the_window():
+    rng = np.random.default_rng(11)
+    q = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    k = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    v = rng.standard_normal((1, 1, 4, 2)).astype(np.float32)
+    g = Graph(
+        name="windowed_attention",
+        inputs={
+            "q": TensorType.of((1, 1, 4, 2)),
+            "k": TensorType.of((1, 1, 4, 2)),
+            "v": TensorType.of((1, 1, 4, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "window": 1, "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    got = execute(g, {"q": q, "k": k, "v": v}, WeightPackage.from_arrays({})).outputs["y"]
+
+    scores = np.einsum("bhtd,bhsd->bhts", q.astype(np.float64), k.astype(np.float64)) / np.sqrt(2.0)
+    qpos = np.arange(4)[:, None]
+    kpos = np.arange(4)[None, :]
+    mask = (kpos > qpos) | (np.abs(qpos - kpos) > 1)
+    scores = np.where(mask[None, None], -np.inf, scores)
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.einsum("bhts,bhsd->bhtd", probs, v.astype(np.float64))
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_attention_alibi_bias_uses_per_head_distance_slopes():
+    rng = np.random.default_rng(12)
+    q = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    k = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    v = rng.standard_normal((1, 2, 3, 2)).astype(np.float32)
+    slopes = [0.25, 0.5]
+    g = Graph(
+        name="alibi_attention",
+        inputs={
+            "q": TensorType.of((1, 2, 3, 2)),
+            "k": TensorType.of((1, 2, 3, 2)),
+            "v": TensorType.of((1, 2, 3, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "alibi_slopes": slopes, "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    got = execute(g, {"q": q, "k": k, "v": v}, WeightPackage.from_arrays({})).outputs["y"]
+
+    scores = np.einsum("bhtd,bhsd->bhts", q.astype(np.float64), k.astype(np.float64)) / np.sqrt(2.0)
+    qpos = np.arange(3)[:, None]
+    kpos = np.arange(3)[None, :]
+    distance = qpos - kpos
+    scores -= np.asarray(slopes)[None, :, None, None] * distance[None, None]
+    scores = np.where((kpos > qpos)[None, None], -np.inf, scores)
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.einsum("bhts,bhsd->bhtd", probs, v.astype(np.float64))
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
 
 
 def test_new_kernels_are_registered_as_implemented():

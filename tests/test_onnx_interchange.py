@@ -91,3 +91,41 @@ def test_import_reports_unsupported_onnx_operators_instead_of_dropping_them():
 
 def test_adapter_reports_availability():
     assert is_available() is True
+
+
+def test_gelu_round_trips_through_the_standard_onnx_gelu_op(tmp_path):
+    definition = build_architecture(
+        "mlp", dict(input_dim=5, hidden_dims=[7], output_dim=3, activation="gelu")
+    )
+    package = definition.build_package(seed=0)
+    inputs = definition.sample_inputs(batch=2, seed=0)
+    expected = execute(definition.graph, inputs, package).outputs
+
+    path = tmp_path / "gelu.onnx"
+    model = export_onnx(definition.graph, package, save_path=path)
+    onnx.checker.check_model(model)
+    assert "Gelu" in {node.op_type for node in model.graph.node}
+
+    graph, weights, metadata = import_onnx(path)
+    graph.require_valid(weights)
+    restored = execute(graph, inputs, weights).outputs
+    expected_values = [expected[name] for name in definition.graph.outputs]
+    restored_values = [restored[name] for name in graph.outputs]
+    assert len(restored_values) == len(expected_values)
+    for got, want in zip(restored_values, expected_values):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+    assert metadata["num_nodes"] >= 3
+
+
+def test_import_refuses_erf_gelu_instead_of_rewriting_it():
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])
+    node = helper.make_node("Gelu", ["x"], ["y"], name="erf_gelu")
+    graph = helper.make_graph([node], "erf_gelu", [x], [y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 20)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+
+    with pytest.raises(UnsupportedOperator) as exc:
+        import_onnx(model)
+    assert "approximate" in str(exc.value)

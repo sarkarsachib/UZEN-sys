@@ -76,7 +76,7 @@ class ArchitectureDefinition:
         rng = generator(seed, "sample_inputs")
         out: dict[str, np.ndarray] = {}
         for iname, shape in self.default_inputs.items():
-            if iname == "tokens":
+            if iname == "tokens" or iname.startswith("tokens_") or iname == "decoder_tokens":
                 vocab = int(self.spec.get("vocab_size", 32))
                 out[iname] = rng.integers(0, vocab, size=(batch, seq)).astype(np.int64)
             elif iname == "adj":
@@ -239,7 +239,7 @@ class TransformerBuilder(FamilyBuilder):
             )
         if norm not in ("layernorm", "rmsnorm"):
             raise InvalidOperationParameters(f"unsupported norm '{norm}'")
-        if activation not in ("gelu", "relu", "silu"):
+        if activation not in ("gelu", "gelu_exact", "relu", "silu"):
             raise InvalidOperationParameters(f"unsupported activation '{activation}'")
 
         spec_clean = {
@@ -1130,6 +1130,710 @@ class HybridBuilder(FamilyBuilder):
         return definition
 
 
+# --------------------------------------------------------------------------- #
+# additional families, ordered from simple to advanced in FAMILY_ORDER
+# --------------------------------------------------------------------------- #
+
+
+def _add_encoder_block(
+    g: Graph,
+    cur: Ref,
+    sh: dict[str, tuple[int, ...]],
+    *,
+    prefix: str,
+    d_model: int,
+    n_heads: int,
+    d_ff: int,
+    eps: float,
+    causal: bool,
+    activation: str = "gelu",
+    shared: bool = False,
+) -> Ref:
+    """Append one pre-norm attention + MLP block and return its residual output."""
+    p = "shared" if shared else prefix
+
+    def param(name: str) -> str:
+        return f"param:{p}.{name}"
+
+    sh.setdefault(f"{p}.ln1.weight", (d_model,))
+    sh.setdefault(f"{p}.ln1.bias", (d_model,))
+    sh.setdefault(f"{p}.qkv.weight", (3 * d_model, d_model))
+    sh.setdefault(f"{p}.qkv.bias", (3 * d_model,))
+    sh.setdefault(f"{p}.attn_out.weight", (d_model, d_model))
+    sh.setdefault(f"{p}.attn_out.bias", (d_model,))
+    sh.setdefault(f"{p}.ln2.weight", (d_model,))
+    sh.setdefault(f"{p}.ln2.bias", (d_model,))
+    sh.setdefault(f"{p}.mlp_up.weight", (d_ff, d_model))
+    sh.setdefault(f"{p}.mlp_up.bias", (d_ff,))
+    sh.setdefault(f"{p}.mlp_down.weight", (d_model, d_ff))
+    sh.setdefault(f"{p}.mlp_down.bias", (d_model,))
+    ln1 = g.add_node(
+        f"{prefix}_ln1",
+        "layernorm",
+        {"x": cur},
+        {"weight": param("ln1.weight"), "bias": param("ln1.bias"), "eps": eps},
+    )
+    qkv = g.add_node(
+        f"{prefix}_qkv",
+        "linear",
+        {"x": ln1},
+        {"weight": param("qkv.weight"), "bias": param("qkv.bias")},
+    )
+    split = g.add_node(f"{prefix}_split", "split_qkv", {"x": qkv}, {"n_heads": n_heads})
+    attn = g.add_node(
+        f"{prefix}_attn",
+        "attention",
+        {"q": split, "k": Ref(f"{prefix}_split", 1), "v": Ref(f"{prefix}_split", 2)},
+        {"causal": causal, "scale": "auto"},
+    )
+    merged = g.add_node(f"{prefix}_merge", "merge_heads", {"x": attn}, {"n_heads": n_heads})
+    proj = g.add_node(
+        f"{prefix}_attn_out",
+        "linear",
+        {"x": merged},
+        {"weight": param("attn_out.weight"), "bias": param("attn_out.bias")},
+    )
+    cur = g.add_node(f"{prefix}_res1", "add", {"a": cur, "b": proj})
+    ln2 = g.add_node(
+        f"{prefix}_ln2",
+        "layernorm",
+        {"x": cur},
+        {"weight": param("ln2.weight"), "bias": param("ln2.bias"), "eps": eps},
+    )
+    up = g.add_node(
+        f"{prefix}_mlp_up",
+        "linear",
+        {"x": ln2},
+        {"weight": param("mlp_up.weight"), "bias": param("mlp_up.bias")},
+    )
+    act = g.add_node(f"{prefix}_act", activation, {"x": up})
+    down = g.add_node(
+        f"{prefix}_mlp_down",
+        "linear",
+        {"x": act},
+        {"weight": param("mlp_down.weight"), "bias": param("mlp_down.bias")},
+    )
+    return g.add_node(f"{prefix}_res2", "add", {"a": cur, "b": down})
+
+
+def _add_token_encoder(
+    g: Graph,
+    sh: dict[str, tuple[int, ...]],
+    *,
+    vocab: int,
+    d_model: int,
+    n_heads: int,
+    n_layers: int,
+    d_ff: int,
+    max_seq: int,
+    eps: float = 1e-5,
+    activation: str = "gelu",
+    causal: bool = False,
+    shared: bool = False,
+    prefix: str = "enc",
+) -> Ref:
+    sh.setdefault(f"{prefix}.embed.weight", (vocab, d_model))
+    sh.setdefault(f"{prefix}.pos.weight", (max_seq, d_model))
+    cur = g.add_node(
+        f"{prefix}_embed",
+        "embedding",
+        {"x": Ref("input:tokens")},
+        {"weight": f"param:{prefix}.embed.weight"},
+    )
+    cur = g.add_node(
+        f"{prefix}_pos",
+        "pos_embedding",
+        {"x": cur},
+        {"weight": f"param:{prefix}.pos.weight"},
+    )
+    for layer in range(n_layers):
+        cur = _add_encoder_block(
+            g,
+            cur,
+            sh,
+            prefix=f"{prefix}{layer}",
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            eps=eps,
+            causal=causal,
+            activation=activation,
+            shared=shared,
+        )
+    sh.setdefault(f"{prefix}.ln_f.weight", (d_model,))
+    sh.setdefault(f"{prefix}.ln_f.bias", (d_model,))
+    return g.add_node(
+        f"{prefix}_ln_f",
+        "layernorm",
+        {"x": cur},
+        {
+            "weight": f"param:{prefix}.ln_f.weight",
+            "bias": f"param:{prefix}.ln_f.bias",
+            "eps": eps,
+        },
+    )
+
+
+@dataclass
+class LinearResidualBuilder(FamilyBuilder):
+    family: str = "linear_residual"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        inp = int(self._require(self.spec, "input_dim"))
+        hidden = int(self._require(self.spec, "hidden_dim", 2 * inp))
+        out = int(self._require(self.spec, "out_dim", inp))
+        g = Graph(name="linear_residual", metadata={"family": self.family})
+        g.add_input("x", TensorType.of(("B", inp)))
+        sh = {
+            "up.weight": (hidden, inp),
+            "up.bias": (hidden,),
+            "down.weight": (out, hidden),
+            "down.bias": (out,),
+            "skip.weight": (out, inp),
+            "skip.bias": (out,),
+        }
+        up = g.add_node("up", "linear", {"x": Ref("input:x")}, {"weight": "param:up.weight", "bias": "param:up.bias"})
+        act = g.add_node("act", "relu", {"x": up})
+        down = g.add_node("down", "linear", {"x": act}, {"weight": "param:down.weight", "bias": "param:down.bias"})
+        skip = g.add_node("skip", "linear", {"x": Ref("input:x")}, {"weight": "param:skip.weight", "bias": "param:skip.bias"})
+        out_ref = g.add_node("out", "add", {"a": down, "b": skip})
+        g.set_output("y", out_ref)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"input_dim": inp, "hidden_dim": hidden, "out_dim": out},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"x": ("B", inp)},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class GatedMLPBuilder(FamilyBuilder):
+    family: str = "gated_mlp"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        inp = int(self._require(self.spec, "input_dim"))
+        hidden = int(self._require(self.spec, "hidden_dim", 2 * inp))
+        out = int(self._require(self.spec, "out_dim", inp))
+        g = Graph(name="gated_mlp", metadata={"family": self.family})
+        g.add_input("x", TensorType.of(("B", inp)))
+        sh = {
+            "up.weight": (hidden, inp),
+            "up.bias": (hidden,),
+            "gate.weight": (hidden, inp),
+            "gate.bias": (hidden,),
+            "down.weight": (out, hidden),
+            "down.bias": (out,),
+            "skip.weight": (out, inp),
+            "skip.bias": (out,),
+        }
+        up = g.add_node("up", "linear", {"x": Ref("input:x")}, {"weight": "param:up.weight", "bias": "param:up.bias"})
+        gate = g.add_node("gate", "linear", {"x": Ref("input:x")}, {"weight": "param:gate.weight", "bias": "param:gate.bias"})
+        gate = g.add_node("silu", "silu", {"x": gate})
+        fused = g.add_node("fused", "mul", {"a": up, "b": gate})
+        down = g.add_node("down", "linear", {"x": fused}, {"weight": "param:down.weight", "bias": "param:down.bias"})
+        skip = g.add_node("skip", "linear", {"x": Ref("input:x")}, {"weight": "param:skip.weight", "bias": "param:skip.bias"})
+        out_ref = g.add_node("out", "add", {"a": down, "b": skip})
+        g.set_output("y", out_ref)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"input_dim": inp, "hidden_dim": hidden, "out_dim": out},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"x": ("B", inp)},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class ConvResidualBuilder(FamilyBuilder):
+    family: str = "conv_residual"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        channels = int(self._require(self.spec, "channels", 1))
+        height = int(self._require(self.spec, "height", 8))
+        width = int(self._require(self.spec, "width", 8))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if height % 2 or width % 2:
+            raise InvalidOperationParameters("conv_residual height and width must be even for pooling")
+        g = Graph(name="conv_residual", metadata={"family": self.family})
+        g.add_input("image", TensorType.of(("B", channels, height, width)))
+        sh = {
+            "conv1.weight": (channels, channels, 3, 3),
+            "conv1.bias": (channels,),
+            "conv2.weight": (channels, channels, 3, 3),
+            "conv2.bias": (channels,),
+            "head.weight": (num_classes, channels * (height // 2) * (width // 2)),
+            "head.bias": (num_classes,),
+        }
+        conv1 = g.add_node("conv1", "conv2d", {"x": Ref("input:image")}, {"weight": "param:conv1.weight", "bias": "param:conv1.bias", "padding": 1})
+        act = g.add_node("act", "relu", {"x": conv1})
+        conv2 = g.add_node("conv2", "conv2d", {"x": act}, {"weight": "param:conv2.weight", "bias": "param:conv2.bias", "padding": 1})
+        res = g.add_node("res", "add", {"a": Ref("input:image"), "b": conv2})
+        pool = g.add_node("pool", "maxpool2d", {"x": res}, {"kernel": 2, "stride": 2})
+        flat = g.add_node("flat", "flatten", {"x": pool}, {"start_dim": 1})
+        logits = g.add_node("head", "linear", {"x": flat}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"channels": channels, "height": height, "width": width, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"image": ("B", channels, height, width)},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class TransformerEncoderBuilder(FamilyBuilder):
+    family: str = "transformer_encoder"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 2))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        g = Graph(name="transformer_encoder", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        sh: dict[str, tuple[int, ...]] = {}
+        cur = _add_token_encoder(
+            g, sh, vocab=vocab, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            d_ff=d_ff, max_seq=max_seq, causal=False, prefix="enc",
+        )
+        pooled = g.add_node("pool", "mean", {"x": cur}, {"axis": 1})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        g.set_output("hidden", cur)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "max_seq_len": max_seq, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T")},
+            input_dtypes={"tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class AlbertBuilder(FamilyBuilder):
+    family: str = "albert"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 3))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        g = Graph(name="albert_shared", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        sh: dict[str, tuple[int, ...]] = {}
+        cur = _add_token_encoder(
+            g, sh, vocab=vocab, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            d_ff=d_ff, max_seq=max_seq, causal=False, shared=True, prefix="shared",
+        )
+        pooled = g.add_node("pool", "mean", {"x": cur}, {"axis": 1})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        g.set_output("hidden", cur)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "max_seq_len": max_seq, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T")},
+            input_dtypes={"tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class BertBuilder(FamilyBuilder):
+    family: str = "bert"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 2))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        g = Graph(name="bert", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        sh: dict[str, tuple[int, ...]] = {}
+        cur = _add_token_encoder(
+            g, sh, vocab=vocab, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            d_ff=d_ff, max_seq=max_seq, causal=False, prefix="bert",
+        )
+        first = g.add_node("first", "slice", {"x": cur}, {"axis": 1, "start": 0, "stop": 1})
+        flat = g.add_node("flat", "reshape", {"x": first}, {"shape": ["B", d_model]})
+        sh["pooler.weight"] = (d_model, d_model)
+        sh["pooler.bias"] = (d_model,)
+        pooled = g.add_node("pooler", "linear", {"x": flat}, {"weight": "param:pooler.weight", "bias": "param:pooler.bias"})
+        pooled = g.add_node("pooler_tanh", "tanh", {"x": pooled})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        g.set_output("pooled", pooled)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "max_seq_len": max_seq, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T")},
+            input_dtypes={"tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class ViTBuilder(FamilyBuilder):
+    family: str = "vit"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        channels = int(self._require(self.spec, "in_channels", 1))
+        height = int(self._require(self.spec, "height", 8))
+        width = int(self._require(self.spec, "width", 8))
+        patch = int(self._require(self.spec, "patch", 2))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 1))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if height % patch or width % patch:
+            raise InvalidOperationParameters("vit height and width must be divisible by patch")
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        tokens = (height // patch) * (width // patch)
+        g = Graph(name="vit", metadata={"family": self.family})
+        g.add_input("image", TensorType.of(("B", channels, height, width)))
+        sh: dict[str, tuple[int, ...]] = {
+            "patch.weight": (d_model, channels, patch, patch),
+            "patch.bias": (d_model,),
+            "pos.weight": (tokens, d_model),
+        }
+        patch_ref = g.add_node("patch", "conv2d", {"x": Ref("input:image")}, {"weight": "param:patch.weight", "bias": "param:patch.bias", "stride": patch})
+        flat = g.add_node("flat", "reshape", {"x": patch_ref}, {"shape": ["B", tokens, d_model]})
+        cur = g.add_node("pos", "pos_embedding", {"x": flat}, {"weight": "param:pos.weight"})
+        for layer in range(n_layers):
+            cur = _add_encoder_block(g, cur, sh, prefix=f"vit{layer}", d_model=d_model, n_heads=n_heads, d_ff=d_ff, eps=1e-5, causal=False)
+        sh["ln_f.weight"] = (d_model,)
+        sh["ln_f.bias"] = (d_model,)
+        cur = g.add_node("ln_f", "layernorm", {"x": cur}, {"weight": "param:ln_f.weight", "bias": "param:ln_f.bias", "eps": 1e-5})
+        pooled = g.add_node("pool", "mean", {"x": cur}, {"axis": 1})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"in_channels": channels, "height": height, "width": width, "patch": patch, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"image": ("B", channels, height, width)},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class SetTransformerBuilder(FamilyBuilder):
+    family: str = "set_transformer"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 1))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        g = Graph(name="set_transformer", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        sh: dict[str, tuple[int, ...]] = {}
+        cur = _add_token_encoder(g, sh, vocab=vocab, d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff, max_seq=max_seq, causal=False, prefix="set")
+        pooled = g.add_node("pool", "mean", {"x": cur}, {"axis": 1})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "max_seq_len": max_seq, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T")},
+            input_dtypes={"tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class SiameseBuilder(FamilyBuilder):
+    family: str = "siamese"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        inp = int(self._require(self.spec, "input_dim"))
+        hidden = int(self._require(self.spec, "hidden_dim", 2 * inp))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        g = Graph(name="siamese", metadata={"family": self.family})
+        g.add_input("a", TensorType.of(("B", inp)))
+        g.add_input("b", TensorType.of(("B", inp)))
+        sh = {
+            "up.weight": (hidden, inp), "up.bias": (hidden,),
+            "down.weight": (hidden, hidden), "down.bias": (hidden,),
+            "head.weight": (num_classes, 2 * hidden), "head.bias": (num_classes,),
+        }
+
+        def encode(name: str) -> Ref:
+            up = g.add_node(f"{name}_up", "linear", {"x": Ref(f"input:{name}")}, {"weight": "param:up.weight", "bias": "param:up.bias"})
+            act = g.add_node(f"{name}_act", "relu", {"x": up})
+            return g.add_node(f"{name}_down", "linear", {"x": act}, {"weight": "param:down.weight", "bias": "param:down.bias"})
+
+        left = encode("a")
+        right = encode("b")
+        joined = g.add_node("join", "concat", {"a": left, "b": right}, {"axis": -1})
+        logits = g.add_node("head", "linear", {"x": joined}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"input_dim": inp, "hidden_dim": hidden, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"a": ("B", inp), "b": ("B", inp)},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class RetrievalBuilder(FamilyBuilder):
+    family: str = "retrieval"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        hidden = int(self._require(self.spec, "hidden_dim", 2 * d_model))
+        embed_dim = int(self._require(self.spec, "embed_dim", d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        g = Graph(name="retrieval", metadata={"family": self.family})
+        g.add_input("tokens_a", TensorType.of(("B", "T"), "int64"))
+        g.add_input("tokens_b", TensorType.of(("B", "T"), "int64"))
+        sh = {
+            "embed.weight": (vocab, d_model),
+            "up.weight": (hidden, d_model), "up.bias": (hidden,),
+            "proj.weight": (embed_dim, hidden), "proj.bias": (embed_dim,),
+        }
+
+        def encode(name: str) -> Ref:
+            emb = g.add_node(f"{name}_embed", "embedding", {"x": Ref(f"input:{name}")}, {"weight": "param:embed.weight"})
+            pooled = g.add_node(f"{name}_pool", "mean", {"x": emb}, {"axis": 1})
+            up = g.add_node(f"{name}_up", "linear", {"x": pooled}, {"weight": "param:up.weight", "bias": "param:up.bias"})
+            act = g.add_node(f"{name}_act", "relu", {"x": up})
+            return g.add_node(f"{name}_proj", "linear", {"x": act}, {"weight": "param:proj.weight", "bias": "param:proj.bias"})
+
+        left = encode("tokens_a")
+        right = encode("tokens_b")
+        right_t = g.add_node("right_t", "transpose", {"x": right}, {"perm": [1, 0]})
+        logits = g.add_node("logits", "matmul", {"a": left, "b": right_t})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "hidden_dim": hidden, "embed_dim": embed_dim, "max_seq_len": max_seq},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens_a": ("B", "T"), "tokens_b": ("B", "T")},
+            input_dtypes={"tokens_a": "int64", "tokens_b": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class PerceiverBuilder(FamilyBuilder):
+    family: str = "perceiver"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        latent_count = int(self._require(self.spec, "latent_count", 4))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        num_classes = int(self._require(self.spec, "num_classes", 2))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        head_dim = d_model // n_heads
+        g = Graph(name="perceiver", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        g.add_input("latents", TensorType.of(("B", latent_count, d_model)))
+        sh: dict[str, tuple[int, ...]] = {
+            "embed.weight": (vocab, d_model),
+            "cross.q.weight": (d_model, d_model), "cross.q.bias": (d_model,),
+            "cross.k.weight": (d_model, d_model), "cross.k.bias": (d_model,),
+            "cross.v.weight": (d_model, d_model), "cross.v.bias": (d_model,),
+            "cross.out.weight": (d_model, d_model), "cross.out.bias": (d_model,),
+        }
+        embed = g.add_node("embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"})
+
+        def heads(ref: Ref, name: str, length: int) -> Ref:
+            shaped = g.add_node(f"{name}_shape", "reshape", {"x": ref}, {"shape": ["B", length, n_heads, head_dim]})
+            return g.add_node(f"{name}_heads", "transpose", {"x": shaped}, {"perm": [0, 2, 1, 3]})
+
+        q = g.add_node("cross_q", "linear", {"x": Ref("input:latents")}, {"weight": "param:cross.q.weight", "bias": "param:cross.q.bias"})
+        k = g.add_node("cross_k", "linear", {"x": embed}, {"weight": "param:cross.k.weight", "bias": "param:cross.k.bias"})
+        v = g.add_node("cross_v", "linear", {"x": embed}, {"weight": "param:cross.v.weight", "bias": "param:cross.v.bias"})
+        attn = g.add_node("cross_attn", "attention", {"q": heads(q, "q", latent_count), "k": heads(k, "k", "T"), "v": heads(v, "v", "T")}, {"causal": False, "scale": "auto"})
+        merged = g.add_node("cross_merge", "merge_heads", {"x": attn}, {"n_heads": n_heads})
+        projected = g.add_node("cross_out", "linear", {"x": merged}, {"weight": "param:cross.out.weight", "bias": "param:cross.out.bias"})
+        cur = g.add_node("cross_res", "add", {"a": Ref("input:latents"), "b": projected})
+        cur = _add_encoder_block(g, cur, sh, prefix="latent_self", d_model=d_model, n_heads=n_heads, d_ff=d_ff, eps=1e-5, causal=False)
+        sh["ln_f.weight"] = (d_model,)
+        sh["ln_f.bias"] = (d_model,)
+        cur = g.add_node("ln_f", "layernorm", {"x": cur}, {"weight": "param:ln_f.weight", "bias": "param:ln_f.bias", "eps": 1e-5})
+        pooled = g.add_node("pool", "mean", {"x": cur}, {"axis": 1})
+        sh["head.weight"] = (num_classes, d_model)
+        sh["head.bias"] = (num_classes,)
+        logits = g.add_node("head", "linear", {"x": pooled}, {"weight": "param:head.weight", "bias": "param:head.bias"})
+        g.set_output("logits", logits)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "latent_count": latent_count, "d_ff": d_ff, "max_seq_len": max_seq, "num_classes": num_classes},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T"), "latents": ("B", latent_count, d_model)},
+            input_dtypes={"tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
+@dataclass
+class Seq2SeqBuilder(FamilyBuilder):
+    family: str = "seq2seq"
+    spec: dict[str, Any] = field(default_factory=dict)
+
+    def build(self) -> ArchitectureDefinition:
+        vocab = int(self._require(self.spec, "vocab_size"))
+        d_model = int(self._require(self.spec, "d_model"))
+        n_heads = int(self._require(self.spec, "n_heads"))
+        n_layers = int(self._require(self.spec, "n_layers", 1))
+        d_ff = int(self._require(self.spec, "d_ff", 2 * d_model))
+        max_seq = int(self._require(self.spec, "max_seq_len", 16))
+        if d_model % n_heads:
+            raise InvalidOperationParameters("d_model must be divisible by n_heads")
+        head_dim = d_model // n_heads
+        g = Graph(name="seq2seq", metadata={"family": self.family})
+        g.add_input("tokens", TensorType.of(("B", "T"), "int64"))
+        g.add_input("decoder_tokens", TensorType.of(("B", "T"), "int64"))
+        sh: dict[str, tuple[int, ...]] = {
+            "embed.weight": (vocab, d_model), "pos.weight": (max_seq, d_model),
+            "out.weight": (vocab, d_model), "out.bias": (vocab,),
+        }
+        enc = g.add_node("enc_embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed.weight"})
+        enc = g.add_node("enc_pos", "pos_embedding", {"x": enc}, {"weight": "param:pos.weight"})
+        for layer in range(n_layers):
+            enc = _add_encoder_block(g, enc, sh, prefix=f"enc{layer}", d_model=d_model, n_heads=n_heads, d_ff=d_ff, eps=1e-5, causal=False)
+        sh["enc_ln.weight"] = (d_model,)
+        sh["enc_ln.bias"] = (d_model,)
+        enc = g.add_node("enc_ln", "layernorm", {"x": enc}, {"weight": "param:enc_ln.weight", "bias": "param:enc_ln.bias", "eps": 1e-5})
+
+        cur = g.add_node("dec_embed", "embedding", {"x": Ref("input:decoder_tokens")}, {"weight": "param:embed.weight"})
+        cur = g.add_node("dec_pos", "pos_embedding", {"x": cur}, {"weight": "param:pos.weight"})
+        sh["dec.ln1.weight"] = (d_model,); sh["dec.ln1.bias"] = (d_model,)
+        sh["dec.qkv.weight"] = (3 * d_model, d_model); sh["dec.qkv.bias"] = (3 * d_model,)
+        sh["dec.self_out.weight"] = (d_model, d_model); sh["dec.self_out.bias"] = (d_model,)
+        sh["dec.ln2.weight"] = (d_model,); sh["dec.ln2.bias"] = (d_model,)
+        sh["dec.cross_q.weight"] = (d_model, d_model); sh["dec.cross_q.bias"] = (d_model,)
+        sh["dec.cross_k.weight"] = (d_model, d_model); sh["dec.cross_k.bias"] = (d_model,)
+        sh["dec.cross_v.weight"] = (d_model, d_model); sh["dec.cross_v.bias"] = (d_model,)
+        sh["dec.cross_out.weight"] = (d_model, d_model); sh["dec.cross_out.bias"] = (d_model,)
+        sh["dec.ln3.weight"] = (d_model,); sh["dec.ln3.bias"] = (d_model,)
+        sh["dec.up.weight"] = (d_ff, d_model); sh["dec.up.bias"] = (d_ff,)
+        sh["dec.down.weight"] = (d_model, d_ff); sh["dec.down.bias"] = (d_model,)
+        sh["dec.ln_f.weight"] = (d_model,); sh["dec.ln_f.bias"] = (d_model,)
+
+        ln1 = g.add_node("dec_ln1", "layernorm", {"x": cur}, {"weight": "param:dec.ln1.weight", "bias": "param:dec.ln1.bias", "eps": 1e-5})
+        qkv = g.add_node("dec_qkv", "linear", {"x": ln1}, {"weight": "param:dec.qkv.weight", "bias": "param:dec.qkv.bias"})
+        split = g.add_node("dec_split", "split_qkv", {"x": qkv}, {"n_heads": n_heads})
+        self_attn = g.add_node("dec_self_attn", "attention", {"q": split, "k": Ref("dec_split", 1), "v": Ref("dec_split", 2)}, {"causal": True, "scale": "auto"})
+        merged = g.add_node("dec_self_merge", "merge_heads", {"x": self_attn}, {"n_heads": n_heads})
+        self_out = g.add_node("dec_self_out", "linear", {"x": merged}, {"weight": "param:dec.self_out.weight", "bias": "param:dec.self_out.bias"})
+        cur = g.add_node("dec_res1", "add", {"a": cur, "b": self_out})
+
+        ln2 = g.add_node("dec_ln2", "layernorm", {"x": cur}, {"weight": "param:dec.ln2.weight", "bias": "param:dec.ln2.bias", "eps": 1e-5})
+        cq = g.add_node("dec_cross_q", "linear", {"x": ln2}, {"weight": "param:dec.cross_q.weight", "bias": "param:dec.cross_q.bias"})
+        ck = g.add_node("dec_cross_k", "linear", {"x": enc}, {"weight": "param:dec.cross_k.weight", "bias": "param:dec.cross_k.bias"})
+        cv = g.add_node("dec_cross_v", "linear", {"x": enc}, {"weight": "param:dec.cross_v.weight", "bias": "param:dec.cross_v.bias"})
+
+        def heads(ref: Ref, name: str, length_symbol: str) -> Ref:
+            shaped = g.add_node(f"{name}_shape", "reshape", {"x": ref}, {"shape": ["B", length_symbol, n_heads, head_dim]})
+            return g.add_node(f"{name}_heads", "transpose", {"x": shaped}, {"perm": [0, 2, 1, 3]})
+
+        cross_attn = g.add_node("dec_cross_attn", "attention", {"q": heads(cq, "cq", "T"), "k": heads(ck, "ck", "T"), "v": heads(cv, "cv", "T")}, {"causal": False, "scale": "auto"})
+        cross_merged = g.add_node("dec_cross_merge", "merge_heads", {"x": cross_attn}, {"n_heads": n_heads})
+        cross_out = g.add_node("dec_cross_out", "linear", {"x": cross_merged}, {"weight": "param:dec.cross_out.weight", "bias": "param:dec.cross_out.bias"})
+        cur = g.add_node("dec_res2", "add", {"a": cur, "b": cross_out})
+
+        ln3 = g.add_node("dec_ln3", "layernorm", {"x": cur}, {"weight": "param:dec.ln3.weight", "bias": "param:dec.ln3.bias", "eps": 1e-5})
+        up = g.add_node("dec_up", "linear", {"x": ln3}, {"weight": "param:dec.up.weight", "bias": "param:dec.up.bias"})
+        act = g.add_node("dec_act", "gelu", {"x": up})
+        down = g.add_node("dec_down", "linear", {"x": act}, {"weight": "param:dec.down.weight", "bias": "param:dec.down.bias"})
+        cur = g.add_node("dec_res3", "add", {"a": cur, "b": down})
+        cur = g.add_node("dec_ln_f", "layernorm", {"x": cur}, {"weight": "param:dec.ln_f.weight", "bias": "param:dec.ln_f.bias", "eps": 1e-5})
+        logits = g.add_node("out", "linear", {"x": cur}, {"weight": "param:out.weight", "bias": "param:out.bias"})
+        g.set_output("logits", logits)
+        g.set_output("encoder_hidden", enc)
+        definition = ArchitectureDefinition(
+            family=self.family,
+            spec={"vocab_size": vocab, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "d_ff": d_ff, "max_seq_len": max_seq},
+            graph=g,
+            parameter_shapes=sh,
+            default_inputs={"tokens": ("B", "T"), "decoder_tokens": ("B", "T")},
+            input_dtypes={"tokens": "int64", "decoder_tokens": "int64"},
+        )
+        definition.graph.require_valid(definition.build_package(seed=0))
+        return definition
+
+
 FAMILY_BUILDERS: dict[str, type[FamilyBuilder]] = {
     "transformer_decoder": TransformerBuilder,
     "mlp": MLPBuilder,
@@ -1143,7 +1847,49 @@ FAMILY_BUILDERS: dict[str, type[FamilyBuilder]] = {
     "diffusion": DiffusionBuilder,
     "multimodal": MultimodalBuilder,
     "hybrid": HybridBuilder,
+    "linear_residual": LinearResidualBuilder,
+    "gated_mlp": GatedMLPBuilder,
+    "conv_residual": ConvResidualBuilder,
+    "transformer_encoder": TransformerEncoderBuilder,
+    "albert": AlbertBuilder,
+    "bert": BertBuilder,
+    "vit": ViTBuilder,
+    "set_transformer": SetTransformerBuilder,
+    "siamese": SiameseBuilder,
+    "retrieval": RetrievalBuilder,
+    "perceiver": PerceiverBuilder,
+    "seq2seq": Seq2SeqBuilder,
 }
+
+
+# Catalogue order is deliberate: simple feed-forward blocks first, then vision /
+# sequence encoders, then dual-tower, latent-attention and encoder-decoder models.
+FAMILY_ORDER: tuple[str, ...] = (
+    "linear_residual",
+    "gated_mlp",
+    "mlp",
+    "conv_residual",
+    "cnn",
+    "recurrent",
+    "autoencoder",
+    "siamese",
+    "retrieval",
+    "set_transformer",
+    "transformer_encoder",
+    "albert",
+    "bert",
+    "vit",
+    "vae",
+    "state_space",
+    "gnn",
+    "moe",
+    "diffusion",
+    "multimodal",
+    "hybrid",
+    "perceiver",
+    "seq2seq",
+    "transformer_decoder",
+)
 
 
 def build_architecture(family: str, spec: Mapping[str, Any] | None = None) -> ArchitectureDefinition:
@@ -1159,25 +1905,39 @@ def build_architecture(family: str, spec: Mapping[str, Any] | None = None) -> Ar
 
 
 def family_catalogue() -> list[dict[str, Any]]:
+    notes = {
+        "transformer_decoder": "pre-norm decoder-only transformer with fused QKV and causal attention",
+        "mlp": "stacked linear + activation network",
+        "cnn": "conv2d/relu/maxpool stack with a linear head",
+        "recurrent": "embedding + rnn|lstm|gru + last-step linear head",
+        "autoencoder": "linear encoder/decoder with tanh bottleneck",
+        "moe": "token embedding + top-k routed mixture-of-experts + pooled linear head",
+        "state_space": "embedding + diagonal state-space recurrence + pooled linear head",
+        "gnn": "degree-normalized graph convolutions over dense adjacency + mean readout",
+        "vae": "encoder/mu/logvar + seeded reparameterized sample + decoder",
+        "diffusion": "seeded forward-noising step + time-conditioned MLP epsilon predictor",
+        "multimodal": "image projection fused with pooled text embedding + linear head",
+        "hybrid": "conv/pool trunk + GRU over spatial tokens + linear head",
+        "linear_residual": "linear up/relu/down with a learned residual projection",
+        "gated_mlp": "SwiGLU-style up/gate/down MLP with residual",
+        "conv_residual": "residual 3x3 convolution block + pooling + linear head",
+        "transformer_encoder": "bidirectional pre-norm transformer encoder with mean pooling",
+        "albert": "encoder with one shared transformer block repeated across depth",
+        "bert": "transformer encoder + first-token pooler + classifier",
+        "vit": "patch convolution + positional tokens + transformer encoder",
+        "set_transformer": "permutation-invariant self-attention over a token set",
+        "siamese": "weight-shared twin MLP encoders + concatenation head",
+        "retrieval": "shared text encoder with query/document dot-product logits",
+        "perceiver": "latent cross-attention into token features + latent self-attention",
+        "seq2seq": "bidirectional encoder + causal decoder with cross-attention",
+    }
     return [
         {
             "family": name,
-            "builder": cls.__name__,
+            "builder": FAMILY_BUILDERS[name].__name__,
             "supported": True,
-            "notes": {
-                "transformer_decoder": "pre-norm decoder-only transformer with fused QKV and causal attention",
-                "mlp": "stacked linear + activation network",
-                "cnn": "conv2d/relu/maxpool stack with a linear head",
-                "recurrent": "embedding + rnn|lstm|gru + last-step linear head",
-                "autoencoder": "linear encoder/decoder with tanh bottleneck",
-                "moe": "token embedding + top-k routed mixture-of-experts + pooled linear head",
-                "state_space": "embedding + diagonal state-space recurrence + pooled linear head",
-                "gnn": "degree-normalized graph convolutions over dense adjacency + mean readout",
-                "vae": "encoder/mu/logvar + seeded reparameterized sample + decoder",
-                "diffusion": "seeded forward-noising step + time-conditioned MLP epsilon predictor",
-                "multimodal": "image projection fused with pooled text embedding + linear head",
-                "hybrid": "conv/pool trunk + GRU over spatial tokens + linear head",
-            }.get(name, ""),
+            "notes": notes.get(name, ""),
         }
-        for name, cls in sorted(FAMILY_BUILDERS.items())
+        for name in FAMILY_ORDER
+        if name in FAMILY_BUILDERS
     ]

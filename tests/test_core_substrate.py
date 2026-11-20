@@ -17,8 +17,10 @@ from uzen.errors import (
     UnsupportedFormat,
 )
 from uzen.infrastructure.storage.safetensors_io import (
+    UZEN_GRAPH_METADATA_KEY,
     read_header,
     read_safetensors,
+    rewrite_safetensors_metadata,
     write_safetensors,
 )
 from uzen.policies.strict_plus.effects import EngineEffect, Maturity, Origin, TaskScope
@@ -47,6 +49,36 @@ def test_safetensors_roundtrip_all_supported_dtypes(tmp_path):
         np.testing.assert_array_equal(loaded[name], arr)
         assert loaded[name].dtype == arr.dtype
     assert header.metadata["family"] == "unit-test"
+
+
+def test_safetensors_metadata_rewrite_streams_payload_verbatim(tmp_path):
+    source = tmp_path / "source.safetensors"
+    arrays = {
+        "f16": np.array([0.5, 0.25, -1.0], dtype=np.float16),
+        "f32": np.arange(6, dtype=np.float32).reshape(2, 3),
+    }
+    write_safetensors(source, arrays, metadata={"family": "unit-test"})
+    graph = '{"name":"g","nodes":[]}'
+    dest = rewrite_safetensors_metadata(
+        source,
+        tmp_path / "dest.safetensors",
+        metadata={UZEN_GRAPH_METADATA_KEY: graph},
+    )
+
+    _original, original_header = read_safetensors(source)
+    rewritten, rewritten_header = read_safetensors(dest)
+    assert rewritten_header.metadata == {
+        "family": "unit-test",
+        UZEN_GRAPH_METADATA_KEY: graph,
+    }
+    for name, arr in arrays.items():
+        np.testing.assert_array_equal(rewritten[name], arr)
+        assert rewritten[name].dtype == arr.dtype
+    # The payload is copied, not decoded and re-encoded.
+    assert (
+        dest.read_bytes()[8 + rewritten_header.header_bytes :]
+        == source.read_bytes()[8 + original_header.header_bytes :]
+    )
 
 
 def test_safetensors_header_only_read_does_not_need_data(tmp_path):

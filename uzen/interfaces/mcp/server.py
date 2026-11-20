@@ -63,10 +63,28 @@ class MCPServer:
                 },
                 self._import_model,
             ),
+            "uzen.quantize_model": (
+                {
+                    "description": (
+                        "Persist a weight-only int8 execution variant of a stored causal-LM "
+                        "artifact. Returns the new artifact id, lineage parent and explicit "
+                        "quantization report."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "scheme": {"type": "string", "enum": ["int8"]},
+                        },
+                        "required": ["artifact_id"],
+                    },
+                },
+                self._quantize_model,
+            ),
             "uzen.forward_model": (
                 {
                     "description": (
-                        "Run a stored reconstructed GPT-2/Llama model graph on token IDs. "
+                        "Run a stored reconstructed causal-LM model graph on token IDs. "
                         "Returns output shapes and optional values; no training or gradients."
                     ),
                     "inputSchema": {
@@ -81,7 +99,20 @@ class MCPServer:
                                 "type": "array",
                                 "items": {"type": "array", "items": {"type": "integer"}},
                             },
+                            "capture": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "NIR node ids to capture, or ['layers'] for transformer "
+                                    "block outputs"
+                                ),
+                            },
                             "include_values": {"type": "boolean"},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "weight-only int8 execution with a report",
+                            },
                         },
                         "required": ["artifact_id", "tokens"],
                     },
@@ -92,7 +123,7 @@ class MCPServer:
                 {
                     "description": (
                         "Tokenize text with the imported artifact's stored tokenizer and run "
-                        "its reconstructed GPT-2/Llama graph. No training or gradients."
+                        "its reconstructed causal-LM graph. No training or gradients."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -103,12 +134,60 @@ class MCPServer:
                                 "type": "array",
                                 "items": {"type": "array", "items": {"type": "integer"}},
                             },
+                            "capture": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "NIR node ids to capture, or ['layers'] for transformer "
+                                    "block outputs"
+                                ),
+                            },
                             "include_values": {"type": "boolean"},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "weight-only int8 execution with a report",
+                            },
                         },
                         "required": ["artifact_id", "text"],
                     },
                 },
                 self._forward_text,
+            ),
+            "uzen.generate_text": (
+                {
+                    "description": (
+                        "Generate text from an imported causal-LM artifact using its "
+                        "stored tokenizer and reconstructed graph. Supports greedy, seeded "
+                        "sampling and beam search. No training or gradients."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "max_new_tokens": {"type": "integer", "minimum": 1},
+                            "eos_token_id": {"type": "integer", "minimum": 0},
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "strategy": {"type": "string", "enum": ["greedy", "sample", "beam"]},
+                            "temperature": {"type": "number", "minimum": 0},
+                            "top_k": {"type": "integer", "minimum": 1},
+                            "top_p": {"type": "number", "minimum": 0, "maximum": 1},
+                            "seed": {"type": "integer", "minimum": 0},
+                            "num_beams": {"type": "integer", "minimum": 1},
+                            "quantize": {
+                                "type": "string",
+                                "enum": ["int8"],
+                                "description": "quantize the execution copy once with a report",
+                            },
+                        },
+                        "required": ["artifact_id", "text"],
+                    },
+                },
+                self._generate_text,
             ),
             "uzen.compare_models": (
                 {
@@ -131,11 +210,49 @@ class MCPServer:
                             },
                             "atol": {"type": "number"},
                             "rtol": {"type": "number"},
+                            "max_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "mean_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "max_rel_error_threshold": {"type": "number", "minimum": 0},
                         },
                         "required": ["source_artifact_id", "candidate_artifact_id", "tokens"],
                     },
                 },
                 self._compare_models,
+            ),
+            "uzen.compare_quantized_model": (
+                {
+                    "description": (
+                        "Compare a floating-point source model with its persisted quantized "
+                        "variant on identical token/position inputs. Returns per-output and "
+                        "aggregate drift, optional threshold failures and the quantization report."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source_artifact_id": {"type": "string"},
+                            "quantized_artifact_id": {"type": "string"},
+                            "tokens": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "positions": {
+                                "type": "array",
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "atol": {"type": "number", "minimum": 0},
+                            "rtol": {"type": "number", "minimum": 0},
+                            "max_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "mean_abs_error_threshold": {"type": "number", "minimum": 0},
+                            "max_rel_error_threshold": {"type": "number", "minimum": 0},
+                        },
+                        "required": [
+                            "source_artifact_id",
+                            "quantized_artifact_id",
+                            "tokens",
+                        ],
+                    },
+                },
+                self._compare_quantized_model,
             ),
             "uzen.inspect_model": (
                 {
@@ -432,12 +549,20 @@ class MCPServer:
         if self._progress_callback is not None:
             self._progress_callback(stage, status, message)
 
+    def _quantize_model(self, args: Mapping[str, Any]) -> Any:
+        return self.client.quantize_model(
+            str(args["artifact_id"]),
+            scheme=str(args.get("scheme", "int8")),
+        )
+
     def _forward_model(self, args: Mapping[str, Any]) -> Any:
         return self.client.forward_model(
             str(args["artifact_id"]),
             tokens=args["tokens"],
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
+            capture=args.get("capture"),
+            quantize=args.get("quantize"),
         )
 
     def _forward_text(self, args: Mapping[str, Any]) -> Any:
@@ -446,6 +571,24 @@ class MCPServer:
             text=str(args["text"]),
             positions=args.get("positions"),
             include_values=bool(args.get("include_values", False)),
+            capture=args.get("capture"),
+            quantize=args.get("quantize"),
+        )
+
+    def _generate_text(self, args: Mapping[str, Any]) -> Any:
+        return self.client.generate_text(
+            str(args["artifact_id"]),
+            text=str(args["text"]),
+            max_new_tokens=int(args.get("max_new_tokens", 16)),
+            eos_token_id=args.get("eos_token_id"),
+            positions=args.get("positions"),
+            strategy=str(args.get("strategy", "greedy")),
+            temperature=float(args.get("temperature", 1.0)),
+            top_k=args.get("top_k"),
+            top_p=args.get("top_p"),
+            seed=args.get("seed"),
+            num_beams=int(args.get("num_beams", 1)),
+            quantize=args.get("quantize"),
         )
 
     def _compare_models(self, args: Mapping[str, Any]) -> Any:
@@ -456,6 +599,22 @@ class MCPServer:
             positions=args.get("positions"),
             atol=float(args.get("atol", 1e-5)),
             rtol=float(args.get("rtol", 1e-5)),
+            max_abs_error_threshold=args.get("max_abs_error_threshold"),
+            mean_abs_error_threshold=args.get("mean_abs_error_threshold"),
+            max_rel_error_threshold=args.get("max_rel_error_threshold"),
+        )
+
+    def _compare_quantized_model(self, args: Mapping[str, Any]) -> Any:
+        return self.client.compare_quantized_model(
+            str(args["source_artifact_id"]),
+            str(args["quantized_artifact_id"]),
+            tokens=args["tokens"],
+            positions=args.get("positions"),
+            atol=float(args.get("atol", 1e-5)),
+            rtol=float(args.get("rtol", 1e-5)),
+            max_abs_error_threshold=args.get("max_abs_error_threshold"),
+            mean_abs_error_threshold=args.get("mean_abs_error_threshold"),
+            max_rel_error_threshold=args.get("max_rel_error_threshold"),
         )
 
     def _inspect_model(self, args: Mapping[str, Any]) -> Any:

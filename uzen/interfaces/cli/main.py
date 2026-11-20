@@ -13,6 +13,9 @@ Examples::
     uzen import model.safetensors --family transformer_decoder
     uzen modify ARTIFACT_ID interpolate --other OTHER_ID --param t=0.5
     uzen forward ARTIFACT_ID --text 'hello world'
+    uzen quantize ARTIFACT_ID --scheme int8
+    uzen compare-quantized SOURCE QUANTIZED --tokens '[[0,1,2,3]]'
+    uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8
     uzen generate --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen evaluate ARTIFACT_ID --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
     uzen align A B --method procrustes
@@ -125,13 +128,37 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--family")
     ev.add_argument("--spec")
 
+    quant = sub.add_parser("quantize", help="persist a quantized model artifact variant")
+    quant.add_argument("artifact_id")
+    quant.add_argument("--scheme", choices=("int8",), default="int8")
+
     fwd = sub.add_parser("forward", help="execute a stored reconstructed model graph")
     fwd.add_argument("artifact_id")
     fwd_input = fwd.add_mutually_exclusive_group(required=True)
     fwd_input.add_argument("--tokens", help="JSON token matrix, e.g. '[[0,1,2,3]]'")
     fwd_input.add_argument("--text", help="text encoded with the artifact's stored tokenizer")
     fwd.add_argument("--positions", help="JSON position matrix; defaults to arange")
-    fwd.add_argument("--values", action="store_true", help="include output values")
+    fwd.add_argument(
+        "--capture",
+        nargs="+",
+        help="NIR node ids to capture, or 'layers' for transformer block outputs",
+    )
+    fwd.add_argument("--values", action="store_true", help="include output and captured values")
+    fwd.add_argument("--quantize", choices=("int8",), help="weight-only int8 execution with a report")
+
+    gen_text = sub.add_parser("generate-text", help="generate text from a model artifact")
+    gen_text.add_argument("artifact_id")
+    gen_text.add_argument("--text", required=True, help="prompt text")
+    gen_text.add_argument("--max-new-tokens", type=int, default=16)
+    gen_text.add_argument("--eos-token-id", type=int)
+    gen_text.add_argument("--positions", help="JSON prompt position matrix")
+    gen_text.add_argument("--strategy", choices=("greedy", "sample", "beam"), default="greedy")
+    gen_text.add_argument("--temperature", type=float, default=1.0)
+    gen_text.add_argument("--top-k", type=int)
+    gen_text.add_argument("--top-p", type=float)
+    gen_text.add_argument("--seed", type=int)
+    gen_text.add_argument("--num-beams", type=int, default=1)
+    gen_text.add_argument("--quantize", choices=("int8",), help="quantize the execution copy once")
 
     cmp_models = sub.add_parser("compare-models", help="compare source and modified model outputs")
     cmp_models.add_argument("source_artifact_id")
@@ -140,6 +167,23 @@ def build_parser() -> argparse.ArgumentParser:
     cmp_models.add_argument("--positions", help="JSON position matrix")
     cmp_models.add_argument("--atol", type=float, default=1e-5)
     cmp_models.add_argument("--rtol", type=float, default=1e-5)
+    cmp_models.add_argument("--max-abs-error-threshold", type=float)
+    cmp_models.add_argument("--mean-abs-error-threshold", type=float)
+    cmp_models.add_argument("--max-rel-error-threshold", type=float)
+
+    cmp_quant = sub.add_parser(
+        "compare-quantized",
+        help="compare a source model with its persisted quantized variant",
+    )
+    cmp_quant.add_argument("source_artifact_id")
+    cmp_quant.add_argument("quantized_artifact_id")
+    cmp_quant.add_argument("--tokens", required=True, help="JSON token matrix")
+    cmp_quant.add_argument("--positions", help="JSON position matrix")
+    cmp_quant.add_argument("--atol", type=float, default=1e-5)
+    cmp_quant.add_argument("--rtol", type=float, default=1e-5)
+    cmp_quant.add_argument("--max-abs-error-threshold", type=float)
+    cmp_quant.add_argument("--mean-abs-error-threshold", type=float)
+    cmp_quant.add_argument("--max-rel-error-threshold", type=float)
 
     align = sub.add_parser("align", help="align one artifact to another")
     align.add_argument("source")
@@ -198,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--reload", action="store_true")
+    serve.add_argument(
+        "--no-auto-run",
+        action="store_true",
+        help="leave submitted jobs QUEUED for registered workers instead of running them in-process",
+    )
+    serve.add_argument("--lease-seconds", type=float, default=120.0)
+    serve.add_argument("--max-attempts", type=int, default=3)
+    serve.add_argument("--retry-backoff-seconds", type=float, default=0.0)
+    serve.add_argument("--retry-backoff-cap-seconds", type=float, default=300.0)
+    serve.add_argument("--aging-seconds", type=float, default=0.0)
+    serve.add_argument("--max-in-flight-per-worker", type=int, default=0)
 
     worker = sub.add_parser("worker", help="worker daemon")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -208,6 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_run.add_argument("--worker-id", default=None)
     worker_run.add_argument("--once", action="store_true")
     worker_run.add_argument("--poll", type=float, default=1.0)
+    worker_run.add_argument("--lease-seconds", type=float, default=120.0)
+    worker_run.add_argument("--wait-seconds", type=float, default=0.0)
 
     mcp = sub.add_parser("mcp", help="run the MCP stdio server")
     mcp.add_argument("--root", default="./uzen-workspace")
@@ -325,6 +382,15 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if cmd == "quantize":
+        _emit(
+            _client(args).quantize_model(
+                args.artifact_id,
+                scheme=args.scheme,
+            )
+        )
+        return 0
+
     if cmd == "forward":
         client = _client(args)
         if args.text is not None:
@@ -334,6 +400,8 @@ def _dispatch(args: argparse.Namespace) -> int:
                     text=args.text,
                     positions=_json_arg(args.positions),
                     include_values=args.values,
+                    capture=args.capture,
+                    quantize=args.quantize,
                 )
             )
         else:
@@ -343,8 +411,29 @@ def _dispatch(args: argparse.Namespace) -> int:
                     tokens=_json_arg(args.tokens),
                     positions=_json_arg(args.positions),
                     include_values=args.values,
+                    capture=args.capture,
+                    quantize=args.quantize,
                 )
             )
+        return 0
+
+    if cmd == "generate-text":
+        _emit(
+            _client(args).generate_text(
+                args.artifact_id,
+                text=args.text,
+                max_new_tokens=args.max_new_tokens,
+                eos_token_id=args.eos_token_id,
+                positions=_json_arg(args.positions),
+                strategy=args.strategy,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=args.seed,
+                num_beams=args.num_beams,
+                quantize=args.quantize,
+            )
+        )
         return 0
 
     if cmd == "compare-models":
@@ -356,6 +445,25 @@ def _dispatch(args: argparse.Namespace) -> int:
                 positions=_json_arg(args.positions),
                 atol=args.atol,
                 rtol=args.rtol,
+                max_abs_error_threshold=args.max_abs_error_threshold,
+                mean_abs_error_threshold=args.mean_abs_error_threshold,
+                max_rel_error_threshold=args.max_rel_error_threshold,
+            )
+        )
+        return 0
+
+    if cmd == "compare-quantized":
+        _emit(
+            _client(args).compare_quantized_model(
+                args.source_artifact_id,
+                args.quantized_artifact_id,
+                tokens=_json_arg(args.tokens),
+                positions=_json_arg(args.positions),
+                atol=args.atol,
+                rtol=args.rtol,
+                max_abs_error_threshold=args.max_abs_error_threshold,
+                mean_abs_error_threshold=args.mean_abs_error_threshold,
+                max_rel_error_threshold=args.max_rel_error_threshold,
             )
         )
         return 0
@@ -451,7 +559,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             import uvicorn
         except ImportError as exc:  # pragma: no cover
             raise SystemExit("uvicorn is required for `uzen serve`: pip install 'uzen[api]'") from exc
-        app = create_app(root=args.root)
+        app = create_app(
+            root=args.root,
+            auto_run=not args.no_auto_run,
+            lease_seconds=args.lease_seconds,
+            max_attempts=args.max_attempts,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            retry_backoff_cap_seconds=args.retry_backoff_cap_seconds,
+            aging_seconds=args.aging_seconds,
+            max_in_flight_per_worker=args.max_in_flight_per_worker,
+        )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
@@ -463,6 +580,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             worker_id=args.worker_id,
             control_plane=args.url,
             secret=args.secret,
+            lease_seconds=args.lease_seconds,
+            claim_wait_seconds=args.wait_seconds,
+            poll_interval=args.poll,
         )
         if args.once:
             _emit(daemon.run_once())

@@ -56,6 +56,14 @@ parents, operations and seeds — so retries are idempotent and re-running a job
 mutate an existing artifact. Publication is atomic (write temp dir, then rename), and
 `verify()` re-hashes the payload against the manifest checksum.
 
+Remote transport (`uzen.infrastructure.storage.object_store`) moves the same
+artifact directories through any S3-compatible endpoint. The client implements
+SigV4 with the standard library, streams uploads (multipart above a configurable
+threshold), retries transient failures with a fresh signature, and verifies both
+the object SHA-256 and the tensor fingerprint before publishing a downloaded
+artifact. Parent lineage and the artifact's stored tokenizer are transported with
+it, so a fetched artifact verifies and executes exactly like a local one.
+
 ## NIR — Neural Intermediate Representation
 
 A typed dataflow graph, not a layer list:
@@ -178,14 +186,46 @@ artifact index) plus the artifact store and engines. States:
 retry re-reads the same authorized scope.
 
 `WorkerDaemon` runs jobs either locally or against the REST control plane
-(register → heartbeat → claim under lease → execute → report). Workers advertise
-detected capabilities (CPU/memory/Python/torch, supported operation codes, supported
-families). They never execute user-supplied scripts: only registered operations over
-artifacts.
+(register → heartbeat → claim under lease → fetch inputs → execute → report). Workers
+advertise detected capabilities (CPU/memory/Python/torch, supported operation codes,
+operators, families, artifact transports, native weight layouts). They never execute
+user-supplied scripts: only registered operations over artifacts.
+
+`JobScheduler` owns distribution: it derives a requirement set from each job request,
+stores it with the job, and lets the claiming statement take a lease only when the
+worker's advertised capability rows satisfy it and the worker is not draining. Claims
+order by operator priority plus optional aging, and mint a `dispatch_token`; renewals
+and reports must present it, and `dispatch_records` makes the first terminal report the
+only one that applies. A worker that stops renewing loses its lease: the reaper returns
+the job to the queue after an exponential backoff, or fails it with `job.lease_expired`
+once attempts are exhausted. An operator can drain a worker or preempt a job
+cooperatively, and a long-poll claim returns as soon as work appears. Queued jobs no
+registered worker can run are reported as unroutable with the missing capability, never
+left to starve silently.
+
+Worker authentication uses versioned HMAC envelopes (`uzen.worker.envelope/2`) with
+signing-key rotation, an optional signed expiry, a bounded timestamp window and either
+an in-process or durable SQLite nonce guard. Scoped hashed credentials support
+rotation and revocation; plaintext secrets are never persisted.
 
 ## Design boundaries
 
 * Base44 (or any host) can provide control-plane metadata, orchestration and API
   exposure. It must never pretend to execute tensor math.
-* Tensor computation happens in Python/NumPy (reference) or PyTorch (adapter).
-* Rust/C++/CUDA are future native layers, not stub modules.
+* Tensor computation happens in Python/NumPy (reference), PyTorch (adapter) or the
+  native C++ CPU runtime. The native runtime has two paths: a direct executor that
+  calls one kernel per node, and a compiled plan that lowers the graph into steps
+  with fusion, prepacked weights and a liveness buffer plan. Both implement only
+  their documented float32 operator sets and raise `UnsupportedOperator` for
+  everything else; layout operators are NumPy byte movement and are reported as
+  such.
+* Advanced parameter representations (N3) are per-weight native layouts on the
+  compiled path — blocked dense, transposed, group-wise int8/int4, low-rank factors
+  and CSR sparse — each packed once with a measured cost and error report, and
+  dispatched by the plan to its own kernel. The NIR graph language is unchanged.
+* Distributed execution is a control-plane concern: one job database (SQLite across
+  processes) or a Redis/Valkey queue, capability-routed claims, token-guarded leases and
+  idempotent reports. Compute stays where it was — NumPy, torch or the native CPU
+  runtime — and a device requirement only routes work; it never implies a kernel.
+* Rust integration and CUDA kernels (N5) are future layers, not stub modules. No GPU
+  acceleration is claimed before real kernels exist.

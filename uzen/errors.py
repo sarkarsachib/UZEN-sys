@@ -102,11 +102,32 @@ class ArtifactIntegrityError(UzenError):
     http_status = 500
 
 
+class ObjectStoreError(UzenError):
+    """The remote object-store request failed (HTTP status in ``details``)."""
+
+    code = "storage.object_store"
+    http_status = 502
+
+
+class ObjectStoreUnavailable(UzenError):
+    """No object-store endpoint/credentials are configured for this deployment."""
+
+    code = "storage.object_store_unavailable"
+    http_status = 501
+
+
 class ArtifactImmutable(UzenError):
     """Attempted to overwrite an existing content-addressed artifact."""
 
     code = "artifact.immutable"
     http_status = 409
+
+
+class NativeKernelError(UzenError):
+    """A native C/C++ kernel rejected its arguments or returned a failure."""
+
+    code = "runtime.native_kernel"
+    http_status = 500
 
 
 class UnsupportedFormat(UzenError):

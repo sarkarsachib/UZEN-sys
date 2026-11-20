@@ -19,6 +19,24 @@ from uzen.util.canonical import canonical_bytes, sha256_bytes, utc_now_iso
 PROTOCOL_VERSION = "uzen.worker/1"
 
 
+def native_representations() -> list[str]:
+    """Weight layouts this worker can execute natively, or none if it cannot.
+
+    The native layouts are advertised only when a compiled kernel library actually
+    resolves. A worker without a built library must not claim it can read int4
+    panels: the scheduler would route that work into a guaranteed failure.
+    """
+    try:
+        from uzen.runtimes.native.library import resolve_library_path
+
+        resolve_library_path(auto_build=False)
+    except Exception:
+        return []
+    from uzen.runtimes.native.representations import REPRESENTATION_KINDS
+
+    return list(REPRESENTATION_KINDS)
+
+
 def detect_capabilities() -> dict[str, Any]:
     from uzen.core.nir.ops import OPERATORS
     from uzen.core.nwpc.registry import default_registry
@@ -57,9 +75,30 @@ def detect_capabilities() -> dict[str, Any]:
         "supported_operators": sorted(OPERATORS),
         "max_tensor_bytes": None,
         "artifact_transport": ["shared_filesystem", "inline_tensors"],
+        "representations": native_representations(),
         "strict_plus": True,
         "detected_at": utc_now_iso(),
     }
+
+
+def merge_capability_overrides(
+    capabilities: Mapping[str, Any], overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Apply operator-declared capability overrides on top of detection.
+
+    Used to pin a worker to an approved device policy, to reserve a machine for a
+    specific architecture family, or to build a heterogeneous fleet from identical
+    hardware. Values replace the detected entry; ``None`` removes it. Detection results
+    are never silently rewritten without this explicit argument.
+    """
+    merged = dict(capabilities)
+    for key, value in dict(overrides or {}).items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    merged["overrides"] = sorted(dict(overrides or {}))
+    return merged
 
 
 @dataclass

@@ -8,6 +8,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tests.test_llama_reconstruction import _write_llama  # noqa: E402
+from tests.test_neox_reconstruction import _write_neox  # noqa: E402
 from uzen.core.nir.executor import execute  # noqa: E402
 from uzen.core.nir.graph import Graph  # noqa: E402
 from uzen.core.nir.types import Ref, TensorType  # noqa: E402
@@ -19,6 +20,18 @@ from uzen.runtimes.pytorch_runtime import PyTorchRuntime  # noqa: E402
 from uzen.runtimes.torch_executor import execute_torch, is_available  # noqa: E402
 
 FAMILY_SPECS = {
+    "linear_residual": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "gated_mlp": dict(input_dim=6, hidden_dim=10, out_dim=4),
+    "conv_residual": dict(channels=2, height=8, width=8, num_classes=3),
+    "transformer_encoder": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "albert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "bert": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=2, d_ff=16, max_seq_len=8, num_classes=3),
+    "vit": dict(in_channels=1, height=8, width=8, patch=2, d_model=8, n_heads=2, n_layers=1, d_ff=16, num_classes=3),
+    "set_transformer": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8, num_classes=3),
+    "siamese": dict(input_dim=6, hidden_dim=10, num_classes=2),
+    "retrieval": dict(vocab_size=16, d_model=8, hidden_dim=16, embed_dim=4, max_seq_len=8),
+    "perceiver": dict(vocab_size=16, d_model=8, n_heads=2, latent_count=3, d_ff=16, max_seq_len=8, num_classes=3),
+    "seq2seq": dict(vocab_size=16, d_model=8, n_heads=2, n_layers=1, d_ff=16, max_seq_len=8),
     "transformer_decoder": dict(
         d_model=16, n_heads=4, n_layers=2, d_ff=32, vocab_size=24, max_seq_len=12
     ),
@@ -56,6 +69,45 @@ def test_torch_cpu_matches_numpy_for_every_family(family, spec):
         )
 
 
+def test_torch_windowed_alibi_attention_matches_numpy():
+    rng = np.random.default_rng(21)
+    values = {
+        "q": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+        "k": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+        "v": rng.standard_normal((1, 2, 4, 2)).astype(np.float32),
+    }
+    g = Graph(
+        name="windowed-alibi",
+        inputs={
+            "q": TensorType.of((1, 2, 4, 2)),
+            "k": TensorType.of((1, 2, 4, 2)),
+            "v": TensorType.of((1, 2, 4, 2)),
+        },
+    )
+    g.add_node(
+        "attn",
+        "attention",
+        {"q": Ref("input:q"), "k": Ref("input:k"), "v": Ref("input:v")},
+        {"causal": True, "window": 2, "alibi_slopes": [0.25, 0.5], "scale": "auto"},
+    )
+    g.set_output("y", Ref("attn"))
+    package = WeightPackage.from_arrays({})
+    expected = execute(g, values, package).outputs["y"]
+    got = execute_torch(g, values, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_torch_clip_matches_numpy():
+    g = Graph(name="clip", inputs={"x": TensorType.of((2, 3, 4))})
+    g.add_node("clip", "clip", {"x": Ref("input:x")}, {"min": -0.5, "max": 0.75})
+    g.set_output("y", Ref("clip"))
+    x = np.linspace(-2.0, 2.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    package = WeightPackage.from_arrays({})
+    expected = execute(g, {"x": x}, package).outputs["y"]
+    got = execute_torch(g, {"x": x}, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
 def test_runtime_prefers_torch_and_can_force_the_reference():
     definition = build_architecture("mlp", dict(input_dim=4, hidden_dims=[6], output_dim=2))
     package = definition.build_package(seed=1)
@@ -83,6 +135,59 @@ def test_torch_backend_can_be_requested_explicitly():
     expected = execute(definition.graph, inputs, package).outputs
     for name in expected:
         np.testing.assert_allclose(got[name], expected[name], rtol=1e-5, atol=1e-6)
+
+
+def test_torch_gelu_exact_matches_numpy():
+    graph = Graph(name="exact-gelu", inputs={"x": TensorType.of((1, 5))})
+    graph.add_node("act", "gelu_exact", {"x": Ref("input:x")})
+    graph.set_output("y", Ref("act"))
+    package = WeightPackage.from_arrays({})
+    x = np.array([[-3.0, -1.0, 0.0, 1.0, 3.0]], dtype=np.float32)
+    expected = execute(graph, {"x": x}, package).outputs["y"]
+    got = execute_torch(graph, {"x": x}, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-7)
+
+
+def test_torch_neox_graph_matches_numpy(tmp_path):
+    root, _arrays = _write_neox(tmp_path / "neox-torch")
+    result = ModelImporter().import_source(root)
+    assert result.reconstruction is not None
+    graph = result.reconstruction.definition.graph
+    package = result.artifact_package
+    tokens = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    positions = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    inputs = {"tokens": tokens, "positions": positions}
+
+    expected = execute(graph, inputs, package).outputs
+    got = execute_torch(graph, inputs, package).outputs
+    for name in expected:
+        np.testing.assert_allclose(
+            got[name], expected[name], rtol=1e-5, atol=1e-6, err_msg=name
+        )
+
+
+def test_torch_pos_embedding_honours_the_offset_parameter():
+    graph = Graph(name="offset", inputs={"tokens": TensorType.of((1, 3), "int64")})
+    graph.add_node(
+        "embed", "embedding", {"x": Ref("input:tokens")}, {"weight": "param:embed"}
+    )
+    graph.add_node(
+        "pos",
+        "pos_embedding",
+        {"x": Ref("embed")},
+        {"weight": "param:pos", "offset": 2},
+    )
+    graph.set_output("y", Ref("pos"))
+    embed = np.arange(20, dtype=np.float32).reshape(5, 4)
+    pos = np.arange(24, dtype=np.float32).reshape(6, 4)
+    package = WeightPackage.from_arrays({"embed": embed, "pos": pos})
+    inputs = {"tokens": np.array([[0, 2, 4]], dtype=np.int64)}
+
+    expected = embed[inputs["tokens"]] + pos[2:5]
+    np.testing.assert_array_equal(execute(graph, inputs, package).outputs["y"], expected)
+    np.testing.assert_allclose(
+        execute_torch(graph, inputs, package).outputs["y"], expected, rtol=0, atol=0
+    )
 
 
 def test_capture_returns_intermediates():
@@ -127,6 +232,29 @@ def test_torch_rope_matches_numpy_reference():
     expected = execute(graph, inputs, package).outputs["y"]
     got = execute_torch(graph, inputs, package).outputs["y"]
     np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_torch_interleaved_partial_rope_matches_numpy_reference():
+    rng = np.random.default_rng(23)
+    x = rng.standard_normal((2, 3, 4, 8)).astype(np.float32)
+    positions = np.array([[0, 2, 3, 5]], dtype=np.int64)
+    graph = Graph(
+        name="interleaved-rope-parity",
+        inputs={"x": TensorType.of((2, 3, 4, 8)), "positions": TensorType.of((1, 4), "int64")},
+    )
+    graph.add_node(
+        "rope",
+        "rope",
+        {"x": Ref("input:x"), "positions": Ref("input:positions")},
+        {"theta": 10000.0, "rotary_dim": 4, "interleaved": True},
+    )
+    graph.set_output("y", Ref("rope"))
+    package = WeightPackage.from_arrays({})
+    inputs = {"x": x, "positions": positions}
+
+    expected = execute(graph, inputs, package).outputs["y"]
+    got = execute_torch(graph, inputs, package).outputs["y"]
+    np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-7)
 
 
 def test_torch_repeat_kv_matches_numpy_reference():

@@ -1,7 +1,7 @@
 # P2 — Reconstructed model execution and modification validation
 
-P1 imports and reconstructs GPT-2/Llama checkpoints. P2 makes the resulting
-artifact a usable model object rather than an import report:
+P1 imports and reconstructs GPT-2, Llama, OPT and GPT-NeoX checkpoints. P2 makes
+the resulting artifact a usable model object rather than an import report:
 
 1. **Execute** the validated graph stored in an imported artifact.
 2. **Modify** its immutable weight package through the existing registered
@@ -28,10 +28,62 @@ result = client.forward_model(
 )
 ```
 
-The result contains the graph name, input/output shapes and dtypes, and the
-operation count. `include_values=True` additionally returns the output arrays.
-An artifact without a stored graph is refused with
-`operation.invalid_parameters`; no architecture is guessed.
+The result contains the graph name, input/output shapes and dtypes, the
+operation count, and a `captured` map. `include_values=True` additionally returns
+the output and captured arrays. An artifact without a stored graph is refused
+with `operation.invalid_parameters`; no architecture is guessed.
+
+## Per-layer activation capture
+
+Pass `capture=` to `forward_model()` or `forward_text()` to capture NIR node
+outputs during the same forward pass:
+
+```python
+execution = client.forward_model(
+    imported["artifact_id"],
+    tokens=[[0, 1, 2, 3]],
+    capture="layers",
+    include_values=True,
+)
+execution["captured"]["l0_res2"]["shape"]   # [1, 4, d_model]
+execution["captured"]["l0_res2"]["values"]  # present with include_values=True
+```
+
+`capture="layers"` resolves the reconstructed transformer block outputs named
+`l<N>_res2`, in numeric layer order. An explicit list of NIR node ids is also
+accepted. Unknown nodes raise `operation.invalid_parameters` rather than
+returning an empty capture. The same option is available through the REST
+forward routes (`"capture": ["layers"]`), the CLI (`--capture layers`), and the
+MCP forward tools.
+
+## Layer-by-layer Hugging Face parity
+
+The optional parity helpers compare every reconstructed block output with the
+corresponding Hugging Face transformer block, not just the final logits:
+
+```python
+from uzen.core.wie.parity import (
+    compare_gpt2_activations,
+    compare_llama_activations,
+    compare_neox_activations,
+    compare_opt_activations,
+)
+
+report = compare_gpt2_activations(graph, package, local_checkpoint, tokens=[[0, 1, 2, 3]])
+report["passed"]
+report["max_abs_error"]
+report["layers"][0]["node"]          # l0_res2
+report["layers"][0]["max_abs_error"]
+```
+
+GPT-2 uses `transformers.GPT2LMHeadModel.transformer.h`, Llama uses
+`transformers.LlamaForCausalLM.model.layers`, OPT uses
+`transformers.OPTForCausalLM.model.decoder.layers`, and GPT-NeoX uses
+`transformers.GPTNeoXForCausalLM.gpt_neox.layers`. Forward hooks capture each
+block's real output; the comparison does not depend on the version-specific
+`hidden_states` tuple layout. Each layer records its node id, shape, tolerance
+result, and absolute/relative errors. The gated live suite compares all four
+tiny Hub fixtures layer by layer.
 
 ## Tokenizer-backed text inference
 
@@ -65,6 +117,98 @@ so modified artifacts keep text inference.
 The REST endpoint is `POST /v1/models/{artifact_id}/forward-text`, the CLI form is
 `uzen forward ARTIFACT_ID --text 'hello world'`, and MCP exposes
 `uzen.forward_text`.
+
+## Autoregressive generation
+
+`generate_text()` supports three decoding strategies. `greedy` selects the
+highest-logit token. `sample` draws from the temperature-scaled distribution with
+optional top-k and nucleus (top-p) truncation; a seed makes the sequence
+reproducible. `beam` scores complete hypotheses by cumulative log-probability and
+returns the best beam. For decoder-only graphs without learned positional tables
+(Llama, Mistral, GPT-NeoX and the Llama-like profile graphs), greedy and sampled
+decoding prefill the prompt once into an in-memory K/V cache and then run one
+single-token decode per generated token. Graphs with learned position embeddings
+(GPT-2, OPT) and beam search use full-sequence recomputation.
+
+```python
+generated = client.generate_text(
+    imported["artifact_id"],
+    text="hello world",
+    max_new_tokens=8,
+    strategy="sample",  # greedy | sample | beam
+    temperature=0.8,
+    top_k=50,
+    top_p=0.9,
+    seed=123,
+    num_beams=1,
+)
+generated["generated_text"]
+generated["full_text"]
+generated["generated_token_ids"]
+generated["stopped_reason"]  # eos_token | max_new_tokens | max_sequence_length
+generated["strategy"], generated["seed"]
+```
+
+`top_k` and `top_p` apply only to `sample`. `num_beams` greater than one requires
+`strategy="beam"`. Beam search has no length penalty and does not use the K/V
+cache; it is intended for deterministic best-hypothesis selection, not fast
+long-context decoding.
+
+EOS is taken from an explicit `eos_token_id` or inferred from the tokenizer's
+declared special tokens. The context limit comes from the graph's stored
+`spec.max_seq_len` (or GPT-2's position-embedding shape); generation stops before
+exceeding it. Explicit prompt `positions` are extended by one per generated token.
+
+REST uses `POST /v1/models/{artifact_id}/generate-text`, the CLI uses
+`uzen generate-text ARTIFACT_ID --text 'hello world' --max-new-tokens 8`, and MCP
+exposes `uzen.generate_text`; all three accept the strategy, temperature, top-k,
+top-p, seed and num-beams options. Add `--quantize int8` (CLI) or
+`"quantize": "int8"` (REST/MCP) to quantize the execution copy once.
+
+## Weight-only int8 execution
+
+`quantize_int8()` derives an execution copy of a graph and package: 2-D float
+weights used only by `linear` nodes are stored as symmetric int8 values in
+`[-127, 127]` with one float32 scale per output channel. The graph's linear
+nodes are rewritten to `quantized_linear`, which dequantizes weights at run time;
+activations, biases, embeddings and normalization weights stay floating point.
+Weights shared with a non-linear operator are left unchanged and listed as
+excluded rather than quantized inconsistently.
+
+```python
+from uzen.core.wie.quantization import quantize_int8
+
+quantized = quantize_int8(graph, package)
+quantized.report.to_dict()   # per-tensor scales, bytes, errors, exclusions
+result = quantized.execute({"tokens": tokens, "positions": positions})
+```
+
+Persist a variant with `client.quantize_model(artifact_id, scheme="int8")`,
+`uzen quantize ARTIFACT_ID --scheme int8`, the MCP `uzen.quantize_model` tool, or
+`POST /v1/models/{id}/quantize`. The new artifact stores the int8 graph, lineage
+parent and full quantization report, and can be forwarded or generated from
+directly without quantizing again. `client.compare_quantized_model(source_id,
+variant_id, tokens=..., atol=..., rtol=...)` and
+`POST /v1/models/compare-quantized` report per-output drift between the source and
+its variant; the comparison requires the variant's recorded parent to match the
+supplied source.
+
+Stored-model execution can select the same transform explicitly. The SDK's
+`forward_model(..., quantize="int8")`, `forward_text(..., quantize="int8")` and
+`generate_text(..., quantize="int8")` return the report under `quantization`; the
+matching REST bodies for `/v1/models/{id}/forward`, `/forward-text` and
+`/generate-text` accept `"quantize": "int8"` and include the same report. The CLI
+uses `--quantize int8` on `forward` and `generate-text`, and the MCP tools expose
+the same `quantize` field. Generation quantizes its execution copy once before
+prefill, then reuses it for cached decoding or beam scoring. Unquantized responses carry `"quantization": null`, so
+callers can distinguish an omitted transform from a quantized execution.
+
+The report records the scheme, axis, zero point, scale count/min/max/SHA-256,
+original and quantized bytes, bits per weight, saturation count, maximum and mean
+absolute reconstruction error, compression ratio and graph-validation status.
+It is also stored under `metadata.quantization` on the derived package and graph.
+This is weight-only quantization: it does not claim int8 activations, GGUF block
+formats or bit-identical output.
 
 ## Modifying a real model
 
@@ -100,45 +244,80 @@ reports, per output:
 
 The top-level result contains `passed`, `tolerances`, source/candidate artifact
 IDs, and the input shapes. A shape or output-name mismatch is reported, never
-silently coerced.
+silently coerced. It also includes an aggregate `drift` object with element-count
+weighted `mean_abs_error`, `max_abs_error`, `max_rel_error`, output/element
+counts, completeness, `allclose_passed`, `failed_outputs`, and threshold
+failures. Optional `max_abs_error_threshold`, `mean_abs_error_threshold` and
+`max_rel_error_threshold` arguments add explicit aggregate failure limits
+without replacing the per-output `atol`/`rtol` checks. The same three limits are
+available on both comparison interfaces: `compare-models` accepts
+`--max-abs-error-threshold`, `--mean-abs-error-threshold` and
+`--max-rel-error-threshold`, while the MCP `uzen.compare_models` and
+`uzen.compare_quantized_model` tools accept the equivalent snake-case fields.
 
 Parent IDs are deduplicated, so interpolating a model with itself records the
 source once in lineage.
+
+## Exporting a modified artifact
+
+Safetensors exports embed the stored NIR graph under the `uzen.graph` metadata
+key. Re-importing the file through `import_weights` or `uzen import` validates
+that graph against the reloaded tensors before storing it, so the new artifact
+executes without its parent artifact's manifest. Tokenizer documents and the
+original configuration are not embedded; text inference still requires the
+original import or a separate tokenizer sidecar.
 
 ## Interfaces
 
 REST:
 
 * `POST /v1/models/{artifact_id}/forward`
+* `POST /v1/models/{artifact_id}/quantize`
 * `POST /v1/models/compare`
+* `POST /v1/models/compare-quantized`
 
 Python SDK:
 
-* `forward_model(...)`
+* `forward_model(..., capture="layers")`
+* `quantize_model(...)`
 * `compare_models(...)`
+* `compare_quantized_model(...)`
 
 CLI:
 
 ```bash
 uzen forward ARTIFACT_ID --tokens '[[0,1,2,3]]'
 uzen compare-models SOURCE CANDIDATE --tokens '[[0,1,2,3]]'
+uzen compare-quantized SOURCE QUANTIZED --tokens '[[0,1,2,3]]' \
+  --max-abs-error-threshold 0.01
 ```
 
 MCP:
 
 * `uzen.forward_model`
 * `uzen.compare_models`
+* `uzen.compare_quantized_model`
 
 ## Limits
 
 * Execution is for causal-LM graphs with `tokens` and optional `positions`
-  inputs, which are the graphs produced by the current GPT-2/Llama adapters.
+  inputs, which are the graphs produced by the current GPT-2/Llama/OPT/GPT-NeoX
+  adapters and the explicit Llama-like profile graphs.
 * Text inference requires `tokenizer.json` plus the optional `tokenizers` runtime;
   `vocab.json`/`merges.txt`-only and `tokenizer.model`-only imports are refused.
-* There is no KV cache; each forward pass recomputes the supplied sequence.
-* Text inference runs a forward pass and returns logits; autoregressive text
-  generation/sampling is not implemented.
+* The K/V cache is process-local and generation-scoped; it is not a paged or
+  disk-backed cache, and cached decoding is limited to decoder self-attention
+  graphs whose positions are carried by RoPE or explicit inputs. Cross-attention
+  graphs are not cached.
+* Beam search is exhaustive full-sequence scoring with raw cumulative
+  log-probability and no length penalty; it does not use the K/V cache and is
+  not a paged or batched beam implementation.
+* Prompt and generated tokens are limited to the graph's stored maximum sequence
+  length.
 * A modification that changes parameter structure is not comparable as the same
   model and is refused by `compare_models` rather than coerced.
 * Numerical closeness is evidence for the stated inputs and tolerances, not a
   claim of semantic equivalence.
+* Layer parity requires a locally available Hugging Face checkpoint plus
+  `transformers` and `torch`; it is validated only for the explicit GPT-2, Llama,
+  OPT and GPT-NeoX adapters.

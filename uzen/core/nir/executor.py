@@ -42,6 +42,27 @@ class ExecutionLimits:
 
 
 @dataclass
+class KVCache:
+    """In-memory K/V cache for decoder-only attention graphs.
+
+    Keys are attention node ids. Values are the post-head-layout tensors used by
+    the attention kernel, so grouped-query repeats are cached once per node.
+    The cache is intentionally process-local and is cleared by the caller between
+    independent sequences.
+    """
+
+    keys: dict[str, np.ndarray] = field(default_factory=dict)
+    values: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.keys.clear()
+        self.values.clear()
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+
+@dataclass
 class ExecutionResult:
     outputs: dict[str, np.ndarray]
     intermediates: dict[str, np.ndarray] = field(default_factory=dict)
@@ -120,6 +141,7 @@ def execute(
     check_finite: bool = True,
     validate_types: bool = True,
     limits: ExecutionLimits | None = None,
+    cache: KVCache | None = None,
 ) -> ExecutionResult:
     """Run a graph forward on concrete inputs."""
     package: WeightPackage | None = None
@@ -196,7 +218,8 @@ def execute(
         node = graph.nodes[nid]
         op = get_operator(node.op)
         in_arrays: list[np.ndarray] = []
-        for port in port_order(op, node.inputs):
+        ports = port_order(op, node.inputs)
+        for port in ports:
             ref = node.inputs[port]
             key = _key(ref)
             if key not in env:
@@ -204,6 +227,26 @@ def execute(
                     f"node '{nid}': missing value for input port '{port}' ({ref})"
                 )
             in_arrays.append(env[key])
+        cached_k: np.ndarray | None = None
+        cached_v: np.ndarray | None = None
+        if cache is not None and node.op == "attention":
+            if len(in_arrays) != 3:
+                raise ShapeMismatch("K/V caching requires attention(q, k, v)")
+            current_k, current_v = in_arrays[1], in_arrays[2]
+            if nid in cache.keys:
+                previous_k = cache.keys[nid]
+                previous_v = cache.values[nid]
+                if previous_k.ndim != current_k.ndim or previous_v.ndim != current_v.ndim:
+                    raise ShapeMismatch(f"cached K/V rank mismatch at attention node '{nid}'")
+                if previous_k.shape[:2] != current_k.shape[:2] or previous_k.shape[3] != current_k.shape[3]:
+                    raise ShapeMismatch(f"cached K shape {previous_k.shape} is incompatible with {current_k.shape}")
+                if previous_v.shape != previous_k.shape:
+                    raise ShapeMismatch(f"cached V shape {previous_v.shape} != cached K shape {previous_k.shape}")
+                current_k = np.concatenate([previous_k, current_k], axis=2)
+                current_v = np.concatenate([previous_v, current_v], axis=2)
+            cached_k, cached_v = current_k, current_v
+            in_arrays[1] = current_k
+            in_arrays[2] = current_v
         kwargs = bound.get(nid, {})
         params = _resolve_params(node.params, symbol_env)
         try:
@@ -241,6 +284,9 @@ def execute(
                     f"node '{nid}' ({node.op}) produced non-finite values"
                 )
             env[f"{nid}:{i}"] = arr
+        if cache is not None and cached_k is not None and cached_v is not None:
+            cache.keys[nid] = np.array(cached_k, copy=True)
+            cache.values[nid] = np.array(cached_v, copy=True)
         if nid in captures:
             captured[nid] = np.array(outs[0], copy=True)
         _check_total_bytes(limits, env)

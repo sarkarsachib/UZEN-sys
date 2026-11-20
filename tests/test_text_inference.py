@@ -9,7 +9,10 @@ import pytest
 
 from tests.test_gpt2_reconstruction import _write_gpt2
 from tests.test_llama_reconstruction import _write_llama
-from uzen.core.wie.tokenization import tokenizer_spec_from_manifest
+from uzen.core.wie.tokenization import (
+    legacy_bpe_tokenizer_json,
+    tokenizer_spec_from_manifest,
+)
 from uzen.errors import InvalidOperationParameters
 from uzen.interfaces.cli.main import main as cli_main
 from uzen.interfaces.mcp.server import MCPServer
@@ -66,6 +69,61 @@ def _llama_text_client(tmp_path):
     return client, imported["artifact_id"]
 
 
+def test_legacy_bpe_tokenizer_without_model_type_is_supported(tmp_path):
+    root, _arrays = _write_gpt2(tmp_path / "legacy-tokenizer")
+    _write_text_tokenizer(root, 16, metaspace=False)
+    tokenizer_file = root / "tokenizer.json"
+    document = json.loads(tokenizer_file.read_text())
+    document["model"].pop("type")
+    tokenizer_file.write_text(json.dumps(document))
+
+    client = Uzen(root=tmp_path / "legacy-tokenizer-workspace")
+    imported = client.import_model(root)
+    artifact_id = imported["artifact_id"]
+    spec = client.artifact(artifact_id)["metadata"]["tokenizer"]
+    assert spec["model_type"] == "BPE"
+
+    result = client.forward_text(artifact_id, text="hello world")
+    assert result["tokens"][0]
+    assert result["outputs"]["logits"]["shape"][0] == 1
+
+
+def test_legacy_vocab_and_merges_are_assembled_into_a_tokenizer(tmp_path):
+    root = tmp_path / "legacy-bpe"
+    root.mkdir()
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=32,
+        special_tokens=["<unk>"],
+        show_progress=False,
+        min_frequency=1,
+    )
+    tokenizer.train_from_iterator(
+        ["hello world", "hello there", "the world is wide", "a small model"],
+        trainer=trainer,
+    )
+    document = json.loads(tokenizer.to_str())
+    (root / "vocab.json").write_text(json.dumps(document["model"]["vocab"]))
+    (root / "merges.txt").write_text(
+        "#version: 0.2\n"
+        + "\n".join(" ".join(pair) for pair in document["model"]["merges"])
+        + "\n"
+    )
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"unk_token": "<unk>", "add_prefix_space": False})
+    )
+
+    assembled = legacy_bpe_tokenizer_json(root)
+
+    assert assembled is not None
+    loaded = Tokenizer.from_str(assembled.decode("utf-8"))
+    encoding = loaded.encode("hello world")
+    assert encoding.ids
+    assert loaded.decode(encoding.ids) == "hello world"
+
+
 def test_gpt2_text_inference_uses_stored_tokenizer(tmp_path):
     client, artifact_id = _gpt2_text_client(tmp_path)
     manifest = client.artifact(artifact_id)
@@ -94,6 +152,19 @@ def test_gpt2_text_inference_uses_stored_tokenizer(tmp_path):
     )
 
 
+def test_text_forward_captures_layer_outputs(tmp_path):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    result = client.forward_text(
+        artifact_id,
+        text="hello world",
+        capture="layers",
+        include_values=True,
+    )
+
+    assert result["captured"]["l0_res2"]["shape"][0] == 1
+    assert np.asarray(result["captured"]["l0_res2"]["values"]).ndim == 3
+
+
 def test_modified_model_keeps_text_tokenizer(tmp_path):
     client, source_id = _gpt2_text_client(tmp_path)
     modified = client.modify(
@@ -112,6 +183,134 @@ def test_modified_model_keeps_text_tokenizer(tmp_path):
     assert candidate["outputs"]["logits"]["shape"] == source["outputs"]["logits"]["shape"]
 
 
+def test_gpt2_seeded_sampling_top1_matches_greedy(tmp_path):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    greedy = client.generate_text(artifact_id, text="hello world", max_new_tokens=3)
+    sampled = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=3,
+        strategy="sample",
+        temperature=0.5,
+        top_k=1,
+        seed=5,
+    )
+    assert greedy["generated_token_ids"] == sampled["generated_token_ids"]
+
+
+def test_generation_greedy_sample_top1_and_single_beam_are_equivalent(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    greedy = client.generate_text(
+        artifact_id, text="hello world", max_new_tokens=4, seed=7
+    )
+    sampled = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.8,
+        top_k=1,
+        seed=7,
+    )
+    beam = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="beam",
+        num_beams=1,
+        seed=7,
+    )
+    assert greedy["generated_token_ids"] == sampled["generated_token_ids"]
+    assert greedy["generated_token_ids"] == beam["generated_token_ids"]
+    assert greedy["strategy"] == "greedy"
+    assert sampled["strategy"] == "sample"
+    assert beam["strategy"] == "beam"
+
+
+def test_seeded_sampling_is_deterministic_and_beam_search_runs(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    first = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.9,
+        top_p=0.9,
+        seed=123,
+    )
+    second = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=4,
+        strategy="sample",
+        temperature=0.9,
+        top_p=0.9,
+        seed=123,
+    )
+    assert first["generated_token_ids"] == second["generated_token_ids"]
+    assert first["seed"] == 123
+    assert first["temperature"] == 0.9
+    assert first["top_p"] == 0.9
+
+    beam = client.generate_text(
+        artifact_id,
+        text="hello world",
+        max_new_tokens=3,
+        strategy="beam",
+        num_beams=3,
+    )
+    assert 0 <= beam["steps"] <= 3
+    assert beam["num_beams"] == 3
+    assert len(beam["full_token_ids"]) == len(beam["prompt_token_ids"]) + beam["steps"]
+    assert beam["stopped_reason"] in {"eos_token", "max_new_tokens", "max_sequence_length"}
+
+
+def test_quantized_generation_is_exposed_through_sdk_and_rest(tmp_path):
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from uzen.interfaces.api.app import create_app
+
+    client, artifact_id = _llama_text_client(tmp_path)
+    generated = client.generate_text(
+        artifact_id, text="hello world", max_new_tokens=2, quantize="int8"
+    )
+    report = generated["quantization"]
+    assert report["schema"] == "uzen.quantization/1"
+    assert report["num_rewritten_nodes"] > 0
+    assert report["graph_valid"] is True
+    assert len(generated["full_token_ids"]) == len(generated["prompt_token_ids"]) + generated["steps"]
+
+    service_generation = client.service.generate_text(
+        artifact_id, text="hello world", max_new_tokens=2, quantize="int8"
+    )
+    assert service_generation.quantization == report
+
+    api = fastapi_testclient.TestClient(create_app(service=client.service))
+    response = api.post(
+        f"/v1/models/{artifact_id}/generate-text",
+        json={"text": "hello world", "max_new_tokens": 2, "quantize": "int8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["quantization"]["schema"] == "uzen.quantization/1"
+    assert body["quantization"]["num_rewritten_nodes"] == report["num_rewritten_nodes"]
+
+
+def test_generation_rejects_inconsistent_sampling_options(tmp_path):
+    client, artifact_id = _llama_text_client(tmp_path)
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="sample", temperature=0
+        )
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="greedy", num_beams=2
+        )
+    with pytest.raises(InvalidOperationParameters):
+        client.generate_text(
+            artifact_id, text="hello", max_new_tokens=1, strategy="sample", top_p=0
+        )
+
+
 def test_llama_text_inference_with_positions(tmp_path):
     client, artifact_id = _llama_text_client(tmp_path)
     result = client.forward_text(
@@ -128,6 +327,67 @@ def test_llama_text_inference_with_positions(tmp_path):
 def test_text_inference_refuses_missing_tokenizer():
     with pytest.raises(InvalidOperationParameters, match="no stored tokenizer"):
         tokenizer_spec_from_manifest({"metadata": {"graph": {}}})
+
+
+def test_persisted_quantized_variant_keeps_tokenizer_and_generates(tmp_path):
+    client, source_id = _llama_text_client(tmp_path)
+    source_tokenizer = client.artifact(source_id)["metadata"]["tokenizer"]
+    variant = client.quantize_model(source_id)
+    variant_id = variant["artifact_id"]
+
+    manifest = client.artifact(variant_id)
+    assert manifest["metadata"]["tokenizer"] == source_tokenizer
+    assert manifest["metadata"]["quantization"]["schema"] == "uzen.quantization/1"
+
+    generated = client.generate_text(
+        variant_id, text="hello world", max_new_tokens=2
+    )
+    assert generated["quantization"] == variant["quantization"]
+    assert len(generated["full_token_ids"]) == (
+        len(generated["prompt_token_ids"]) + generated["steps"]
+    )
+
+
+def test_cli_and_mcp_generate_support_int8(tmp_path, capsys):
+    client, artifact_id = _gpt2_text_client(tmp_path)
+    status = cli_main(
+        [
+            "--root",
+            str(client.service.root),
+            "generate-text",
+            artifact_id,
+            "--text",
+            "hello world",
+            "--max-new-tokens",
+            "2",
+            "--quantize",
+            "int8",
+        ]
+    )
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quantization"]["schema"] == "uzen.quantization/1"
+    assert payload["quantization"]["num_rewritten_nodes"] > 0
+
+    server = MCPServer(root=client.service.root)
+    called = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "uzen.generate_text",
+                "arguments": {
+                    "artifact_id": artifact_id,
+                    "text": "hello world",
+                    "max_new_tokens": 2,
+                    "quantize": "int8",
+                },
+            },
+        }
+    )
+    mcp_payload = json.loads(called["result"]["content"][0]["text"])
+    assert mcp_payload["quantization"]["schema"] == "uzen.quantization/1"
 
 
 def test_rest_mcp_and_cli_text_forward(tmp_path, capsys):
