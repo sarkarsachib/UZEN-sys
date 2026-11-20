@@ -19,10 +19,11 @@ listed gate passes.
 | **N2** | Native graph compiler: lower NIR to a native execution plan, fuse linear+activation and residual+norm, prepack weights, add conv/pool/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, liveness memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | **implemented** |
 | **N4** | Distributed execution: durable queue adapter, capability-aware worker scheduling, leases with expiry and attempts, priority and backoff, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite verified across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
-| **N5** | GPU/native boundary: real CUDA/HIP kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | planned; **no GPU acceleration is claimed now** |
+| **N5** | GPU/native boundary: real CUDA kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | **implemented at the CUDA boundary** (17 kernels compile to PTX with NVRTC and assemble with `ptxas`; driver-API runtime and GPU tests present; execution not verified in the authoring environment because it has no driver/device; HIP not implemented) |
 | **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
 
-N5 is the next phase. N5–N6 build on N2's plan and N3's layouts and are not started.
+N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
+a machine with a device. N6 is not started.
 
 ## N1 — implemented native CPU layer
 
@@ -530,12 +531,66 @@ exactly one artifact.
 9. **Native layouts are advertised only when a built kernel library resolves** — a
    worker without one never claims representation work.
 
-## N5–N6 boundaries
+## N5 — implemented CUDA device boundary
 
-* **N5** is the only phase allowed to claim GPU execution, and only with real
-  kernels, device transfer tests and measurements. Device *requirements* already route
-  jobs (a `cuda` job stays queued until a worker advertises CUDA), but no CUDA kernel
-  exists.
-* **N6** builds research campaigns on the deterministic engines; candidate
-  generation may be autonomous, but every candidate still passes the same
-  STRICT_PLUS, validation and provenance path.
+N5 is the only phase allowed to claim GPU execution. It claims it only when kernels
+were compiled, loaded through `libcuda` and launched on a device. The authoring host
+has no driver or device, so the honest summary is: **17 real kernels, compiled and
+PTX-assembled; device execution not verified here; no speed claim.**
+
+See [N5_CUDA.md](N5_CUDA.md) for the full design, kernel table and limitations.
+
+### What is implemented
+
+* `uzen/runtimes/cuda/kernels.cu`: float32 linear/matmul, layernorm, rmsnorm,
+  softmax, GELU (tanh/exact), SiLU, ReLU, tanh, sigmoid, same-shape add/sub/mul,
+  scale, clip, embedding, last-axis mean/sum and masked attention with the CPU
+  runtime's causal offset, symmetric window and ALiBi semantics.
+* `uzen/runtimes/cuda/nvrtc.py`: compiles the checked-in source with NVRTC when no
+  toolkit exists, or with `nvcc` when it does. The cache key is the source digest
+  plus architecture; the report names the compiler and says whether it was cached.
+* `uzen/runtimes/cuda/driver.py`: ctypes binding to the CUDA driver API
+  (`cuInit`, device attributes, context, module load, function lookup, allocation,
+  copies, launch, synchronize), with typed driver errors.
+* `uzen/runtimes/cuda/allocator.py`: size-class pool, no double free, live/peak/
+  reserved bytes and H2D/D2H accounting.
+* `uzen/runtimes/cuda/executor.py`: NIR dispatch, resident weights keyed by package
+  fingerprint, lifetime-based activation release, host-side layout operators that are
+  reported separately, and output/capture download with finite checks.
+* `uzen/runtimes/cuda/runtime.py`: capabilities, `execution_verified` only after a
+  real run, and an explicit fallback policy — `fallback="error"` refuses without a
+  device, `fallback="cpu"` runs NumPy and labels the result `numpy-fallback`.
+
+### Build and verify
+
+```bash
+python -m uzen.runtimes.cuda.build --json
+python -m pytest -o addopts="" -q tests/test_cuda_runtime.py
+python examples/cuda_device_demo.py --root /tmp/uzen-cuda-demo
+```
+
+On this host the suite reports **10 passed, 4 skipped** and the demo ends
+`RESULT: SKIPPED (no CUDA device; kernels compiled to PTX only)`. The four skips are
+the GPU parity tests (MLP, transformer with attention capture, weight residency,
+attention mask semantics), not fakes. The compile tests run and `ptxas` assembles the
+PTX, so kernel syntax and PTX validity are checked without a device.
+
+### Honest limitations
+
+1. No GPU execution, timing or memory measurement is claimed from this host.
+2. CUDA only; there is no HIP/ROCm backend.
+3. float32 only; no tensor cores, half precision or TF32.
+4. Naive GEMM and attention kernels; no cuBLAS/FlashAttention comparison is implied.
+5. Elementwise `add/sub/mul` require identical shapes; broadcasting is refused.
+6. Layout operators round-trip through host memory and are reported as layout work.
+7. One context, one device, default stream; no CUDA graphs or multi-GPU.
+8. Dynamic shared-memory scores cap attention near 12k keys on older architectures.
+9. `quantized_linear` and N3 int4/int8/sparse layouts are refused on this path.
+10. Toolkit-free compilation needs the NVRTC wheel; execution still needs the vendor
+    driver. A driver older than the PTX target fails with `runtime.cuda_kernel`.
+
+## N6 boundary
+
+N6 builds research campaigns on the deterministic engines; candidate generation may
+be autonomous, but every candidate still passes the same STRICT_PLUS, validation and
+provenance path. No campaign engine is started.

@@ -55,8 +55,9 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Native graph compiler (fusion, prepacked blocked GEMM, liveness buffer planner) | **implemented**; plans fuse linear+bias+activation and residual+norm, prepack linear weights and reuse dead buffer slots, with parity tests per family |
 | Native conv/pool, RNN/LSTM/GRU, SSM, GCN, sparse-MoE and int8 quantized-linear kernels | **implemented** in the compiled plan path; seeded sampling operators are refused |
 | Native parameter representations: block int8, block int4, low-rank factors, CSR sparse and transposed layouts | **implemented** as per-weight layouts chosen at compile time, each with packed-byte, bits/weight, reconstruction-error and digest provenance; lossy layouts report their measured error instead of claiming to be exact |
+| CUDA device runtime: 17 float32 kernels, NVRTC/nvcc PTX build, driver-API launches, pooled device allocator, weight residency | **implemented and compile-verified** (NVRTC 12.4 PTX + ptxas assembly); **GPU execution not verified in the authoring environment** (no driver/device), and no speed claim is made |
 | Embedded ONNX runtime / GGUF quantized tensor types | **planned** (typed refusal, no simulation) |
-| Rust integration / CUDA kernels | **planned** — UZEN never claims GPU acceleration it does not have |
+| Rust integration | **planned** |
 | S3-compatible object-store artifact transport | **implemented** (stdlib SigV4 client, streamed single/multipart uploads, SHA-256 and tensor-fingerprint verification, parent lineage and tokenizer sidecars; validated against a real S3-compatible server) |
 | LLM-assisted planning | **implemented when an OpenAI-compatible endpoint is configured** |
 
@@ -66,8 +67,8 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N4
-are implemented; the rest are designs, not partially working claims.
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N5
+are implemented at their stated level; N6 is a design, not a partially working claim.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -75,10 +76,11 @@ are implemented; the rest are designs, not partially working claims.
 | **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block int8/int4 with group scales, low-rank factors, CSR sparse and transposed layouts, representation-aware execution | **implemented** |
 | **N4** | Durable distributed queue/scheduler, capability-aware worker routing, priority and aging, leases with expiry, backoff and attempts, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
-| **N5** | Real CUDA/HIP kernels and a device boundary; no GPU claim before kernels exist | planned |
+| **N5** | CUDA kernels and a device boundary: 17 real kernels, NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
 | **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |
 
-See [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
+See [docs/N5_CUDA.md](docs/N5_CUDA.md) for the CUDA kernels, build, fallback policy and
+limitations, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
 measurements and limitations.
 
 ---
