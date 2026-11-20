@@ -18,6 +18,14 @@ from .library import (
     resolve_library_path,
 )
 from .plan_executor import NativePlanExecution, execute_compiled, execute_plan
+from .representations import (
+    REPRESENTATION_KINDS,
+    NativeWeight,
+    RepresentationReport,
+    normalize_representations,
+    prepare_representation,
+    prepare_weight,
+)
 from .runtime import NativeRuntime, native_library_path, native_runtime_available
 
 __all__ = [
@@ -29,9 +37,12 @@ __all__ = [
     "NativePlan",
     "NativePlanExecution",
     "NativeRuntime",
+    "NativeWeight",
     "PLAN_OPS",
+    "REPRESENTATION_KINDS",
     "PackedWeight",
     "PlanStep",
+    "RepresentationReport",
     "build_native_library",
     "compile_native_plan",
     "default_cache_path",
@@ -42,5 +53,8 @@ __all__ = [
     "native_compiler",
     "native_library_path",
     "native_runtime_available",
+    "normalize_representations",
+    "prepare_representation",
+    "prepare_weight",
     "resolve_library_path",
 ]

@@ -15,6 +15,11 @@ steps over explicitly allocated buffers. Compared with the direct executor
 
 Coverage is explicit: an operator the plan cannot execute raises
 ``UnsupportedOperator`` at compile time. Nothing falls back silently at run time.
+
+Phase N3 adds representation-aware execution: ``representations`` maps a weight
+name to a native layout (``dense_blocked``, ``transposed``, ``int8_block``,
+``int4_block``, ``low_rank``, ``sparse_csr``). The plan records the request, packs
+that weight once and the executor dispatches to the kernel for its layout.
 """
 
 from __future__ import annotations
@@ -33,6 +38,12 @@ from uzen.errors import (
     InvalidOperationParameters,
     ShapeMismatch,
     UnsupportedOperator,
+)
+
+from .representations import (
+    normalize_representations,
+    prepare_weight,
+    representation_key,
 )
 
 GRAPH_INPUT = "input:"
@@ -248,9 +259,10 @@ class NativePlan:
     fusions: list[dict[str, Any]]
     prepack_names: tuple[str, ...]
     symbolic_shapes: dict[str, tuple[Any, ...]]
+    representations: dict[str, dict[str, Any]] = field(default_factory=dict)
     _bound: dict[tuple[Any, ...], BoundPlan] = field(default_factory=dict, repr=False)
     _packed: dict[str, Any] = field(default_factory=dict, repr=False)
-    _packed_key: str | None = field(default=None, repr=False)
+    _packed_key: Any | None = field(default=None, repr=False)
 
     # ------------------------------------------------------------------ #
     # inspection
@@ -287,9 +299,19 @@ class NativePlan:
             "fused_steps": self.fused_steps(),
             "fusions": list(self.fusions),
             "prepacked_weights": list(self.prepack_names),
+            "representations": {
+                name: dict(options) for name, options in self.representations.items()
+            },
+            "prepared_representations": {
+                name: weight.kind for name, weight in self._packed.items()
+            },
             "bound_variants": len(self._bound),
             "float32_only": True,
         }
+
+    def representation_summary(self) -> dict[str, dict[str, Any]]:
+        """Per-weight representation reports for the most recent package."""
+        return {name: weight.describe() for name, weight in self._packed.items()}
 
     # ------------------------------------------------------------------ #
     # binding and weights
@@ -324,16 +346,22 @@ class NativePlan:
         return bound
 
     def prepare_weights(self, package: WeightPackage, library: Any) -> dict[str, Any]:
-        """Prepack linear weights once per package fingerprint."""
-        key = package.fingerprint
+        """Prepare linear weights once per (package, representation) pair."""
+        key = (package.fingerprint, representation_key(self.representations))
         if self._packed_key == key and self._packed:
             return self._packed
-        packed = {
-            name: library.pack_weight(package.get(name)) for name in self.prepack_names
+        prepared = {
+            name: prepare_weight(
+                name,
+                package.get(name),
+                self.representations.get(name, {"kind": "dense_blocked"}),
+                library,
+            )
+            for name in self.prepack_names
         }
-        self._packed = packed
+        self._packed = prepared
         self._packed_key = key
-        return packed
+        return prepared
 
     def release_weights(self) -> None:
         self._packed = {}
@@ -626,12 +654,19 @@ def compile_native_plan(
     package: WeightPackage | None = None,
     *,
     fuse: bool = True,
+    representations: Mapping[str, Any] | None = None,
 ) -> NativePlan:
     """Lower a NIR graph into a native execution plan.
+
+    ``representations`` maps a linear weight name to a native layout, either as a
+    kind string or as a mapping with ``kind`` plus its options (``rank`` for
+    ``low_rank``, ``threshold`` for ``sparse_csr``). Weights that are not listed
+    use the exact blocked float32 layout.
 
     Raises :class:`UnsupportedOperator` for any operator the plan cannot run and
     :class:`GraphValidationError` when node shapes are not inferable.
     """
+    normalized = normalize_representations(representations)
     order = graph.topological_order()
     shapes = _symbolic_shapes(graph, package)
 
@@ -707,6 +742,9 @@ def compile_native_plan(
                     "weight": weight,
                     "bias": param_name(node.params.get("bias")),
                     "activation": graph.nodes[activation_node].op,
+                    "representation": normalized.get(weight, {}).get(
+                        "kind", "dense_blocked"
+                    ),
                 },
                 nodes=(node_id, activation_node),
             )
@@ -731,6 +769,9 @@ def compile_native_plan(
                     "weight": weight,
                     "bias": param_name(node.params.get("bias")),
                     "activation": "none",
+                    "representation": normalized.get(weight, {}).get(
+                        "kind", "dense_blocked"
+                    ),
                 },
                 nodes=(node_id,),
             )
@@ -963,6 +1004,14 @@ def compile_native_plan(
                 operator=op,
             )
 
+    requested = sorted(set(normalized) - prepack)
+    if requested:
+        raise InvalidOperationParameters(
+            f"representation requested for weight(s) {requested}, which no linear "
+            f"node of graph '{graph.name}' consumes; prepacked weights are "
+            f"{sorted(prepack)}"
+        )
+
     plan = NativePlan(
         graph=graph,
         steps=steps,
@@ -971,6 +1020,7 @@ def compile_native_plan(
         fusions=fusions,
         prepack_names=tuple(sorted(prepack)),
         symbolic_shapes=shapes,
+        representations=normalized,
     )
     # A plan whose steps produce no buffer at all is still valid (a graph that
     # only forwards an input), but a plan must materialize every declared output.

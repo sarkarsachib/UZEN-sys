@@ -54,6 +54,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Native NIR executor + runtime adapter | **implemented** for MLP and transformer-decoder graphs, parity-tested against NumPy; no silent fallback |
 | Native graph compiler (fusion, prepacked blocked GEMM, liveness buffer planner) | **implemented**; plans fuse linear+bias+activation and residual+norm, prepack linear weights and reuse dead buffer slots, with parity tests per family |
 | Native conv/pool, RNN/LSTM/GRU, SSM, GCN, sparse-MoE and int8 quantized-linear kernels | **implemented** in the compiled plan path; seeded sampling operators are refused |
+| Native parameter representations: block int8, block int4, low-rank factors, CSR sparse and transposed layouts | **implemented** as per-weight layouts chosen at compile time, each with packed-byte, bits/weight, reconstruction-error and digest provenance; lossy layouts report their measured error instead of claiming to be exact |
 | Embedded ONNX runtime / GGUF quantized tensor types | **planned** (typed refusal, no simulation) |
 | Rust integration / CUDA kernels | **planned** — UZEN never claims GPU acceleration it does not have |
 | S3-compatible object-store artifact transport | **implemented** (stdlib SigV4 client, streamed single/multipart uploads, SHA-256 and tensor-fingerprint verification, parent lineage and tokenizer sidecars; validated against a real S3-compatible server) |
@@ -65,14 +66,14 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. N1 and N2
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N3
 are implemented; the rest are designs, not partially working claims.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | **N1** | Native C++ CPU kernels, ctypes ABI, NIR executor, runtime adapter, parity tests, demo | **implemented** |
 | **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, memory planner | **implemented** |
-| **N3** | Advanced parameter representations (block int4/int8, sparse/low-rank native layouts) | planned |
+| **N3** | Advanced parameter representations: block int8/int4 with group scales, low-rank factors, CSR sparse and transposed layouts, representation-aware execution | **implemented** |
 | **N4** | Durable distributed queue/scheduler and capability-aware native workers | planned |
 | **N5** | Real CUDA/HIP kernels and a device boundary; no GPU claim before kernels exist | planned |
 | **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |

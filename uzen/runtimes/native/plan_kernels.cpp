@@ -8,7 +8,10 @@
 //   * convolution, pooling, recurrent (RNN/LSTM/GRU), state-space, graph
 //     convolution, sparse mixture-of-experts and int8 quantized linear kernels,
 //   * a single-pass (flash-style) attention kernel that never materializes the
-//     score matrix.
+//     score matrix,
+//   * alternative parameter representations (phase N3): group-wise int8 and int4
+//     weights with per-group scales, low-rank factors, CSR sparse weights and a
+//     transposed dense layout.
 //
 // Accumulation uses double precision where the NumPy reference does, storage is
 // float32. Every kernel refuses null pointers and non-positive dimensions.
@@ -751,6 +754,361 @@ int uzen_attention_flash_f32(const float* q, const float* k, const float* v, flo
                     }
                 }
             }
+        }
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------------- //
+// block-quantized weight layouts: int8 and int4 with group scales
+// ------------------------------------------------------------------------- //
+//
+// The reduction (input-feature) axis is split into groups of kBlockK values and
+// every (output feature, group) pair carries its own scale. Packing reuses the
+// kBlockK x kBlockN panels of the dense prepack, so one panel is exactly one
+// quantized group of one output block. Padding columns store weight 0 and scale
+// 1, which keeps a stray padded read inert.
+
+int uzen_int8_block_group() { return kBlockK; }
+
+int uzen_pack_weight_int8_block(const std::int8_t* wq, const float* scales,
+                                std::int8_t* packed, float* packed_scales,
+                                int out_features, int in_features) {
+    if (!valid(wq) || !valid(scales) || !valid(packed) || !valid(packed_scales) ||
+        out_features <= 0 || in_features <= 0) {
+        return 1;
+    }
+    const int nblocks = (out_features + kBlockN - 1) / kBlockN;
+    const int kblocks = (in_features + kBlockK - 1) / kBlockK;
+    for (int nb = 0; nb < nblocks; ++nb) {
+        for (int kb = 0; kb < kblocks; ++kb) {
+            const std::size_t panel_index = static_cast<std::size_t>(nb) * kblocks + kb;
+            std::int8_t* panel = packed + panel_index * kBlockK * kBlockN;
+            float* scale_panel = packed_scales + panel_index * kBlockN;
+            for (int nn = 0; nn < kBlockN; ++nn) {
+                const int o = nb * kBlockN + nn;
+                scale_panel[nn] =
+                    (o < out_features)
+                        ? scales[static_cast<std::size_t>(o) * kblocks + kb]
+                        : 1.0f;
+            }
+            for (int kk = 0; kk < kBlockK; ++kk) {
+                const int k = kb * kBlockK + kk;
+                std::int8_t* prow = panel + static_cast<std::size_t>(kk) * kBlockN;
+                for (int nn = 0; nn < kBlockN; ++nn) {
+                    const int o = nb * kBlockN + nn;
+                    prow[nn] = (k < in_features && o < out_features)
+                                   ? wq[static_cast<std::size_t>(o) * in_features + k]
+                                   : 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// y = activation(x @ (wq * scale)^T + b). Each group's partial dot product is
+// scaled before it is added to the accumulator, so no dequantized weight matrix
+// is ever materialized.
+int uzen_gemm_int8_block_f32(const float* x, const std::int8_t* packed,
+                             const float* packed_scales, const float* bias, float* out,
+                             int rows, int in_features, int out_features, int activation) {
+    if (!valid(x) || !valid(packed) || !valid(packed_scales) || !valid(out) || rows < 0 ||
+        in_features <= 0 || out_features <= 0) {
+        return 1;
+    }
+    if (rows == 0) {
+        return 0;
+    }
+    const int nblocks = (out_features + kBlockN - 1) / kBlockN;
+    const int kblocks = (in_features + kBlockK - 1) / kBlockK;
+#pragma omp parallel for schedule(static) if (rows > 1)
+    for (int row = 0; row < rows; ++row) {
+        const float* xrow = x + static_cast<std::size_t>(row) * in_features;
+        float* orow = out + static_cast<std::size_t>(row) * out_features;
+        for (int nb = 0; nb < nblocks; ++nb) {
+            double acc[kBlockN];
+            for (int nn = 0; nn < kBlockN; ++nn) {
+                acc[nn] = 0.0;
+            }
+            for (int kb = 0; kb < kblocks; ++kb) {
+                const std::size_t panel_index =
+                    static_cast<std::size_t>(nb) * kblocks + kb;
+                const std::int8_t* panel = packed + panel_index * kBlockK * kBlockN;
+                const float* scale_panel = packed_scales + panel_index * kBlockN;
+                const float* xblock = xrow + static_cast<std::size_t>(kb) * kBlockK;
+                const int kcount = std::min(kBlockK, in_features - kb * kBlockK);
+                double part[kBlockN];
+                for (int nn = 0; nn < kBlockN; ++nn) {
+                    part[nn] = 0.0;
+                }
+                for (int kk = 0; kk < kcount; ++kk) {
+                    const double value = xblock[kk];
+                    const std::int8_t* prow =
+                        panel + static_cast<std::size_t>(kk) * kBlockN;
+                    for (int nn = 0; nn < kBlockN; ++nn) {
+                        part[nn] += value * static_cast<double>(prow[nn]);
+                    }
+                }
+                for (int nn = 0; nn < kBlockN; ++nn) {
+                    acc[nn] += part[nn] * static_cast<double>(scale_panel[nn]);
+                }
+            }
+            const int base = nb * kBlockN;
+            const int count = std::min(kBlockN, out_features - base);
+            for (int nn = 0; nn < count; ++nn) {
+                const int o = base + nn;
+                double value = acc[nn];
+                if (bias) {
+                    value += static_cast<double>(bias[o]);
+                }
+                orow[o] = static_cast<float>(activate(value, activation));
+            }
+        }
+    }
+    return 0;
+}
+
+// int4 values travel as one unsigned nibble each (two's complement, 0..15) in a
+// (out_features, in_features) buffer. Packing pairs adjacent reduction values
+// into one byte: low nibble = k (even), high nibble = k + 1. A panel therefore
+// holds (kBlockK / 2) x kBlockN bytes.
+int uzen_pack_weight_int4_block(const std::uint8_t* q, const float* scales,
+                                std::uint8_t* packed, float* packed_scales,
+                                int out_features, int in_features) {
+    if (!valid(q) || !valid(scales) || !valid(packed) || !valid(packed_scales) ||
+        out_features <= 0 || in_features <= 0) {
+        return 1;
+    }
+    const int nblocks = (out_features + kBlockN - 1) / kBlockN;
+    const int kblocks = (in_features + kBlockK - 1) / kBlockK;
+    const int panel_bytes = (kBlockK / 2) * kBlockN;
+    for (int nb = 0; nb < nblocks; ++nb) {
+        for (int kb = 0; kb < kblocks; ++kb) {
+            const std::size_t panel_index = static_cast<std::size_t>(nb) * kblocks + kb;
+            std::uint8_t* panel = packed + panel_index * panel_bytes;
+            float* scale_panel = packed_scales + panel_index * kBlockN;
+            for (int nn = 0; nn < kBlockN; ++nn) {
+                const int o = nb * kBlockN + nn;
+                scale_panel[nn] =
+                    (o < out_features)
+                        ? scales[static_cast<std::size_t>(o) * kblocks + kb]
+                        : 1.0f;
+                const std::uint8_t* qrow =
+                    q + static_cast<std::size_t>(o) * in_features;
+                for (int pair = 0; pair < kBlockK / 2; ++pair) {
+                    const int k0 = kb * kBlockK + pair * 2;
+                    const int k1 = k0 + 1;
+                    const std::uint8_t low =
+                        (o < out_features && k0 < in_features) ? (qrow[k0] & 0x0F) : 0;
+                    const std::uint8_t high =
+                        (o < out_features && k1 < in_features) ? (qrow[k1] & 0x0F) : 0;
+                    panel[static_cast<std::size_t>(pair) * kBlockN + nn] =
+                        static_cast<std::uint8_t>(low | (high << 4));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int uzen_gemm_int4_block_f32(const float* x, const std::uint8_t* packed,
+                             const float* packed_scales, const float* bias, float* out,
+                             int rows, int in_features, int out_features, int activation) {
+    if (!valid(x) || !valid(packed) || !valid(packed_scales) || !valid(out) || rows < 0 ||
+        in_features <= 0 || out_features <= 0) {
+        return 1;
+    }
+    if (rows == 0) {
+        return 0;
+    }
+    const int nblocks = (out_features + kBlockN - 1) / kBlockN;
+    const int kblocks = (in_features + kBlockK - 1) / kBlockK;
+    const int panel_bytes = (kBlockK / 2) * kBlockN;
+#pragma omp parallel for schedule(static) if (rows > 1)
+    for (int row = 0; row < rows; ++row) {
+        const float* xrow = x + static_cast<std::size_t>(row) * in_features;
+        float* orow = out + static_cast<std::size_t>(row) * out_features;
+        for (int nb = 0; nb < nblocks; ++nb) {
+            double acc[kBlockN];
+            for (int nn = 0; nn < kBlockN; ++nn) {
+                acc[nn] = 0.0;
+            }
+            for (int kb = 0; kb < kblocks; ++kb) {
+                const std::size_t panel_index =
+                    static_cast<std::size_t>(nb) * kblocks + kb;
+                const std::uint8_t* panel = packed + panel_index * panel_bytes;
+                const float* scale_panel = packed_scales + panel_index * kBlockN;
+                const float* xblock = xrow + static_cast<std::size_t>(kb) * kBlockK;
+                const int kcount = std::min(kBlockK, in_features - kb * kBlockK);
+                double part[kBlockN];
+                for (int nn = 0; nn < kBlockN; ++nn) {
+                    part[nn] = 0.0;
+                }
+                for (int kk = 0; kk < kcount; kk += 2) {
+                    const int k0 = kk;
+                    const int k1 = kk + 1;
+                    const double x0 = xblock[k0];
+                    const double x1 = (k1 < kcount) ? xblock[k1] : 0.0;
+                    const std::uint8_t* byte_row =
+                        panel + static_cast<std::size_t>(kk / 2) * kBlockN;
+                    for (int nn = 0; nn < kBlockN; ++nn) {
+                        const std::uint8_t byte = byte_row[nn];
+                        const int low = static_cast<int>(static_cast<std::int8_t>(byte << 4)) >> 4;
+                        const int high = static_cast<int>(static_cast<std::int8_t>(byte)) >> 4;
+                        part[nn] += x0 * low + x1 * high;
+                    }
+                    if (k1 >= kcount) {
+                        break;
+                    }
+                }
+                for (int nn = 0; nn < kBlockN; ++nn) {
+                    acc[nn] += part[nn] * static_cast<double>(scale_panel[nn]);
+                }
+            }
+            const int base = nb * kBlockN;
+            const int count = std::min(kBlockN, out_features - base);
+            for (int nn = 0; nn < count; ++nn) {
+                const int o = base + nn;
+                double value = acc[nn];
+                if (bias) {
+                    value += static_cast<double>(bias[o]);
+                }
+                orow[o] = static_cast<float>(activate(value, activation));
+            }
+        }
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------------- //
+// low-rank, sparse CSR and transposed dense layouts
+// ------------------------------------------------------------------------- //
+
+// y = activation(x @ (U V)^T + b) with v (rank, in_features) and u
+// (out_features, rank), i.e. W[o, k] = sum_r u[o, r] * v[r, k]. The latent
+// projection is kept in registers per row, so neither W nor the full latent
+// matrix is materialized for the whole batch.
+int uzen_gemm_low_rank_f32(const float* x, const float* v, const float* u, const float* bias,
+                           float* out, int rows, int in_features, int rank, int out_features,
+                           int activation) {
+    if (!valid(x) || !valid(v) || !valid(u) || !valid(out) || rows < 0 || in_features <= 0 ||
+        rank <= 0 || out_features <= 0) {
+        return 1;
+    }
+    if (rows == 0) {
+        return 0;
+    }
+#pragma omp parallel for schedule(static) if (rows > 1)
+    for (int row = 0; row < rows; ++row) {
+        const float* xrow = x + static_cast<std::size_t>(row) * in_features;
+        float* orow = out + static_cast<std::size_t>(row) * out_features;
+        std::vector<double> latent(static_cast<std::size_t>(rank), 0.0);
+        for (int r = 0; r < rank; ++r) {
+            const float* vrow = v + static_cast<std::size_t>(r) * in_features;
+            double acc = 0.0;
+            for (int k = 0; k < in_features; ++k) {
+                acc += static_cast<double>(xrow[k]) * static_cast<double>(vrow[k]);
+            }
+            latent[r] = acc;
+        }
+        for (int o = 0; o < out_features; ++o) {
+            const float* urow = u + static_cast<std::size_t>(o) * rank;
+            double acc = bias ? static_cast<double>(bias[o]) : 0.0;
+            for (int r = 0; r < rank; ++r) {
+                acc += latent[r] * static_cast<double>(urow[r]);
+            }
+            orow[o] = static_cast<float>(activate(acc, activation));
+        }
+    }
+    return 0;
+}
+
+// y = activation(x @ W^T + b) with W stored as CSR rows over output features:
+// row o owns values[row_ptr[o] .. row_ptr[o + 1]) at input indices indices[...].
+int uzen_sparse_gemm_f32(const float* x, const float* values, const std::int32_t* indices,
+                         const std::int32_t* row_ptr, const float* bias, float* out, int rows,
+                         int in_features, int out_features, int nonzero_total, int activation) {
+    if (!valid(x) || !valid(values) || !valid(indices) || !valid(row_ptr) || !valid(out) ||
+        rows < 0 || in_features <= 0 || out_features <= 0 || nonzero_total < 0) {
+        return 1;
+    }
+    // Validate the CSR structure before any parallel work starts.
+    if (row_ptr[0] != 0 || row_ptr[out_features] != nonzero_total) {
+        return 2;
+    }
+    for (int o = 0; o < out_features; ++o) {
+        if (row_ptr[o] > row_ptr[o + 1]) {
+            return 2;
+        }
+    }
+    for (int j = 0; j < nonzero_total; ++j) {
+        if (indices[j] < 0 || indices[j] >= in_features) {
+            return 2;
+        }
+    }
+    if (rows == 0) {
+        return 0;
+    }
+#pragma omp parallel for schedule(static) if (rows > 1)
+    for (int row = 0; row < rows; ++row) {
+        const float* xrow = x + static_cast<std::size_t>(row) * in_features;
+        float* orow = out + static_cast<std::size_t>(row) * out_features;
+        for (int o = 0; o < out_features; ++o) {
+            double acc = bias ? static_cast<double>(bias[o]) : 0.0;
+            for (int j = row_ptr[o]; j < row_ptr[o + 1]; ++j) {
+                acc += static_cast<double>(xrow[indices[j]]) * static_cast<double>(values[j]);
+            }
+            orow[o] = static_cast<float>(activate(acc, activation));
+        }
+    }
+    return 0;
+}
+
+// Transposed dense layout: packed[k * out_features + o] = w[o * in_features + k].
+// The GEMM streams a weight row contiguously for one input value, which is the
+// natural order when the source tensor is already stored as (in, out).
+int uzen_pack_weight_transposed_f32(const float* w, float* packed, int out_features,
+                                    int in_features) {
+    if (!valid(w) || !valid(packed) || out_features <= 0 || in_features <= 0) {
+        return 1;
+    }
+    for (int k = 0; k < in_features; ++k) {
+        float* prow = packed + static_cast<std::size_t>(k) * out_features;
+        for (int o = 0; o < out_features; ++o) {
+            prow[o] = w[static_cast<std::size_t>(o) * in_features + k];
+        }
+    }
+    return 0;
+}
+
+int uzen_gemm_transposed_f32(const float* x, const float* wt, const float* bias, float* out,
+                             int rows, int in_features, int out_features, int activation) {
+    if (!valid(x) || !valid(wt) || !valid(out) || rows < 0 || in_features <= 0 ||
+        out_features <= 0) {
+        return 1;
+    }
+    if (rows == 0) {
+        return 0;
+    }
+#pragma omp parallel for schedule(static) if (rows > 1)
+    for (int row = 0; row < rows; ++row) {
+        const float* xrow = x + static_cast<std::size_t>(row) * in_features;
+        float* orow = out + static_cast<std::size_t>(row) * out_features;
+        std::vector<double> acc(static_cast<std::size_t>(out_features), 0.0);
+        for (int k = 0; k < in_features; ++k) {
+            const double value = static_cast<double>(xrow[k]);
+            const float* wrow = wt + static_cast<std::size_t>(k) * out_features;
+            for (int o = 0; o < out_features; ++o) {
+                acc[o] += value * static_cast<double>(wrow[o]);
+            }
+        }
+        for (int o = 0; o < out_features; ++o) {
+            double value = acc[o];
+            if (bias) {
+                value += static_cast<double>(bias[o]);
+            }
+            orow[o] = static_cast<float>(activate(value, activation));
         }
     }
     return 0;

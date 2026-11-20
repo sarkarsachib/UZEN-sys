@@ -207,6 +207,10 @@ rotation and revocation; plaintext secrets are never persisted.
   their documented float32 operator sets and raise `UnsupportedOperator` for
   everything else; layout operators are NumPy byte movement and are reported as
   such.
-* Rust integration, advanced parameter representations (N3), distributed execution
-  (N4) and CUDA kernels (N5) are future layers, not stub modules. No GPU
-  acceleration is claimed before real kernels exist.
+* Advanced parameter representations (N3) are per-weight native layouts on the
+  compiled path — blocked dense, transposed, group-wise int8/int4, low-rank factors
+  and CSR sparse — each packed once with a measured cost and error report, and
+  dispatched by the plan to its own kernel. The NIR graph language is unchanged.
+* Rust integration, distributed execution (N4) and CUDA kernels (N5) are future
+  layers, not stub modules. No GPU acceleration is claimed before real kernels
+  exist.

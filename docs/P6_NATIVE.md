@@ -17,12 +17,12 @@ listed gate passes.
 | --- | --- | --- |
 | **N1** | Native CPU arithmetic: C++17 kernels, ctypes ABI, NIR executor, native runtime adapter, parity tests, working demo | **implemented** |
 | **N2** | Native graph compiler: lower NIR to a native execution plan, fuse linear+activation and residual+norm, prepack weights, add conv/pool/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, liveness memory planner | **implemented** |
-| **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | planned |
+| **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | **implemented** |
 | **N4** | Distributed execution: durable queue adapter (Redis/Valkey or PostgreSQL), capability-aware native worker scheduling, leases, idempotent dispatch, remote artifact fetch | planned; local SQLite leases and S3-compatible transport already exist |
 | **N5** | GPU/native boundary: real CUDA/HIP kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | planned; **no GPU acceleration is claimed now** |
 | **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
 
-N3 is the next phase. N4–N6 build on N2's plan and are not started.
+N4 is the next phase. N4–N6 build on N2's plan and N3's layouts and are not started.
 
 ## N1 — implemented native CPU layer
 
@@ -235,16 +235,138 @@ still a CPU float32 backend and makes no GPU claim.
    changing the numbers. Use the NumPy executor for VAE/diffusion graphs.
 3. **Fusion is intentionally narrow**: linear+bias+activation and residual+norm.
    No conv+activation, attention+rope or multi-op elementwise chains yet.
-4. **Prepacked weights are dense float32.** There is no int4/sparse/low-rank native
-   layout yet — that is N3.
+4. **The default prepacked weight is dense float32.** Alternative layouts exist in
+   N3 below and are selected per weight at compile time.
 5. **One reduction axis per node**, and reductions do not fuse into consumers.
 6. **No thread-pool ownership.** OpenMP remains optional; the plan does not pick a
    thread count.
 7. **No CUDA.** `capabilities()["extra"]["cuda"]` is still always `False`.
 
-## N3–N6 boundaries
+## N3 — implemented advanced parameter representations
 
-* **N3** changes tensor representation and native storage, not the NIR language.
+N3 changes how a linear weight is stored and which kernel reads it; the NIR graph
+language is untouched. `compile_native_plan(..., representations={weight: kind})`
+records the request on the plan, packs that weight once, and the plan executor
+dispatches to the kernel for its layout. Unlisted weights keep the exact blocked
+float32 layout.
+
+| Kind | Native storage | Kernel | Lossy |
+| --- | --- | --- | --- |
+| `dense_blocked` | 64x64 float32 panels (N2 prepack) | `uzen_gemm_packed_f32` | no |
+| `transposed` | float32 (in, out) contiguous, no padding | `uzen_gemm_transposed_f32` | no |
+| `int8_block` | int8 panels + one float32 scale per (row, 64-value group) | `uzen_gemm_int8_block_f32` | weights |
+| `int4_block` | two's-complement nibbles, two per byte + per-group scales | `uzen_gemm_int4_block_f32` | weights |
+| `low_rank` | float32 factors u (out, r), v (r, in) from a float64 SVD | `uzen_gemm_low_rank_f32` | yes |
+| `sparse_csr` | float32 values + int32 indices, CSR rows over outputs | `uzen_sparse_gemm_f32` | unless threshold is 0 |
+
+Quantization is symmetric and group-wise (`[-127, 127]` for int8, `[-7, 7]` for
+int4, zero point 0), with the group equal to the GEMM's 64-value reduction panel, so
+a panel is exactly one quantized group of one output block. Dequantization happens
+inside the accumulation; a float weight matrix is never materialized.
+
+### Provenance
+
+Every prepared weight carries a `RepresentationReport`: layout kind, shape, source
+dtype, packed bytes, bits per weight, compression ratio against the source tensor,
+max/mean/max-relative reconstruction error, group and scale statistics (count, min,
+max, SHA-256), saturation count, rank and captured spectral energy for `low_rank`,
+nonzero count and density for `sparse_csr`, and a SHA-256 digest over the packed
+buffers. The plan exposes `describe()["representations"]` and
+`representation_summary()`; each execution summary embeds the same reports.
+
+```python
+from uzen.runtimes.native import NativeRuntime
+
+runtime = NativeRuntime()
+plan = runtime.compile(
+    graph,
+    package,
+    representations={
+        "layers.0.qkv.weight": "int8_block",
+        "layers.0.mlp_up.weight": "int4_block",
+        "layers.1.attn_out.weight": {"kind": "low_rank", "rank": 32},
+        "layers.1.mlp_down.weight": {"kind": "sparse_csr", "threshold": 0.0},
+    },
+)
+result = runtime.execute_compiled_graph(plan, inputs, package)
+print(result.summary()["representations"])
+```
+
+### Build and verify
+
+```bash
+python -m uzen.runtimes.native.build --force
+.venv/bin/python -m pytest -o addopts="" -q tests/test_native_representations.py
+.venv/bin/python examples/native_representation_demo.py --root /tmp/uzen-representation-demo
+```
+
+`25 passed` for the representation suite, plus the unchanged N1/N2 suites. Tests
+compare each kernel against the matrix its packed buffers reconstruct through an
+independent NumPy unpacking path, so a packing/indexing error cannot cancel out;
+they also cover group-scale placement, signed nibble round-trip, full-rank SVD
+exactness, CSR structure validation, request normalization and per-weight caching.
+
+Demo output on this machine (g++ 13.3, x86_64), weight 70x130:
+
+```text
+layout parity and cost (weight 70x130, structured random):
+  dense_blocked  bits/weight= 86.421 bytes= 98304 reconstruction=0.000e+00 kernel=0.000e+00
+  transposed     bits/weight= 32.000 bytes= 36400 reconstruction=0.000e+00 kernel=0.000e+00
+  int8_block     bits/weight= 22.956 bytes= 26112 reconstruction=1.444e-02 kernel=1.907e-06
+  int4_block     bits/weight= 12.153 bytes= 13824 reconstruction=2.634e-01 kernel=1.907e-06
+  low_rank       bits/weight= 14.066 bytes= 16000 reconstruction=2.438e+00 kernel=2.861e-06
+  sparse_csr     bits/weight=  2.810 bytes=  3196 reconstruction=0.000e+00 kernel=0.000e+00
+representations on whole compiled plans (max abs error vs float32 NumPy):
+  mlp                  weights= 3 dense=5.59e-09 transposed=5.59e-09 int8=2.38e-04 int4=2.71e-03
+  transformer_decoder  weights= 9 dense=1.12e-08 transposed=1.12e-08 int8=3.51e-04 int4=6.66e-03
+  cnn                  weights= 1 dense=1.86e-08 transposed=1.86e-08 int8=1.99e-05 int4=3.36e-04
+  recurrent            weights= 1 dense=1.18e-09 transposed=1.18e-09 int8=1.36e-05 int4=5.17e-04
+mixed plan (transformer decoder): 9 weights, max_abs_error=5.679e-04, stored=103424 bytes
+latency (median of 5, batch=4 seq=16 d_model=64 2 layers):
+  dense_blocked   2.629 ms  stored= 294912 bytes  error=2.24e-08
+  int8_block      3.254 ms  stored=  78336 bytes  error=4.78e-04
+  int4_block      2.866 ms  stored=  41472 bytes  error=8.64e-03
+gate: PASS
+```
+
+The storage column is the measured sum of packed buffers, not a projection: int4
+stores 7.1x less than the padded float32 plan and int8 3.8x less. The latency column
+is also measured and **is not a speedup claim** — both quantized paths were a little
+slower than float32 on this run because these kernels dequantize with scalar
+accumulation rather than SIMD int8 dot products, and the medians move by a few
+percent between runs. The win is storage and explicit error control.
+
+The 70x130 example is deliberately not block-aligned: 2 output blocks x 3 reduction
+blocks cost 2.7x padding, which is why `dense_blocked` reports 86 bits/weight there.
+On block-aligned shapes the same layout reports 32 bits/weight, and the report always
+shows the real number.
+
+### Honest limitations
+
+1. **Group size is fixed at 64 values**, tied to the GEMM reduction panel. Arbitrary
+   group sizes (32/128) are refused rather than silently rounded.
+2. **No SIMD integer dot products.** int8/int4 kernels decode and accumulate in
+   scalar double precision; throughput is not better than float32, only storage is.
+3. **int4 is symmetric `[-7, 7]` with zero point 0.** No asymmetric int4 or per-token
+   (activation) quantization; activations stay float32.
+4. **Sparse CSR is unstructured magnitude pruning** with float32 values and int32
+   indices: 8 bytes per nonzero, so it only beats float32 below 50% density and int4
+   below about 6%. There is no 2:4 structured sparsity, no sparse tensor core claim,
+   and pruning is a one-shot transform, never training.
+5. **`low_rank` is a one-shot float64 SVD.** On randomly initialized weights it
+   captures only about `rank / min(out, in)` of the spectral energy, so its reported
+   error is large by construction; it is a representation, not a compression pipeline
+   or a fine-tuning method.
+6. **Only `linear` weights can change layout.** Conv, embedding, recurrent, SSM, GCN
+   and MoE parameters keep their N2 storage.
+7. **Padding is part of the cost.** Block layouts pad to whole 64x64 panels; the
+   report's `bits_per_weight` includes that padding instead of quoting a theoretical
+   4 or 8 bits.
+8. **Still float32 activations and still CPU.** No CUDA, no mixed-precision
+   hardware path, no quantized attention.
+
+## N4–N6 boundaries
+
 * **N4** adds distributed scheduling around the existing job/worker contracts; it
   must not weaken lease/idempotency semantics.
 * **N5** is the only phase allowed to claim GPU execution, and only with real

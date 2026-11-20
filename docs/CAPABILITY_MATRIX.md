@@ -143,6 +143,7 @@ single-objective contract.
 | NumPy reference (safetensors, sharded safetensors index, npz, GGUF including dequantization; atomic writes; graph execution) | implemented |
 | Native CPU runtime (`uzen.runtimes.native`) | implemented: a direct per-node executor and a compiled plan path (fusion, prepacked blocked GEMM, liveness buffer planner). Build-on-demand with the local C++ compiler, cached by source digest; all seven supported architecture families are parity-tested against NumPy. Layout operators use NumPy and are reported separately. Unsupported operators/dtypes raise instead of falling back. Seeded sampling operators and multi-axis reductions are refused. No CUDA |
 | Native compiled plan (`compile_native_plan` / `execute_plan`) | implemented: linear+bias+activation and residual+norm fusion, 64x64 weight prepacking, slot reuse by liveness, shape-polymorphic binding, measured 0.63x the direct executor's time on a 2-layer transformer (batch 4, seq 16, d_model 64); not a GPU claim |
+| Native parameter representations (`representations=` on a compiled plan) | implemented per linear weight: `dense_blocked`, `transposed`, group-wise `int8_block`/`int4_block` (64-value groups, symmetric, zero point 0), `low_rank` SVD factors and `sparse_csr` magnitude pruning. Each prepared weight reports packed bytes, bits/weight, reconstruction error and a packed-buffer digest; measured int4 storage 7.1x and int8 3.8x smaller than the padded float32 plan on a 2-layer transformer. No SIMD int8 throughput or GPU claim |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
 | Torch-CPU NIR executor (all 44 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
@@ -192,8 +193,11 @@ single-objective contract.
    executor uses a naive GEMM and NumPy for layout ops and covers
    [P6_NATIVE.md](P6_NATIVE.md)'s documented operator set; the compiled plan adds
    conv/pool, recurrent, SSM, GCN, MoE, int8 `quantized_linear`, a prepacked GEMM
-   and single-pass attention. Seeded `sample_normal`/`add_noise` are refused. It is
-   not a CUDA backend.
+   and single-pass attention. Linear weights can be stored as blocked float32,
+   transposed float32, group-wise int8/int4, low-rank factors or CSR sparse; the
+   int8/int4 kernels trade storage, not throughput, because they decode with scalar
+   accumulation. Seeded `sample_normal`/`add_noise` are refused. It is not a CUDA
+   backend.
 
 ## P0 substrate hardening
 

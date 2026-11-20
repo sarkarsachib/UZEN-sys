@@ -46,6 +46,7 @@ class NativePlanExecution:
     prepacked: int = 0
     memory: dict[str, Any] = field(default_factory=dict)
     plan: dict[str, Any] = field(default_factory=dict)
+    representations: dict[str, Any] = field(default_factory=dict)
 
     def output(self, name: str) -> np.ndarray:
         try:
@@ -65,6 +66,13 @@ class NativePlanExecution:
             "native_ops": list(self.native_ops),
             "layout_ops": list(self.layout_ops),
             "prepacked_weights": self.prepacked,
+            "representations": dict(self.representations),
+            "representation_bytes": int(
+                sum(
+                    int(item.get("packed_bytes", 0))
+                    for item in self.representations.values()
+                )
+            ),
             "memory": dict(self.memory),
             "plan": dict(self.plan),
             "outputs": {
@@ -118,15 +126,67 @@ def _run_step(
                 f"plan step {step.index} needs prepacked weight '{name}', which was "
                 "not prepared"
             )
+        prepared = context.packed[name]
         bias = context.tensor(attrs.get("bias"), step=step)
-        return [
-            library.gemm_packed(
-                arrays[0],
-                context.packed[name],
-                bias=bias,
-                activation=str(attrs.get("activation", "none")),
-            )
-        ]
+        activation = str(attrs.get("activation", "none"))
+        kind = str(getattr(prepared, "kind", "dense_blocked"))
+        if kind == "dense_blocked":
+            return [
+                library.gemm_packed(
+                    arrays[0], prepared.packed, bias=bias, activation=activation
+                )
+            ]
+        if kind == "transposed":
+            return [
+                library.gemm_transposed(
+                    arrays[0], prepared.packed, bias=bias, activation=activation
+                )
+            ]
+        if kind == "int8_block":
+            return [
+                library.gemm_int8_block(
+                    arrays[0], prepared.packed, bias=bias, activation=activation
+                )
+            ]
+        if kind == "int4_block":
+            return [
+                library.gemm_int4_block(
+                    arrays[0], prepared.packed, bias=bias, activation=activation
+                )
+            ]
+        if kind == "low_rank":
+            if prepared.factors is None:
+                raise InvalidOperationParameters(
+                    f"plan step {step.index} needs low-rank factors for '{name}'"
+                )
+            u, v = prepared.factors
+            return [
+                library.gemm_low_rank(
+                    arrays[0], v, u, bias=bias, activation=activation
+                )
+            ]
+        if kind == "sparse_csr":
+            if prepared.sparse is None:
+                raise InvalidOperationParameters(
+                    f"plan step {step.index} needs a CSR payload for '{name}'"
+                )
+            values, indices, row_ptr = prepared.sparse
+            return [
+                library.sparse_gemm(
+                    arrays[0],
+                    values,
+                    indices,
+                    row_ptr,
+                    prepared.in_features,
+                    prepared.out_features,
+                    bias=bias,
+                    activation=activation,
+                )
+            ]
+        raise InvalidOperationParameters(
+            f"plan step {step.index} uses unknown weight representation '{kind}' "
+            f"for '{name}'"
+        )
 
     if op == "add_norm":
         weight = context.tensor(attrs.get("weight"), step=step)
@@ -400,6 +460,9 @@ def execute_plan(
             )
 
     packed = plan.prepare_weights(package, library)
+    representation_reports = {
+        name: weight.describe() for name, weight in packed.items()
+    }
     context = _Context(
         package=package,
         bound=resolve_bindings(plan.graph, package),
@@ -464,6 +527,7 @@ def execute_plan(
         prepacked=len(packed),
         memory=bound_plan.memory.describe(),
         plan=plan.describe(),
+        representations=representation_reports,
     )
 
 
@@ -474,10 +538,13 @@ def execute_compiled(
     *,
     capture: Sequence[str] | None = None,
     fuse: bool = True,
+    representations: Mapping[str, Any] | None = None,
     library: NativeLibrary | None = None,
 ) -> NativePlanExecution:
     """Compile ``graph`` and run it in one call."""
-    plan = compile_native_plan(graph, package, fuse=fuse)
+    plan = compile_native_plan(
+        graph, package, fuse=fuse, representations=representations
+    )
     return execute_plan(
         plan, inputs, package, capture=capture, library=library
     )

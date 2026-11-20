@@ -25,6 +25,7 @@ from .compiler import PLAN_OPS, NativePlan, compile_native_plan
 from .executor import NativeExecution, execute_native
 from .library import NativeLibrary, native_available, resolve_library_path
 from .plan_executor import NativePlanExecution, execute_plan
+from .representations import REPRESENTATION_KINDS, REPRESENTATION_NOTES
 
 
 class NativeRuntime:
@@ -112,6 +113,9 @@ class NativeRuntime:
                     "residual add + layernorm/rmsnorm",
                 ],
                 "prepacked_gemm": True,
+                "representations": list(REPRESENTATION_KINDS),
+                "representation_notes": dict(REPRESENTATION_NOTES),
+                "representation_aware_gemm": True,
                 "threaded_attention": "single-pass (flash-style) online softmax",
                 "openmp": "optional; enabled when the compiler accepts -fopenmp",
                 "cuda": False,
@@ -199,9 +203,12 @@ class NativeRuntime:
         package: WeightPackage | None = None,
         *,
         fuse: bool = True,
+        representations: Mapping[str, Any] | None = None,
     ) -> NativePlan:
-        """Lower a graph into a native execution plan (fusions + prepacking)."""
-        return compile_native_plan(graph, package, fuse=fuse)
+        """Lower a graph into a native execution plan (fusions + representation)."""
+        return compile_native_plan(
+            graph, package, fuse=fuse, representations=representations
+        )
 
     def execute_compiled_graph(
         self,

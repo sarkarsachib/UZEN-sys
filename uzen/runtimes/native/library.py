@@ -106,6 +106,84 @@ class PackedWeight:
         }
 
 
+#: Group size of the block-quantized layouts (must match plan_kernels.cpp).
+QUANT_GROUP = BLOCK_K
+INT8_BLOCK_RANGE = 127
+INT4_BLOCK_RANGE = 7
+
+
+@dataclass(frozen=True)
+class PackedBlockWeight:
+    """Group-wise quantized weight in the blocked GEMM panel layout.
+
+    ``weight`` holds the quantized values (int8, or packed int4 nibbles) in
+    ``kBlockK x kBlockN`` panels; ``scales`` holds one float32 scale per
+    ``(output feature, group)`` pair in the same panel order. Partial panels are
+    padded, so the buffers are slightly larger than ``out * in``; the reported
+    overhead is measured, never hidden.
+    """
+
+    kind: str
+    weight: np.ndarray
+    scales: np.ndarray
+    in_features: int
+    out_features: int
+    group: int = QUANT_GROUP
+
+    @property
+    def panel_count(self) -> int:
+        blocks_out = -(-self.out_features // BLOCK_N)
+        blocks_in = -(-self.in_features // BLOCK_K)
+        return blocks_out * blocks_in
+
+    @property
+    def dense_elements(self) -> int:
+        return self.in_features * self.out_features
+
+    @property
+    def padded_elements(self) -> int:
+        """Quantized value slots, including block padding (nibbles count as one)."""
+        return self.panel_count * self.group * BLOCK_N
+
+    @property
+    def padding_overhead(self) -> float:
+        return (
+            self.padded_elements / float(self.dense_elements)
+            if self.dense_elements
+            else 0.0
+        )
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "weight_shape": [self.out_features, self.in_features],
+            "group": self.group,
+            "block_in": BLOCK_K,
+            "block_out": BLOCK_N,
+            "padded_elements": self.padded_elements,
+            "packed_bytes": int(self.weight.nbytes + self.scales.nbytes),
+            "padding_overhead": round(self.padding_overhead, 3),
+        }
+
+
+@dataclass(frozen=True)
+class PackedTransposedWeight:
+    """A (in_features, out_features) dense layout consumed by ``gemm_transposed``."""
+
+    array: np.ndarray
+    in_features: int
+    out_features: int
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": "transposed",
+            "weight_shape": [self.out_features, self.in_features],
+            "packed_layout": "in_features-major",
+            "packed_bytes": int(self.array.nbytes),
+            "padding_overhead": 1.0,
+        }
+
+
 def resolve_library_path(
     path: str | Path | None = None, *, auto_build: bool = True
 ) -> Path:
@@ -154,6 +232,33 @@ def _as_f32(array: Any, label: str) -> np.ndarray:
     if arr.dtype != np.float32:
         raise InvalidOperationParameters(
             f"native kernel '{label}' requires float32 arrays, got {arr.dtype}"
+        )
+    return np.ascontiguousarray(arr)
+
+
+def _as_int8(array: Any, label: str) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.dtype != np.int8:
+        raise InvalidOperationParameters(
+            f"native kernel '{label}' requires int8 arrays, got {arr.dtype}"
+        )
+    return np.ascontiguousarray(arr)
+
+
+def _as_uint8(array: Any, label: str) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.dtype != np.uint8:
+        raise InvalidOperationParameters(
+            f"native kernel '{label}' requires uint8 arrays, got {arr.dtype}"
+        )
+    return np.ascontiguousarray(arr)
+
+
+def _as_int32(array: Any, label: str) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.dtype != np.int32:
+        raise InvalidOperationParameters(
+            f"native kernel '{label}' requires int32 arrays, got {arr.dtype}"
         )
     return np.ascontiguousarray(arr)
 
@@ -447,6 +552,69 @@ class NativeLibrary:
                 _C_INT,
             ],
         )
+        # Phase N3: alternative parameter representations.
+        self._int8_block_group = getattr(self._lib, "uzen_int8_block_group")
+        self._int8_block_group.argtypes = []
+        self._int8_block_group.restype = _C_INT
+        self._pack_int8_block = self._bind_function(
+            "uzen_pack_weight_int8_block",
+            [pointer, pointer, pointer, pointer, _C_INT, _C_INT],
+        )
+        self._gemm_int8_block = self._bind_function(
+            "uzen_gemm_int8_block_f32",
+            [pointer, pointer, pointer, pointer, pointer, _C_INT, _C_INT, _C_INT, _C_INT],
+        )
+        self._pack_int4_block = self._bind_function(
+            "uzen_pack_weight_int4_block",
+            [pointer, pointer, pointer, pointer, _C_INT, _C_INT],
+        )
+        self._gemm_int4_block = self._bind_function(
+            "uzen_gemm_int4_block_f32",
+            [pointer, pointer, pointer, pointer, pointer, _C_INT, _C_INT, _C_INT, _C_INT],
+        )
+        self._gemm_low_rank = self._bind_function(
+            "uzen_gemm_low_rank_f32",
+            [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+            ],
+        )
+        self._sparse_gemm = self._bind_function(
+            "uzen_sparse_gemm_f32",
+            [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+                _C_INT,
+            ],
+        )
+        self._pack_weight_transposed = self._bind_function(
+            "uzen_pack_weight_transposed_f32", [pointer, pointer, _C_INT, _C_INT]
+        )
+        self._gemm_transposed = self._bind_function(
+            "uzen_gemm_transposed_f32",
+            [pointer, pointer, pointer, pointer, _C_INT, _C_INT, _C_INT, _C_INT],
+        )
+
+    @property
+    def quant_group(self) -> int:
+        """Group size of the block-quantized layouts, as compiled into C++."""
+        return int(self._int8_block_group())
 
     def _check(self, status: int, name: str) -> None:
         if status != 0:
@@ -1476,6 +1644,367 @@ class NativeLibrary:
             )
         return output
 
+    # ------------------------------------------------------------------ #
+    # parameter representations (phase N3)
+    # ------------------------------------------------------------------ #
+
+    def _activation_code(self, activation: str) -> int:
+        if activation not in ACTIVATION_CODES:
+            raise InvalidOperationParameters(
+                f"native gemm activation must be one of {sorted(ACTIVATION_CODES)}, "
+                f"got '{activation}'"
+            )
+        return ACTIVATION_CODES[activation]
+
+    def _gemm_bias(
+        self, bias: Any | None, out_features: int, label: str
+    ) -> np.ndarray | None:
+        if bias is None:
+            return None
+        ba = _as_f32(bias, f"{label}.bias")
+        if ba.shape != (out_features,):
+            raise InvalidOperationParameters(
+                f"native {label} bias shape {ba.shape} != ({out_features},)"
+            )
+        return ba
+
+    def _gemm_input(
+        self, x: Any, in_features: int, label: str
+    ) -> tuple[np.ndarray, int, tuple[int, ...]]:
+        xa = _as_f32(x, f"{label}.x")
+        if xa.ndim < 1:
+            raise InvalidOperationParameters(f"native {label} requires rank >= 1")
+        if xa.shape[-1] != in_features:
+            raise InvalidOperationParameters(
+                f"native {label}: input last dim {xa.shape[-1]} != weight "
+                f"in_features {in_features}"
+            )
+        rows = int(np.prod(xa.shape[:-1])) if xa.ndim > 1 else 1
+        return xa, rows, tuple(xa.shape[:-1])
+
+    def pack_weight_int8_block(
+        self, weight: Any, scales: Any
+    ) -> PackedBlockWeight:
+        """Pack symmetric int8 weights with one scale per (row, group)."""
+        weights = _as_int8(weight, "pack_weight_int8_block.weight")
+        if weights.ndim != 2:
+            raise InvalidOperationParameters(
+                "native pack_weight_int8_block requires a 2-D weight"
+            )
+        out_features, in_features = (int(v) for v in weights.shape)
+        group = self.quant_group
+        groups = -(-in_features // group)
+        scale_array = _as_f32(scales, "pack_weight_int8_block.scales")
+        if scale_array.shape != (out_features, groups):
+            raise InvalidOperationParameters(
+                f"native pack_weight_int8_block scales shape {scale_array.shape} != "
+                f"({out_features}, {groups}) for group size {group}"
+            )
+        if not np.isfinite(scale_array).all() or (scale_array <= 0).any():
+            raise InvalidOperationParameters(
+                "native pack_weight_int8_block scales must be finite and positive"
+            )
+        packed = PackedBlockWeight(
+            kind="int8_block",
+            weight=np.zeros(
+                -(-out_features // BLOCK_N) * groups * group * BLOCK_N, dtype=np.int8
+            ),
+            scales=np.zeros(-(-out_features // BLOCK_N) * groups * BLOCK_N, dtype=np.float32),
+            in_features=in_features,
+            out_features=out_features,
+            group=group,
+        )
+        scale_array = np.ascontiguousarray(scale_array)
+        self._check(
+            self._pack_int8_block(
+                _pointer(weights),
+                _pointer(scale_array),
+                _pointer(packed.weight),
+                _pointer(packed.scales),
+                out_features,
+                in_features,
+            ),
+            "pack_weight_int8_block",
+        )
+        return packed
+
+    def gemm_int8_block(
+        self,
+        x: Any,
+        packed: PackedBlockWeight,
+        bias: Any | None = None,
+        *,
+        activation: str = "none",
+    ) -> np.ndarray:
+        """y = activation(x @ (wq * scale)^T + b) for packed int8 weights."""
+        if packed.kind != "int8_block":
+            raise InvalidOperationParameters(
+                f"native gemm_int8_block needs an int8_block weight, got '{packed.kind}'"
+            )
+        code = self._activation_code(activation)
+        xa, rows, leading = self._gemm_input(x, packed.in_features, "gemm_int8_block")
+        ba = self._gemm_bias(bias, packed.out_features, "gemm_int8_block")
+        output = np.empty((rows, packed.out_features), dtype=np.float32)
+        if rows:
+            self._check(
+                self._gemm_int8_block(
+                    _pointer(xa),
+                    _pointer(packed.weight),
+                    _pointer(packed.scales),
+                    _pointer(ba),
+                    _pointer(output),
+                    rows,
+                    packed.in_features,
+                    packed.out_features,
+                    code,
+                ),
+                "gemm_int8_block",
+            )
+        return output.reshape(leading + (packed.out_features,))
+
+    def pack_weight_int4_block(
+        self, nibbles: Any, scales: Any
+    ) -> PackedBlockWeight:
+        """Pack int4 values (one unsigned nibble each, two's complement)."""
+        values = _as_uint8(nibbles, "pack_weight_int4_block.nibbles")
+        if values.ndim != 2:
+            raise InvalidOperationParameters(
+                "native pack_weight_int4_block requires a 2-D (out, in) nibble buffer"
+            )
+        if values.size and int(values.max()) > 0x0F:
+            raise InvalidOperationParameters(
+                "native pack_weight_int4_block expects one nibble per element "
+                f"(0..15), got a maximum of {int(values.max())}"
+            )
+        out_features, in_features = (int(v) for v in values.shape)
+        group = self.quant_group
+        groups = -(-in_features // group)
+        scale_array = _as_f32(scales, "pack_weight_int4_block.scales")
+        if scale_array.shape != (out_features, groups):
+            raise InvalidOperationParameters(
+                f"native pack_weight_int4_block scales shape {scale_array.shape} != "
+                f"({out_features}, {groups}) for group size {group}"
+            )
+        if not np.isfinite(scale_array).all() or (scale_array <= 0).any():
+            raise InvalidOperationParameters(
+                "native pack_weight_int4_block scales must be finite and positive"
+            )
+        blocks_out = -(-out_features // BLOCK_N)
+        packed = PackedBlockWeight(
+            kind="int4_block",
+            weight=np.zeros(blocks_out * groups * (group // 2) * BLOCK_N, dtype=np.uint8),
+            scales=np.zeros(blocks_out * groups * BLOCK_N, dtype=np.float32),
+            in_features=in_features,
+            out_features=out_features,
+            group=group,
+        )
+        scale_array = np.ascontiguousarray(scale_array)
+        self._check(
+            self._pack_int4_block(
+                _pointer(values),
+                _pointer(scale_array),
+                _pointer(packed.weight),
+                _pointer(packed.scales),
+                out_features,
+                in_features,
+            ),
+            "pack_weight_int4_block",
+        )
+        return packed
+
+    def gemm_int4_block(
+        self,
+        x: Any,
+        packed: PackedBlockWeight,
+        bias: Any | None = None,
+        *,
+        activation: str = "none",
+    ) -> np.ndarray:
+        """y = activation(x @ (wq * scale)^T + b) for packed int4 weights."""
+        if packed.kind != "int4_block":
+            raise InvalidOperationParameters(
+                f"native gemm_int4_block needs an int4_block weight, got '{packed.kind}'"
+            )
+        code = self._activation_code(activation)
+        xa, rows, leading = self._gemm_input(x, packed.in_features, "gemm_int4_block")
+        ba = self._gemm_bias(bias, packed.out_features, "gemm_int4_block")
+        output = np.empty((rows, packed.out_features), dtype=np.float32)
+        if rows:
+            self._check(
+                self._gemm_int4_block(
+                    _pointer(xa),
+                    _pointer(packed.weight),
+                    _pointer(packed.scales),
+                    _pointer(ba),
+                    _pointer(output),
+                    rows,
+                    packed.in_features,
+                    packed.out_features,
+                    code,
+                ),
+                "gemm_int4_block",
+            )
+        return output.reshape(leading + (packed.out_features,))
+
+    def gemm_low_rank(
+        self,
+        x: Any,
+        v: Any,
+        u: Any,
+        bias: Any | None = None,
+        *,
+        activation: str = "none",
+    ) -> np.ndarray:
+        """y = activation(x @ (U V)^T + b) from rank factors ``v`` and ``u``."""
+        code = self._activation_code(activation)
+        va = _as_f32(v, "gemm_low_rank.v")
+        ua = _as_f32(u, "gemm_low_rank.u")
+        if va.ndim != 2 or ua.ndim != 2:
+            raise InvalidOperationParameters(
+                "native gemm_low_rank requires 2-D factors v (rank, in) and u (out, rank)"
+            )
+        rank, in_features = (int(value) for value in va.shape)
+        out_features = int(ua.shape[0])
+        if rank <= 0 or in_features <= 0 or out_features <= 0:
+            raise InvalidOperationParameters("native gemm_low_rank needs non-empty factors")
+        if ua.shape[1] != rank:
+            raise InvalidOperationParameters(
+                f"native gemm_low_rank: u has {ua.shape[1]} columns but v has rank {rank}"
+            )
+        xa, rows, leading = self._gemm_input(x, in_features, "gemm_low_rank")
+        ba = self._gemm_bias(bias, out_features, "gemm_low_rank")
+        output = np.empty((rows, out_features), dtype=np.float32)
+        if rows:
+            self._check(
+                self._gemm_low_rank(
+                    _pointer(xa),
+                    _pointer(va),
+                    _pointer(ua),
+                    _pointer(ba),
+                    _pointer(output),
+                    rows,
+                    in_features,
+                    rank,
+                    out_features,
+                    code,
+                ),
+                "gemm_low_rank",
+            )
+        return output.reshape(leading + (out_features,))
+
+    def sparse_gemm(
+        self,
+        x: Any,
+        values: Any,
+        indices: Any,
+        row_ptr: Any,
+        in_features: int,
+        out_features: int,
+        bias: Any | None = None,
+        *,
+        activation: str = "none",
+    ) -> np.ndarray:
+        """y = activation(x @ W^T + b) for W stored as CSR rows over outputs.
+
+        ``in_features`` is explicit: trailing all-zero input columns produce no
+        nonzeros, so the CSR indices alone cannot imply the input width.
+        """
+        code = self._activation_code(activation)
+        in_features = int(in_features)
+        out_features = int(out_features)
+        if in_features <= 0 or out_features <= 0:
+            raise InvalidOperationParameters(
+                "native sparse_gemm needs positive in_features and out_features"
+            )
+        va = _as_f32(values, "sparse_gemm.values")
+        if va.ndim != 1:
+            raise InvalidOperationParameters("native sparse_gemm values must be 1-D")
+        ia = _as_int32(indices, "sparse_gemm.indices")
+        rp = _as_int32(row_ptr, "sparse_gemm.row_ptr")
+        if ia.shape != va.shape:
+            raise InvalidOperationParameters(
+                f"native sparse_gemm indices {ia.shape} != values {va.shape}"
+            )
+        if rp.shape != (out_features + 1,):
+            raise InvalidOperationParameters(
+                f"native sparse_gemm row_ptr {rp.shape} != ({out_features + 1},)"
+            )
+        if int(rp[0]) != 0 or int(rp[-1]) != int(va.size):
+            raise InvalidOperationParameters(
+                "native sparse_gemm row_ptr must start at 0 and end at the nonzero count"
+            )
+        if va.size and (int(ia.min()) < 0 or int(ia.max()) >= in_features):
+            raise InvalidOperationParameters(
+                f"native sparse_gemm indices must lie in [0, {in_features})"
+            )
+        xa, rows, leading = self._gemm_input(x, in_features, "sparse_gemm")
+        ba = self._gemm_bias(bias, out_features, "sparse_gemm")
+        output = np.empty((rows, out_features), dtype=np.float32)
+        if rows:
+            self._check(
+                self._sparse_gemm(
+                    _pointer(xa),
+                    _pointer(va),
+                    _pointer(ia),
+                    _pointer(rp),
+                    _pointer(ba),
+                    _pointer(output),
+                    rows,
+                    in_features,
+                    out_features,
+                    int(va.size),
+                    code,
+                ),
+                "sparse_gemm",
+            )
+        return output.reshape(leading + (out_features,))
+
+    def pack_weight_transposed(self, weight: Any) -> PackedTransposedWeight:
+        """Store a (out, in) weight as an (in, out) contiguous layout."""
+        wa = _as_f32(weight, "pack_weight_transposed")
+        if wa.ndim != 2:
+            raise InvalidOperationParameters(
+                "native pack_weight_transposed requires a 2-D (out, in) weight"
+            )
+        out_features, in_features = (int(value) for value in wa.shape)
+        packed = np.zeros(in_features * out_features, dtype=np.float32)
+        self._check(
+            self._pack_weight_transposed(
+                _pointer(wa), _pointer(packed), out_features, in_features
+            ),
+            "pack_weight_transposed",
+        )
+        return PackedTransposedWeight(packed, in_features, out_features)
+
+    def gemm_transposed(
+        self,
+        x: Any,
+        packed: PackedTransposedWeight,
+        bias: Any | None = None,
+        *,
+        activation: str = "none",
+    ) -> np.ndarray:
+        """y = activation(x @ W^T + b) from the (in, out) dense layout."""
+        code = self._activation_code(activation)
+        xa, rows, leading = self._gemm_input(x, packed.in_features, "gemm_transposed")
+        ba = self._gemm_bias(bias, packed.out_features, "gemm_transposed")
+        output = np.empty((rows, packed.out_features), dtype=np.float32)
+        if rows:
+            self._check(
+                self._gemm_transposed(
+                    _pointer(xa),
+                    _pointer(packed.array),
+                    _pointer(ba),
+                    _pointer(output),
+                    rows,
+                    packed.in_features,
+                    packed.out_features,
+                    code,
+                ),
+                "gemm_transposed",
+            )
+        return output.reshape(leading + (packed.out_features,))
+
     def describe(self) -> dict[str, Any]:
         return {
             "path": str(self.path),
@@ -1509,7 +2038,16 @@ class NativeLibrary:
                     "gcn",
                     "moe",
                     "quantized_linear",
+                    "pack_weight_int8_block",
+                    "gemm_int8_block",
+                    "pack_weight_int4_block",
+                    "gemm_int4_block",
+                    "gemm_low_rank",
+                    "sparse_gemm",
+                    "pack_weight_transposed",
+                    "gemm_transposed",
                 ]
             ),
+            "quant_group": self.quant_group,
             "float32_only": True,
         }
