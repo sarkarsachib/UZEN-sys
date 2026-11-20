@@ -137,6 +137,20 @@ class CudaKernelError(UzenError):
     http_status = 500
 
 
+class CampaignConflict(UzenError):
+    """A campaign id was reused with a different specification."""
+
+    code = "campaign.conflict"
+    http_status = 409
+
+
+class CampaignNotFound(UzenError):
+    """No campaign with the requested id exists in this workspace."""
+
+    code = "campaign.not_found"
+    http_status = 404
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415

@@ -120,7 +120,7 @@ single-objective contract.
 | Capability | Status |
 | --- | --- |
 | Families (24, catalogue ordered simple→advanced): `linear_residual`, `gated_mlp`, `mlp`, `conv_residual`, `cnn`, `recurrent` (RNN/LSTM/GRU), `autoencoder`, `siamese`, `retrieval`, `set_transformer`, `vae`, `state_space`, `gnn`, `moe`, `diffusion`, `multimodal`, `hybrid`, `transformer_encoder`, `albert`, `bert`, `vit`, `perceiver`, `seq2seq`, `transformer_decoder` | implemented |
-| NIR operators (43): linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, pool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, `clip`, reductions, activations including exact `gelu_exact` | implemented |
+| NIR operators (44): linear, quantized_linear, embedding, pos_embedding, layernorm, rmsnorm, attention, split_qkv, merge_heads, `rope`, `repeat_kv`, conv2d, maxpool2d, rnn, lstm, gru, reshape, transpose, concat, slice, flatten, `select`, `moe`, `ssm`, `gcn`, `sample_normal`, `add_noise`, `clip`, reductions, activations including exact `gelu_exact` | implemented |
 | Stored reconstructed-model execution (`tokens` + optional `positions`) | implemented for GPT-2/Llama/OPT/GPT-NeoX/GPT-J/Gemma and the explicit Llama-like profile graphs; finite output validation, optional in-memory K/V cache for RoPE decoder graphs |
 | Tokenizer-backed text inference | implemented for imported GPT-2/Llama/OPT/GPT-NeoX and explicit profile artifacts with `tokenizer.json`; stored by SHA-256 and encoded through the optional real `tokenizers` runtime |
 | Autoregressive generation | greedy, seeded temperature/top-k/top-p sampling, and beam search by cumulative log-probability; cached single-token decoding for RoPE decoder graphs, full recomputation elsewhere; explicit EOS or context-length stopping |
@@ -129,12 +129,27 @@ single-objective contract.
 | Per-layer activation capture | implemented; `capture="layers"` returns `l<N>_res2` block outputs, explicit NIR node ids are also accepted |
 | Logit parity for HF families | implemented for GPT-2/Llama/OPT/GPT-NeoX/GPT-J/Gemma and live-verified Mistral/Qwen2/OLMo; other Llama-like profiles are layout- and execution-tested but not claimed as live parity |
 | Graph validation (refs, acyclicity, binding, shapes, dtypes, declared port order) | implemented |
-| Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented |
+| Composition (sequential/parallel/residual), operator substitution, bypass, truncation | implemented; SDK/CLI/REST/MCP persist validated results with parent lineage. Reconstruction preserves the family spec, and composition selects `out`/`logits`/`y`/`reconstruction`/`eps_pred` rather than JSON-sorted `hidden` |
 | Explicit graph cycles | unsupported by design: recurrent/stateful structure lives inside `rnn`/`lstm`/`gru`/`ssm`, and a cycle is diagnosed rather than silently reinterpreted |
 | Sparse-dispatch MoE (per-expert gather/scatter of routed tokens) | implemented; unused experts are never evaluated, with equivalence and NaN-isolation tests |
 | Prometheus `/metrics` (counters/gauges/histograms) + JSON logging | implemented; dependency-free registry and scraper endpoint |
 | Embedded ONNX runtime | planned |
 | Native CPU kernels (C++17 + ctypes) | implemented for float32 linear/matmul, layernorm/rmsnorm, softmax, GELU (tanh/exact)/SiLU/ReLU/tanh/sigmoid, add/sub/mul/scale/clip, embedding, last-axis mean/sum and masked attention; optional OpenMP; no CUDA claim |
+
+## Research campaigns (N6)
+
+| Capability | Status |
+| --- | --- |
+| Campaign spec: architecture or weight-transform mode, typed axes, objectives, constraints, seed, budget, batch, strategy, patience, evaluation seeds | implemented; unknown fields/objectives/axes are rejected |
+| Deterministic planners: grid, seeded random, seeded evolution | implemented; completed candidate digests are excluded |
+| Batch evaluator | implemented; real NumPy forward passes, bounded thread pool, `invalid`/`constraint`/`error` trials recorded |
+| Durable scheduler | implemented; SQLite WAL, idempotent `(campaign_id, candidate)` trials, pause on `max_rounds`, batch-boundary resume, event history |
+| Objectives/scoring/Pareto | implemented; min-max weighted score and multi-objective domination |
+| Benchmark corpus | implemented; content-addressed JSON, replay re-executes the candidate, integrity check rejects modified records, signed/relative-tolerance metric comparison |
+| Interfaces | SDK (`run_campaign`, `campaign`, `campaigns`, `verify_campaign_corpus`, `replay_benchmark`), CLI (`campaign run|show|list|events|verify|replay`), REST (`/v1/campaigns`, `/v1/benchmarks/{digest}`), MCP (five tools) |
+
+Metrics are inference-only proxies (size, output RMS/diversity, sparsity, int8 round-trip
+error, base distance/agreement). No dataset, loss or task accuracy is measured.
 
 ## Runtimes
 
@@ -171,7 +186,7 @@ single-objective contract.
 | Python SDK (local + remote HTTP) | implemented |
 | CLI (argparse) | implemented |
 | REST API (FastAPI, OpenAPI) | implemented (optional extra) |
-| MCP stdio server (13 tools) | implemented |
+| MCP stdio server (26 tools) | implemented, including NASE composition/edit and N6 campaign/replay tools |
 | Worker protocol + daemon (local and remote) | implemented: claim under a token-guarded lease, input fetching through the object-store transport or the shared exchange directory, local job id equal to the control-plane job id, and reuse of a completed result instead of re-execution |
 | Distributed scheduler (capability routing, priority, leases, attempts, idempotent dispatch) | implemented: requirements derived from the job request and matched inside the atomic claiming statement, operator `priority` with optional aging, `dispatch_token` per attempt, lease expiry requeue with exponential backoff and attempt cap (`job.lease_expired`), cooperative preemption, worker draining/resume, a per-worker in-flight cap, long-poll claims, first-report-wins via `dispatch_records`, and unroutable-job reporting. Verified across real worker processes in `examples/distributed_scheduling_demo.py` |
 | Object-store artifact transport | implemented for S3-compatible endpoints: local SigV4 signing, streamed single and multipart uploads, SHA-256 verification before publication, parent-lineage closure and stored-tokenizer sidecars; validated against a real S3-compatible server and by an independently signature-checking test server |
@@ -195,9 +210,12 @@ single-objective contract.
    than pretending an LLM was consulted.
 4. **Activation alignment** requires a runnable NIR graph and real inputs; it will not
    fabricate activations for unsupported architectures.
-5. **Architecture families beyond the five implemented** are reported `planned`; UZEN
-   will not synthesize a graph it cannot execute.
-6. **The native CPU backend is float32-only and correctness-first.** The direct
+5. **Architecture families outside the 24-family registry** are reported as unsupported;
+   UZEN will not synthesize a graph it cannot execute.
+6. **N6 campaigns are in-process.** There is no distributed campaign execution across
+   N4 workers, no task-quality metric, and resume is batch-granular. Campaign proxy
+   metrics must not be presented as benchmark superiority.
+7. **The native CPU backend is float32-only and correctness-first.** The direct
    executor uses a naive GEMM and NumPy for layout ops and covers
    [P6_NATIVE.md](P6_NATIVE.md)'s documented operator set; the compiled plan adds
    conv/pool, recurrent, SSM, GCN, MoE, int8 `quantized_linear`, a prepacked GEMM

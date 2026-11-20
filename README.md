@@ -29,10 +29,11 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Weight operation registry (45 registered operations) | **implemented** |
 | Arithmetic, merging (incl. TIES/DARE), decomposition (SVD/orthogonal/sparsify) | **implemented** |
 | NPA alignment: identity, Procrustes, linear map, permutation (Hungarian), basis, activation/CKA | **implemented** |
-| NASE synthesis: 24 families ordered simple→advanced (residual/gated MLP, CNN, RNN, autoencoder, Siamese, retrieval, set transformer, VAE, SSM, GNN, MoE, diffusion, multimodal, hybrid, transformer encoder, ALBERT, BERT, ViT, perceiver, seq2seq, transformer decoder), compose, substitute, bypass, truncate | **implemented** |
+| NASE synthesis: 24 families ordered simple→advanced (residual/gated MLP, CNN, RNN, autoencoder, Siamese, retrieval, set transformer, VAE, SSM, GNN, MoE, diffusion, multimodal, hybrid, transformer encoder, ALBERT, BERT, ViT, perceiver, seq2seq, transformer decoder), compose, substitute, bypass, truncate; composition and graph surgery are persisted with lineage through SDK/CLI/REST/MCP | **implemented** |
 | WComp compiler + WPL language (real lexer, recursive-descent parser, typed pipeline) | **implemented** |
 | VEL verification: structural, numerical, functional, regression, performance, provenance | **implemented** |
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
+| N6 research campaigns: seeded architecture/weight-transform search, batch evaluator, resumable SQLite scheduler, Pareto reports, content-addressed replay corpus | **implemented** (in-process scheduler; inference-only proxy metrics, not task quality) |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
@@ -67,8 +68,9 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N5
-are implemented at their stated level; N6 is a design, not a partially working claim.
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N6
+are implemented at their stated level; N6 is an in-process campaign engine, not a
+distributed training/quality-optimization system.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -77,10 +79,11 @@ are implemented at their stated level; N6 is a design, not a partially working c
 | **N3** | Advanced parameter representations: block int8/int4 with group scales, low-rank factors, CSR sparse and transposed layouts, representation-aware execution | **implemented** |
 | **N4** | Durable distributed queue/scheduler, capability-aware worker routing, priority and aging, leases with expiry, backoff and attempts, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | CUDA kernels and a device boundary: 17 real kernels, NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
-| **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |
+| **N6** | Large-scale autonomous research campaigns on the deterministic engines: seeded architecture/parameter search, batch scheduler, Pareto reporting, replayable benchmark corpus | **implemented** (in-process scheduler; no training and no task-quality claim) |
 
 See [docs/N5_CUDA.md](docs/N5_CUDA.md) for the CUDA kernels, build, fallback policy and
-limitations, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
+limitations, [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) for campaign specs, determinism,
+corpus replay and limits, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
 measurements and limitations.
 
 ---
@@ -145,6 +148,10 @@ uzen quantize <source_id> --scheme int8
 uzen compare-models <source_id> <candidate_id> --tokens '[[0,1,2,3]]'
 uzen compare-quantized <source_id> <quantized_id> --tokens '[[0,1,2,3]]'
 uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
+uzen architecture compose <id_a> <id_b> --mode sequential
+uzen architecture edit <artifact_id> --operation truncate --keep-layers 1
+uzen campaign run --spec-file campaign.json
+uzen campaign verify
 uzen serve --host 0.0.0.0 --port 8080
 uzen mcp --root ./uzen-workspace
 uzen worker run --root ./uzen-worker
@@ -310,11 +317,12 @@ curl -s -X POST localhost:8080/v1/jobs -H 'content-type: application/json' \
 ## MCP
 
 `uzen mcp` speaks JSON-RPC 2.0 over stdio (newline or `Content-Length` framing) and
-exposes deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
-`uzen.generate_weights`, `uzen.evaluate_candidate`, `uzen.inspect_provenance`, and
-others. Each tool enforces task scope and STRICT_PLUS; an AI client cannot widen scope
-or request a prohibited effect. A `tools/call` with `params._meta.progressToken` emits
-real JSON-RPC `notifications/progress` messages during import, incrementing per stage.
+exposes 26 deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
+`uzen.generate_weights`, `uzen.compose_architectures`, `uzen.run_campaign`,
+`uzen.verify_campaign_corpus`, `uzen.inspect_provenance`, and others. Each tool enforces
+task scope and STRICT_PLUS; an AI client cannot widen scope or request a prohibited
+effect. A `tools/call` with `params._meta.progressToken` emits real JSON-RPC
+`notifications/progress` messages during import, incrementing per stage.
 
 ## The two engineering domains
 
@@ -342,7 +350,8 @@ uzen/
 │   ├── wie/      # weight intelligence / inspection
 │   ├── nwpc/     # operation registry, operation context
 │   ├── npa/      # neural parameter alignment
-│   ├── nase/     # architecture synthesis
+│   ├── nase/     # architecture synthesis and graph surgery
+│   ├── campaign/ # N6 planners, evaluator, SQLite store, benchmark corpus
 │   ├── wcomp/    # compiler, pipeline, execution plan
 │   ├── vel/      # verification & evaluation lab
 │   └── ane/      # autonomous neural engineer, search, planning, LLM bridge
@@ -366,6 +375,7 @@ uzen/
 * [docs/P1_IMPORT.md](docs/P1_IMPORT.md) — Hugging Face/safetensors import and compatibility report.
 * [docs/P2_MODEL_EXECUTION.md](docs/P2_MODEL_EXECUTION.md) — stored-model execution and modified-model comparison.
 * [docs/P6_NATIVE.md](docs/P6_NATIVE.md) — native CPU kernels, phase plan and measured limits.
+* [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) — campaign specs, determinism, corpus replay and limits.
 
 ## Tests
 

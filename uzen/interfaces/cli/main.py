@@ -201,6 +201,44 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--spec", required=True)
     ra.add_argument("--variants")
 
+    # architecture engineering ---------------------------------------- #
+    architecture = sub.add_parser("architecture", help="compose and edit NIR architectures")
+    architecture_sub = architecture.add_subparsers(dest="architecture_command", required=True)
+    ac = architecture_sub.add_parser("compose")
+    ac.add_argument("artifact_ids", nargs="+")
+    ac.add_argument("--mode", default="sequential")
+    ac.add_argument("--name")
+    ac.add_argument("--seed", default="0")
+    ae = architecture_sub.add_parser("edit")
+    ae.add_argument("artifact_id")
+    ae.add_argument("--operation", required=True, choices=("bypass", "truncate", "substitute"))
+    ae.add_argument("--node")
+    ae.add_argument("--keep-layers", type=int)
+    ae.add_argument("--new-op")
+    ae.add_argument("--port", default="a")
+    ae.add_argument("--param", action="append", default=[])
+
+    # campaigns ------------------------------------------------------- #
+    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6)")
+    campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
+    cr = campaign_sub.add_parser("run")
+    cr.add_argument("--spec", help="inline campaign spec JSON")
+    cr.add_argument("--spec-file", help="campaign spec JSON file")
+    cr.add_argument("--id", help="override the campaign id")
+    cr.add_argument("--no-resume", action="store_true")
+    cr.add_argument("--max-rounds", type=int)
+    cs = campaign_sub.add_parser("show")
+    cs.add_argument("campaign_id")
+    cl = campaign_sub.add_parser("list")
+    cl.add_argument("--limit", type=int, default=50)
+    ce = campaign_sub.add_parser("events")
+    ce.add_argument("campaign_id")
+    ce.add_argument("--after", type=int, default=0)
+    cv = campaign_sub.add_parser("verify")
+    cv.add_argument("--digest", action="append", default=[])
+    cp = campaign_sub.add_parser("replay")
+    cp.add_argument("digest")
+
     # artifacts ------------------------------------------------------- #
     art = sub.add_parser("artifacts", help="artifact store")
     art_sub = art.add_subparsers(dest="artifacts_command", required=True)
@@ -504,6 +542,61 @@ def _dispatch(args: argparse.Namespace) -> int:
                 }
             )
         )
+        return 0
+
+    if cmd == "architecture":
+        client = _client(args)
+        if args.architecture_command == "compose":
+            _emit(
+                client.compose_architectures(
+                    args.artifact_ids,
+                    mode=args.mode,
+                    name=args.name,
+                    seed=args.seed,
+                )
+            )
+        else:
+            _emit(
+                client.edit_architecture(
+                    args.artifact_id,
+                    args.operation,
+                    node_id=args.node,
+                    keep_layers=args.keep_layers,
+                    new_op=args.new_op,
+                    params=_kv_params(args.param),
+                    port=args.port,
+                )
+            )
+        return 0
+
+    if cmd == "campaign":
+        client = _client(args)
+        if args.campaign_command == "run":
+            if args.spec_file:
+                spec = json.loads(Path(args.spec_file).read_text(encoding="utf-8"))
+            else:
+                spec = _json_arg(args.spec)
+            if not isinstance(spec, dict):
+                raise SystemExit("campaign run requires --spec or --spec-file with a JSON object")
+            if args.id:
+                spec["campaign_id"] = args.id
+            _emit(
+                client.run_campaign(
+                    spec,
+                    resume=not args.no_resume,
+                    max_rounds=args.max_rounds,
+                )
+            )
+        elif args.campaign_command == "show":
+            _emit(client.campaign(args.campaign_id))
+        elif args.campaign_command == "list":
+            _emit({"campaigns": client.campaigns(limit=args.limit)})
+        elif args.campaign_command == "events":
+            _emit({"events": client.campaign_events(args.campaign_id, after=args.after)})
+        elif args.campaign_command == "verify":
+            _emit(client.verify_campaign_corpus(args.digest or None))
+        else:
+            _emit(client.replay_benchmark(args.digest))
         return 0
 
     if cmd == "artifacts":

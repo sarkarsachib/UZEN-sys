@@ -20,10 +20,12 @@ listed gate passes.
 | **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | **implemented** |
 | **N4** | Distributed execution: durable queue adapter, capability-aware worker scheduling, leases with expiry and attempts, priority and backoff, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite verified across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | GPU/native boundary: real CUDA kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | **implemented at the CUDA boundary** (17 kernels compile to PTX with NVRTC and assemble with `ptxas`; driver-API runtime and GPU tests present; execution not verified in the authoring environment because it has no driver/device; HIP not implemented) |
-| **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
+| **N6** | Large-scale autonomous research: candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | **implemented** (in-process batch scheduler; inference-only proxy metrics; see [N6_CAMPAIGNS.md](N6_CAMPAIGNS.md)) |
 
 N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
-a machine with a device. N6 is not started.
+a machine with a device. N6 runs real architecture and weight-transform campaigns with
+SQLite resume and a replayable corpus; it is not a distributed training or task-quality
+system.
 
 ## N1 — implemented native CPU layer
 
@@ -569,7 +571,7 @@ python -m pytest -o addopts="" -q tests/test_cuda_runtime.py
 python examples/cuda_device_demo.py --root /tmp/uzen-cuda-demo
 ```
 
-On this host the suite reports **10 passed, 4 skipped** and the demo ends
+On this host the suite reports **11 passed, 4 skipped** and the demo ends
 `RESULT: SKIPPED (no CUDA device; kernels compiled to PTX only)`. The four skips are
 the GPU parity tests (MLP, transformer with attention capture, weight residency,
 attention mask semantics), not fakes. The compile tests run and `ptxas` assembles the
@@ -589,8 +591,46 @@ PTX, so kernel syntax and PTX validity are checked without a device.
 10. Toolkit-free compilation needs the NVRTC wheel; execution still needs the vendor
     driver. A driver older than the PTX target fails with `runtime.cuda_kernel`.
 
-## N6 boundary
+## N6 — implemented campaign engine
 
-N6 builds research campaigns on the deterministic engines; candidate generation may
-be autonomous, but every candidate still passes the same STRICT_PLUS, validation and
-provenance path. No campaign engine is started.
+N6 builds research campaigns on the deterministic engines. Candidate generation is
+seeded and autonomous, but every candidate still passes the same validation and
+inference path; no candidate is trained or optimized by gradients.
+
+* `uzen/core/campaign/spec.py` defines immutable `CampaignSpec`, `Axis` and
+  `Objective` records. Architecture axes must name real family-spec fields; weight
+  axes are restricted to `scale`, `sparsity` and `quantize`.
+* `uzen/core/campaign/space.py` implements deterministic grid, random and evolutionary
+  proposal generation. Completed candidate digests are excluded and proposals are a
+  pure function of the seed, round and ranked trials.
+* `uzen/core/campaign/evaluate.py` builds the architecture or transformed package,
+  executes a real NumPy forward pass and measures parameters, bytes, node count,
+  output RMS/diversity, sparsity, int8 round-trip error and (for weight campaigns)
+  distance/activation agreement from a base package.
+* `uzen/core/campaign/store.py` persists campaigns, trials and events in SQLite. Trial
+  keys are `(campaign_id, candidate_digest)`, so a retry is idempotent. `max_rounds`
+  produces a paused campaign that can be resumed at the next batch boundary.
+* `uzen/core/campaign/corpus.py` writes successful trials to content-addressed JSON
+  records and rebuilds/re-executes them for verification. Timestamps and latency are
+  excluded from the record digest; environment versions are stored separately.
+* `uzen/core/campaign/engine.py` schedules batches (bounded thread pool), applies
+  constraints, scores objectives, computes the Pareto front, early-stops on patience
+  and persists every outcome, including `invalid`, `constraint` and `error` trials.
+
+The CLI exposes `campaign run|show|list|events|verify|replay`; the SDK exposes
+`run_campaign`, `campaign`, `campaigns`, `campaign_events`,
+`verify_campaign_corpus` and `replay_benchmark`; REST exposes `/v1/campaigns` and
+`/v1/benchmarks/{digest}`; MCP exposes five campaign tools. See
+[N6_CAMPAIGNS.md](N6_CAMPAIGNS.md) for the full schema, guarantees and limitations.
+
+### N6 honest limits
+
+1. The scheduler is in-process; there is no campaign distribution over N4 workers.
+2. Proxy metrics are not task quality. No dataset, loss or accuracy score exists.
+3. Resume is batch-granular: a crash inside a batch does not preserve its unwritten
+   trials, though completed trials are never duplicated.
+4. Verification tolerates low-bit BLAS differences within `1e-9` relative; it never
+   claims bitwise identity across machines.
+5. Weight campaigns cover scale, magnitude sparsity and symmetric int8 round-trip
+   simulation; they do not perform learned pruning or quantization-aware optimization.
+6. The REST run endpoint is synchronous and is not a background campaign daemon.

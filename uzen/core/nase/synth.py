@@ -110,6 +110,26 @@ def _concrete_shape_differs(a: TensorType, b: TensorType) -> bool:
     return False
 
 
+def _primary_output_name(graph: Graph) -> str:
+    """Pick the semantic output of a stage, not an alphabetical serialization order.
+
+    Stored graphs round-trip through JSON, which can reorder output names. Composition
+    must not accidentally feed a diagnostic ``hidden`` tensor when the model exposes
+    ``logits``/``out``.
+    """
+    for preferred in ("out", "logits", "y", "reconstruction", "eps_pred"):
+        if preferred in graph.outputs:
+            return preferred
+    return next(iter(graph.outputs))
+
+
+def _primary_input_name(graph: Graph) -> str:
+    for preferred in ("x", "tokens", "input"):
+        if preferred in graph.inputs:
+            return preferred
+    return next(iter(graph.inputs))
+
+
 def _definition_output_type(
     definition: ArchitectureDefinition, name: str | None = None
 ) -> TensorType | None:
@@ -174,11 +194,12 @@ def compose_definitions(
     prev_out_ref: Ref | None = None
     for index in range(len(graphs)):
         if index == 0:
-            prev_out_ref = list(graphs[0].outputs.values())[0]
+            prev_out_name = _primary_output_name(graphs[0])
+            prev_out_ref = graphs[0].outputs[prev_out_name]
             continue
         g = graphs[index]
-        # feed the previous stage's first output into this stage's first input
-        stage_input = next(iter(g.inputs))
+        # feed the previous stage's semantic output into this stage's primary input
+        stage_input = _primary_input_name(g)
         # ``merged`` holds deep copies of the stage nodes, so the rewire must target it
         # rather than the per-stage graph it was copied from.
         _rewire_input(merged, stage_input, prev_out_ref)
@@ -188,7 +209,7 @@ def compose_definitions(
             if stage_input.startswith(prefixes[index])
             else stage_input
         )
-        prev_type = _definition_output_type(definitions[index - 1])
+        prev_type = _definition_output_type(definitions[index - 1], prev_out_name)
         stage_input_type = definitions[index].graph.inputs.get(original_input)
         if (
             prev_type is not None
@@ -202,7 +223,8 @@ def compose_definitions(
         # The consumed stage input is no longer a graph input, so callers must not
         # supply it (the executor rejects unexpected inputs).
         merged.inputs.pop(stage_input, None)
-        first_out = list(g.outputs.values())[0]
+        prev_out_name = _primary_output_name(g)
+        first_out = g.outputs[prev_out_name]
         if mode == "residual":
             add_id = f"c{index}_residual_add"
             merged.add_node(add_id, "add", {"a": prev_out_ref, "b": first_out})
@@ -437,13 +459,27 @@ class ArchitectureSynthesizer:
     def graph_of(self, definition: ArchitectureDefinition) -> dict[str, Any]:
         return definition.graph.to_dict()
 
-    def from_graph(self, graph: Graph, *, parameter_shapes: Mapping[str, Sequence[int]] | None = None, family: str = "custom") -> ArchitectureDefinition:
+    def from_graph(
+        self,
+        graph: Graph,
+        *,
+        parameter_shapes: Mapping[str, Sequence[int]] | None = None,
+        family: str = "custom",
+        spec: Mapping[str, Any] | None = None,
+    ) -> ArchitectureDefinition:
         shapes = {name: tuple(int(d) for d in shape) for name, shape in (parameter_shapes or {}).items()}
         if not shapes:
             shapes = {name: (1,) for name in graph.parameter_names()}
+        # Rebuilding from a stored graph must preserve the family spec: truncation,
+        # depth checks and provenance depend on fields such as n_layers. Without this,
+        # every reconstructed definition looked like an unspec'd custom graph.
+        spec_payload = dict(spec or {})
+        if not spec_payload:
+            stored = graph.metadata.get("spec")
+            spec_payload = dict(stored) if isinstance(stored, Mapping) else {"synthesized": True}
         return ArchitectureDefinition(
             family=family,
-            spec={"synthesized": True},
+            spec=spec_payload,
             graph=graph,
             parameter_shapes=shapes,
             default_inputs={k: tuple(v.shape) for k, v in graph.inputs.items()},

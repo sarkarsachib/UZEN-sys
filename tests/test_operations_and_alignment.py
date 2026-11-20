@@ -34,6 +34,69 @@ def test_linear_interpolation_is_numerically_exact():
     np.testing.assert_allclose(result.output.tensors["w"], np.full((3, 2), 2.0, dtype=np.float32))
 
 
+def test_other_arithmetic_operations_are_exact():
+    a = WeightPackage.from_arrays({"w": np.array([[1.0, -2.0]], dtype=np.float32)})
+    b = WeightPackage.from_arrays({"w": np.array([[3.0, 4.0]], dtype=np.float32)})
+    np.testing.assert_allclose(
+        invoke("w.arithmetic.add_scalar", [a], {"value": 2.0}).output.tensors["w"],
+        np.array([[3.0, 0.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        invoke("w.arithmetic.negate", [a], {}).output.tensors["w"],
+        np.array([[-1.0, 2.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        invoke("w.arithmetic.hadamard", [a, b], {}).output.tensors["w"],
+        np.array([[3.0, -8.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        invoke("w.arithmetic.delta", [a, b], {}).output.tensors["w"],
+        np.array([[2.0, 6.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        invoke("w.arithmetic.scaled_add", [a, b], {"scale": 0.5}).output.tensors["w"],
+        np.array([[2.5, 0.0]], dtype=np.float32),
+    )
+
+
+def test_compose_donors_average_is_a_true_running_mean():
+    donors = [
+        WeightPackage.from_arrays({"w": np.full((2, 2), value, dtype=np.float32)})
+        for value in (0.0, 3.0, 6.0)
+    ]
+    result = invoke(
+        "w.gen.compose_donors", donors, {"conflict": "mean"}, scope=TaskScope.WEIGHT_GENERATION
+    )
+    np.testing.assert_allclose(result.output.tensors["w"], np.full((2, 2), 3.0, dtype=np.float32))
+    assert result.details["conflict"] == "average"
+
+
+def test_prune_heads_removes_the_requested_head_slice():
+    array = np.arange(48, dtype=np.float32).reshape(12, 4)
+    package = WeightPackage.from_arrays({"qkv.weight": array})
+    result = invoke(
+        "w.structural.prune_heads",
+        [package],
+        {"name": "qkv.weight", "n_heads": 2, "heads": [1]},
+    )
+    expected = array[:6, :2]
+    np.testing.assert_array_equal(result.output.tensors["qkv.weight"], expected)
+    assert result.details["shape_after"] == [6, 2]
+
+
+def test_extract_layers_keeps_only_the_requested_block():
+    from uzen.core.nws.families import build_architecture
+
+    package = build_architecture(
+        "transformer_decoder",
+        {"d_model": 8, "n_heads": 2, "n_layers": 2, "d_ff": 16, "vocab_size": 32, "max_seq_len": 8},
+    ).build_package(seed=0)
+    result = invoke("w.structural.extract", [package], {"layers": [1]})
+    assert "layers.1.qkv.weight" in result.output
+    assert "layers.0.qkv.weight" not in result.output
+    assert result.details["num_dropped"] > 0
+
+
 def test_extrapolation_is_numerically_exact():
     a = WeightPackage.from_arrays({"w": np.zeros((2, 2), dtype=np.float32)})
     b = WeightPackage.from_arrays({"w": np.ones((2, 2), dtype=np.float32)})

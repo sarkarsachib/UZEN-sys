@@ -22,6 +22,7 @@ import numpy as np
 from uzen.core.ane.planner import ANEResult, AutonomousNeuralEngineer, JobRequest
 from uzen.core.nase.synth import ArchitectureSynthesizer
 from uzen.core.nir.executor import execute
+from uzen.core.nir.graph import Graph, GraphValidationError
 from uzen.core.nws.families import build_architecture
 from uzen.core.nws.store import ArtifactRecord, ArtifactStore
 from uzen.core.nws.tensors import WeightPackage
@@ -1052,6 +1053,190 @@ class JobService:
             "notes": [
                 "weight architecture research reports representation trade-offs; it does not "
                 "claim downstream quality improvements",
+            ],
+        }
+
+    # ------------------------------------------------------------------ #
+    # architecture engineering (NASE)
+    # ------------------------------------------------------------------ #
+
+    def _definition_from_artifact(
+        self, artifact_id: str
+    ) -> tuple[Any, WeightPackage, dict[str, Any]]:
+        manifest = self.artifact_manifest(artifact_id)
+        graph_doc = (manifest.get("metadata") or {}).get("graph")
+        if not graph_doc:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' has no stored NIR graph; only synthesized "
+                "architectures can be edited"
+            )
+        package = self.get_package(artifact_id)
+        architecture = (manifest.get("metadata") or {}).get("architecture") or {}
+        definition = self.nase.from_graph(
+            Graph.from_dict(graph_doc),
+            parameter_shapes={entry["name"]: entry["shape"] for entry in manifest["tensors"]},
+            family=str(manifest.get("family", "custom")),
+            spec=architecture.get("spec") if isinstance(architecture, Mapping) else None,
+        )
+        return definition, package, manifest
+
+    def _architecture_inputs(self, graph: Graph, *, batch: int = 2, seq: int = 8) -> dict[str, np.ndarray]:
+        inputs: dict[str, np.ndarray] = {}
+        for name, spec in graph.inputs.items():
+            shape = tuple(
+                batch if dim == "B" else seq if isinstance(dim, str) else int(dim)
+                for dim in spec.shape
+            )
+            inputs[name] = np.zeros(shape, dtype=spec.dtype)
+        return inputs
+
+    def _persist_architecture(
+        self,
+        definition: Any,
+        package: WeightPackage,
+        *,
+        operation: str,
+        parents: list[str],
+        note: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        inputs = self._architecture_inputs(definition.graph)
+        result = execute(definition.graph, inputs, package)
+        verification = verify(
+            package,
+            graph=definition.graph,
+            inputs=inputs,
+            policy_records=[],
+            operations=[],
+        )
+        record = self.store.put(
+            package,
+            operation=operation,
+            parents=parents,
+            reuse_existing=True,
+            metadata={
+                "architecture": definition.summary(),
+                "graph": definition.graph.to_dict(),
+                **(dict(extra or {})),
+            },
+            validation=verification.to_dict(),
+            note=note,
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=package.name,
+            family=package.family,
+            operation=operation,
+            numel=package.numel(),
+            num_tensors=len(package),
+        )
+        self.db.register_model(
+            artifact_id=record.artifact_id,
+            family=package.family,
+            spec={**definition.spec, "graph": definition.graph.to_dict()},
+        )
+        return {
+            "artifact_id": record.artifact_id,
+            "architecture": definition.summary(),
+            "forward_outputs": {key: list(value.shape) for key, value in result.outputs.items()},
+            "verification": verification.to_dict(),
+        }
+
+    def edit_architecture(
+        self,
+        artifact_id: str,
+        operation: str,
+        *,
+        node_id: str | None = None,
+        keep_layers: int | None = None,
+        new_op: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        port: str = "a",
+    ) -> dict[str, Any]:
+        """Apply NASE graph surgery to a stored architecture and persist the result.
+
+        Bypass and truncation preserve the surviving tensors exactly; substitution is
+        persisted only when the replacement operator binds the existing parameter
+        names. A structure that would need new random weights is refused rather than
+        silently initialising them.
+        """
+        definition, package, _manifest = self._definition_from_artifact(artifact_id)
+        if operation == "bypass":
+            if not node_id:
+                raise InvalidOperationParameters("bypass requires node_id")
+            report = self.nase.bypass(definition, node_id, port=port)
+        elif operation == "truncate":
+            if keep_layers is None:
+                raise InvalidOperationParameters("truncate requires keep_layers")
+            report = self.nase.truncate_layers(definition, int(keep_layers))
+        elif operation == "substitute":
+            if not node_id or not new_op:
+                raise InvalidOperationParameters("substitute requires node_id and new_op")
+            report = self.nase.substitute(definition, node_id, new_op, params)
+        else:
+            raise InvalidOperationParameters(
+                f"unknown architecture operation '{operation}'; use bypass|truncate|substitute"
+            )
+        definition = report.definition
+        definition.graph.require_valid()
+        surviving = package.without(report.invalidated_parameters)
+        validation = definition.graph.validate(surviving)
+        if not validation.ok:
+            raise GraphValidationError(
+                "architecture edit does not bind the surviving parameters; regenerate "
+                "weights instead of silently replacing them",
+                errors=validation.errors[:10],
+                warnings=report.warnings,
+            )
+        persisted = self._persist_architecture(
+            definition,
+            surviving,
+            operation=f"architecture_{operation}",
+            parents=[artifact_id],
+            note=f"NASE {operation}",
+            extra={"changes": report.changes, "warnings": report.warnings},
+        )
+        return {
+            **persisted,
+            "changes": report.changes,
+            "invalidated_parameters": report.invalidated_parameters,
+            "warnings": report.warnings,
+        }
+
+    def compose_architectures(
+        self,
+        artifact_ids: Sequence[str],
+        *,
+        mode: str = "sequential",
+        name: str | None = None,
+        seed: int | str | None = 0,
+    ) -> dict[str, Any]:
+        if len(artifact_ids) < 2:
+            raise InvalidOperationParameters("composition requires at least two artifacts")
+        definitions = []
+        for artifact_id in artifact_ids:
+            definition, _package, _manifest = self._definition_from_artifact(artifact_id)
+            definitions.append(definition)
+        composed = self.nase.compose(definitions, mode=mode, name=name)
+        package = composed.build_package(seed=seed, name=name or "composed")
+        composed.graph.require_valid(package)
+        persisted = self._persist_architecture(
+            composed,
+            package,
+            operation="architecture_compose",
+            parents=list(artifact_ids),
+            note=f"NASE {mode} composition",
+            extra={"composition": mode},
+        )
+        return {
+            **persisted,
+            "components": list(artifact_ids),
+            "composition": mode,
+            "notes": [
+                "component parameters are not transplanted by composition; the new "
+                "graph is initialised with labelled structured random weights",
+                "the source artifacts remain unchanged and appear as lineage parents",
             ],
         }
 

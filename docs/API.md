@@ -34,6 +34,8 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | `worker.auth_failed` | 401 | invalid worker credentials |
 | `runtime.unavailable` | 503 | optional backend missing (e.g. torch) |
 | `budget.exhausted` | 429 | search budget exhausted |
+| `campaign.conflict` | 409 | campaign id reused with a different spec |
+| `campaign.not_found` | 404 | unknown campaign id |
 
 ## REST (v1)
 
@@ -47,6 +49,15 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | GET | `/v1/architectures/families` | supported families + specs |
 | POST | `/v1/architectures/synthesize` | build a model from a family spec |
 | POST | `/v1/architectures/research` | compare architecture variants |
+| POST | `/v1/architectures/compose` | compose stored graphs (sequential/parallel/residual), validate, execute and persist with lineage |
+| POST | `/v1/architectures/{id}/edit` | bypass, truncate or substitute a stored graph and persist the surviving parameters |
+| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`) |
+| GET | `/v1/campaigns` | list campaigns |
+| POST | `/v1/campaigns/verify` | replay benchmark records (optional `digests`) |
+| GET | `/v1/campaigns/{id}` | campaign report and trials |
+| GET | `/v1/campaigns/{id}/events` | campaign event history |
+| GET | `/v1/campaigns/{id}/corpus` | corpus merkle root and record digests |
+| GET | `/v1/benchmarks/{digest}` | replay one content-addressed benchmark record |
 | POST | `/v1/models/import` | import a local HF directory/file, weights-only `.pt/.pth/.bin/.ckpt`, single-file `.onnx`, or `repo_id` + `revision`; returns the compatibility report or provenance report, plus graph/reconstruction status when available |
 | POST | `/v1/models/{id}/quantize` | persist a weight-only int8 artifact variant; returns the new artifact id and quantization report |
 | POST | `/v1/models/{id}/forward` | execute a stored reconstructed graph on tokens/positions; optional `capture` node ids or `["layers"]`; `quantize: "int8"` returns the quantization report |
@@ -144,8 +155,8 @@ local.operations(); local.policy(); local.families()
 
 `uzen --help` lists groups: `ops`, `policy`, `families`, `inspect`, `import`,
 `analyze`, `modify`, `generate`, `evaluate`, `quantize`, `forward`, `generate-text`,
-`compare-models`, `compare-quantized`, `align`, `research`, `artifacts`, `job`,
-`serve`, `worker`, `mcp`, `sdk`. `uzen forward` accepts exactly one of `--tokens` or `--text`; `--text` uses the
+`compare-models`, `compare-quantized`, `align`, `research`, `architecture`, `campaign`,
+`artifacts`, `job`, `serve`, `worker`, `mcp`, `sdk`. `uzen forward` accepts exactly one of `--tokens` or `--text`; `--text` uses the
 imported tokenizer. Errors print `{"error": {...}}` to stderr and exit 2.
 
 ## MCP
@@ -156,8 +167,10 @@ Tools: `uzen.import_model`, `uzen.quantize_model`, `uzen.forward_model`,
 `uzen.plan_engineering`,
 `uzen.generate_weights`, `uzen.modify_weights`, `uzen.reconstruct_weights`,
 `uzen.research_weight_architecture`, `uzen.research_model_architecture`,
-`uzen.modify_architecture`, `uzen.create_model`, `uzen.evaluate_candidate`,
-`uzen.inspect_provenance`, `uzen.get_job_status`.
+`uzen.modify_architecture`, `uzen.compose_architectures`, `uzen.create_model`,
+`uzen.evaluate_candidate`, `uzen.inspect_provenance`, `uzen.get_job_status`,
+`uzen.run_campaign`, `uzen.get_campaign`, `uzen.list_campaigns`,
+`uzen.verify_campaign_corpus`, `uzen.replay_benchmark`.
 
 Transport: JSON-RPC 2.0 over stdio; `initialize`, `tools/list`, `tools/call`, `ping`.
 Tool failures return `isError: true` with the typed error payload rather than a

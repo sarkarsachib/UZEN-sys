@@ -518,6 +518,44 @@ def create_app(
     # architectures
     # ------------------------------------------------------------------ #
 
+    @app.post(f"/{API_VERSION}/architectures/compose")
+    def compose_architectures(payload: dict[str, Any], _: None = Depends(require_auth)):
+        artifact_ids = payload.get("artifact_ids")
+        if not isinstance(artifact_ids, list) or len(artifact_ids) < 2:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "request.invalid",
+                    "message": "provide at least two artifact_ids",
+                },
+            )
+        return service.compose_architectures(
+            [str(item) for item in artifact_ids],
+            mode=str(payload.get("mode", "sequential")),
+            name=payload.get("name"),
+            seed=payload.get("seed", 0),
+        )
+
+    @app.post(f"/{API_VERSION}/architectures/{{artifact_id}}/edit")
+    def edit_architecture(
+        artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)
+    ):
+        operation = payload.get("operation")
+        if not operation:
+            raise HTTPException(
+                400,
+                detail={"code": "request.invalid", "message": "provide operation"},
+            )
+        return service.edit_architecture(
+            artifact_id,
+            str(operation),
+            node_id=payload.get("node_id"),
+            keep_layers=payload.get("keep_layers"),
+            new_op=payload.get("new_op"),
+            params=payload.get("params"),
+            port=str(payload.get("port", "a")),
+        )
+
     @app.post(f"/{API_VERSION}/architectures/synthesize")
     def synthesize_architecture(payload: dict[str, Any], _: None = Depends(require_auth)):
         job = service.submit(
@@ -546,6 +584,63 @@ def create_app(
             }
         )
         return service.run(job["id"])
+
+    # ------------------------------------------------------------------ #
+    # research campaigns (N6)
+    # ------------------------------------------------------------------ #
+
+    @app.post(f"/{API_VERSION}/campaigns")
+    def run_campaign(payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine, CampaignSpec
+
+        if "spec" not in payload:
+            raise HTTPException(400, detail={"code": "request.invalid", "message": "provide spec"})
+        spec = CampaignSpec.from_dict(payload["spec"])
+        engine = CampaignEngine(service.root)
+        report = engine.run(
+            spec,
+            resume=bool(payload.get("resume", True)),
+            max_rounds=payload.get("max_rounds"),
+        )
+        return report.to_dict()
+
+    @app.get(f"/{API_VERSION}/campaigns")
+    def list_campaigns(limit: int = 50, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return {"campaigns": CampaignEngine(service.root).list_campaigns(limit=limit)}
+
+    @app.post(f"/{API_VERSION}/campaigns/verify")
+    def verify_campaign_corpus(payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return CampaignEngine(service.root).verify_corpus(payload.get("digests"))
+
+    @app.get(f"/{API_VERSION}/campaigns/{{campaign_id}}")
+    def get_campaign(campaign_id: str, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return CampaignEngine(service.root).get(campaign_id).to_dict()
+
+    @app.get(f"/{API_VERSION}/campaigns/{{campaign_id}}/events")
+    def campaign_events(campaign_id: str, after: int = 0, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return {"events": CampaignEngine(service.root).events(campaign_id, after=after)}
+
+    @app.get(f"/{API_VERSION}/campaigns/{{campaign_id}}/corpus")
+    def campaign_corpus(campaign_id: str, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        engine = CampaignEngine(service.root)
+        report = engine.get(campaign_id)
+        return {"campaign_id": campaign_id, "merkle": report.corpus_digest, "records": engine.corpus.digests()}
+
+    @app.get(f"/{API_VERSION}/benchmarks/{{digest}}")
+    def replay_benchmark(digest: str, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return CampaignEngine(service.root).replay(digest)
 
     # ------------------------------------------------------------------ #
     # workers
