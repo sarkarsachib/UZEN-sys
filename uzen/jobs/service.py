@@ -52,6 +52,7 @@ from uzen.errors import (
     UzenError,
 )
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
+from uzen.jobs.scheduling import requirements_from_request
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
 from uzen.util.canonical import sha256_file, utc_now_iso
 
@@ -744,8 +745,25 @@ class JobService:
                     scope=job_request.task_scope.value,
                 )
             spec.validate_params(dict(entry.get("params") or {}))
-        row = self.db.create_job(request, idempotency_key=idempotency_key)
-        self.db.append_event(row.id, "queued", {"scope": job_request.task_scope.value})
+        # The capability requirement set is derived from the request itself and stored
+        # with the job, so dispatch can decide eligibility inside the claiming statement
+        # without re-parsing the request (and without trusting the worker's word).
+        requirements = requirements_from_request(request)
+        row = self.db.create_job(
+            request,
+            idempotency_key=idempotency_key,
+            requirements=requirements,
+            priority=int(request.get("priority") or 0),
+        )
+        self.db.append_event(
+            row.id,
+            "queued",
+            {
+                "scope": job_request.task_scope.value,
+                "requirements": requirements.to_dict(),
+                "priority": row.priority,
+            },
+        )
         return row.to_dict()
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -768,10 +786,31 @@ class JobService:
 
     # ------------------------------------------------------------------ #
 
-    def run(self, job_id: str) -> dict[str, Any]:
+    def run(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a job, either as the control plane or as a worker holding a lease.
+
+        A leased execution (``worker_id`` and ``token`` supplied) settles the job through
+        :meth:`Database.finish_from_worker`, so the dispatch record, the attempt number and
+        the idempotency guard are the same ones a remote worker goes through. A local
+        execution settles it directly. Either way the caller never declares success: the
+        state comes from the executed work or from the recorded error.
+        """
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
             raise JobStateError(f"job '{job_id}' already finished ({row.state})")
+        leased = worker_id is not None and token is not None
+        if leased and (row.dispatch_token != token or row.worker_id != worker_id):
+            raise JobStateError(
+                f"job '{job_id}' is not leased to worker '{worker_id}' with that token",
+                job_id=job_id,
+                current_worker=row.worker_id,
+            )
         if self.db.is_cancel_requested(job_id):
             self.db.transition(job_id, "CANCELLED", payload={"reason": "cancel requested"})
             return self.db.get_job(job_id).to_dict()
@@ -782,11 +821,10 @@ class JobService:
             if isinstance(result, dict) and "artifact_id" in result:
                 result.setdefault("output_artifact_id", result["artifact_id"])
         except UzenError as exc:
-            self.db.set_error(job_id, {"error": exc.to_dict(), "timestamp": utc_now_iso()})
-            self.db.release_lease(job_id)
+            self._settle_failure(job_id, {"error": exc.to_dict(), "timestamp": utc_now_iso()}, worker_id, token)
             return self.db.get_job(job_id).to_dict()
         except Exception as exc:  # unexpected: recorded with type for diagnosis
-            self.db.set_error(
+            self._settle_failure(
                 job_id,
                 {
                     "error": {
@@ -796,13 +834,39 @@ class JobService:
                     },
                     "timestamp": utc_now_iso(),
                 },
+                worker_id,
+                token,
             )
-            self.db.release_lease(job_id)
             return self.db.get_job(job_id).to_dict()
         self.db.transition(job_id, "VALIDATING", progress=0.9)
-        self.db.set_result(job_id, result)
-        self.db.release_lease(job_id)
+        if leased:
+            assert worker_id is not None and token is not None
+            self.db.finish_from_worker(
+                job_id, worker_id=worker_id, token=token, state="SUCCEEDED", result=result
+            )
+        else:
+            self.db.set_result(job_id, result)
+            self.db.release_lease(job_id)
         return self.db.get_job(job_id).to_dict()
+
+    def _settle_failure(
+        self,
+        job_id: str,
+        error: Mapping[str, Any],
+        worker_id: str | None,
+        token: str | None,
+    ) -> None:
+        if worker_id is not None and token is not None:
+            self.db.finish_from_worker(
+                job_id,
+                worker_id=worker_id,
+                token=token,
+                state="FAILED",
+                error=dict(error.get("error") or {}),
+            )
+            return
+        self.db.set_error(job_id, error)
+        self.db.release_lease(job_id)
 
     def run_pending(self, limit: int = 1) -> list[dict[str, Any]]:
         out = []

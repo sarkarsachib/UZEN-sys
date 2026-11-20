@@ -38,6 +38,7 @@ from uzen.errors import UzenError
 from uzen.infrastructure.observability.metrics import METRICS
 from uzen.infrastructure.security.tokens import hash_secret
 from uzen.infrastructure.storage.db import JOB_STATES
+from uzen.jobs.scheduler import JobScheduler
 from uzen.jobs.service import JobService
 from uzen.policies.strict_plus.engine import default_engine
 from uzen.runtimes.pytorch_runtime import PyTorchRuntime, torch_available
@@ -51,6 +52,13 @@ def create_app(
     root: str | Path | None = None,
     service: JobService | None = None,
     api_token: str | None = None,
+    auto_run: bool = True,
+    lease_seconds: float = 120.0,
+    max_attempts: int = 3,
+    retry_backoff_seconds: float = 0.0,
+    retry_backoff_cap_seconds: float = 300.0,
+    aging_seconds: float = 0.0,
+    max_in_flight_per_worker: int = 0,
 ) -> Any:
     if not FASTAPI_AVAILABLE:
         from uzen.errors import RuntimeUnavailable
@@ -60,6 +68,17 @@ def create_app(
             "`pip install 'uzen[api]'` or run the engine via CLI/SDK instead"
         )
     service = service or JobService(root or os.environ.get("UZEN_ROOT", "./uzen-workspace"))
+    # A distributed deployment sets auto_run=False: jobs stay QUEUED until a registered
+    # worker claims them, instead of being executed inside the API process.
+    scheduler = JobScheduler(
+        service.db,
+        lease_seconds=lease_seconds,
+        max_attempts=max_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
+        retry_backoff_cap_seconds=retry_backoff_cap_seconds,
+        aging_seconds=aging_seconds,
+        max_in_flight_per_worker=max_in_flight_per_worker,
+    )
     token = api_token if api_token is not None else os.environ.get("UZEN_API_TOKEN")
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="uzen-job")
     lock = threading.Lock()
@@ -74,6 +93,8 @@ def create_app(
         ),
     )
     app.state.service = service
+    app.state.scheduler = scheduler
+    app.state.auto_run = auto_run
 
     @app.middleware("http")
     async def observe_http(request: Request, call_next):
@@ -189,7 +210,8 @@ def create_app(
         _: None = Depends(require_auth),
     ):
         job = service.submit(payload, idempotency_key=idempotency_key)
-        executor.submit(_safe_run, service, job["id"])
+        if auto_run:
+            executor.submit(_safe_run, service, job["id"])
         return job
 
     def _safe_run(svc: JobService, job_id: str) -> None:
@@ -565,29 +587,98 @@ def create_app(
     @app.post(f"/{API_VERSION}/workers/heartbeat")
     def worker_heartbeat(payload: dict[str, Any]):
         worker_id = _authenticate_worker(payload)
-        service.db.heartbeat(worker_id, status=str(payload.get("status", "online")))
+        status = payload.get("status")
+        service.db.heartbeat(worker_id, status=str(status) if status is not None else None)
         return {"ok": True, "worker_id": worker_id}
 
     @app.post(f"/{API_VERSION}/workers/claim")
     def worker_claim(payload: dict[str, Any]):
         worker_id = _authenticate_worker(payload)
-        job = service.db.claim_job(worker_id, lease_seconds=float(payload.get("lease_seconds", 120.0)))
-        return {"job": job.to_dict() if job else None}
+        capabilities = payload.get("capabilities")
+        job = scheduler.claim(
+            worker_id,
+            capabilities=dict(capabilities) if isinstance(capabilities, Mapping) else None,
+            lease_seconds=(
+                float(payload["lease_seconds"]) if payload.get("lease_seconds") is not None else None
+            ),
+            wait_seconds=(
+                float(payload["wait_seconds"]) if payload.get("wait_seconds") is not None else 0.0
+            ),
+        )
+        return {"job": job, "scheduler": scheduler.describe()}
 
     @app.post(f"/{API_VERSION}/workers/renew")
     def worker_renew(payload: dict[str, Any]):
         worker_id = _authenticate_worker(payload)
-        ok = service.db.renew_lease(str(payload["job_id"]), worker_id, lease_seconds=float(payload.get("lease_seconds", 120.0)))
-        return {"ok": ok}
+        ok = scheduler.renew(
+            str(payload.get("job_id", "")),
+            worker_id,
+            token=(str(payload["token"]) if payload.get("token") else None),
+            lease_seconds=(
+                float(payload["lease_seconds"]) if payload.get("lease_seconds") is not None else None
+            ),
+        )
+        return {
+            "ok": ok,
+            "detail": None if ok else "lease is no longer held by this worker",
+        }
 
     @app.post(f"/{API_VERSION}/workers/report")
     def worker_report(payload: dict[str, Any]):
         worker_id = _authenticate_worker(payload)
         job_id = str(payload.get("job_id", ""))
-        if not job_id:
-            raise HTTPException(400, detail={"code": "worker.invalid", "message": "job_id required"})
-        service.db.append_event(job_id, "worker_report", {"worker_id": worker_id, "result": payload.get("result")})
-        service.db.release_lease(job_id)
-        return {"ok": True}
+        token = str(payload.get("token") or "")
+        if not job_id or not token:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "worker.invalid",
+                    "message": "job_id and the dispatch token from the claim are required",
+                },
+            )
+        body = payload.get("result")
+        if not isinstance(body, Mapping):
+            raise HTTPException(400, detail={"code": "worker.invalid", "message": "result object required"})
+        outcome = scheduler.report(
+            job_id,
+            worker_id=worker_id,
+            token=token,
+            state=str(body.get("state", "FAILED")),
+            result=body.get("result") if isinstance(body.get("result"), Mapping) else None,
+            error=body.get("error") if isinstance(body.get("error"), Mapping) else None,
+        )
+        return {"ok": outcome["status"] == "accepted", **outcome}
+
+    # ------------------------------------------------------------------ #
+    # scheduler
+    # ------------------------------------------------------------------ #
+
+    @app.get(f"/{API_VERSION}/scheduler")
+    def scheduler_status(_: None = Depends(require_auth)):
+        return {"scheduler": scheduler.describe(), **scheduler.status()}
+
+    @app.post(f"/{API_VERSION}/scheduler/reap")
+    def scheduler_reap(_: None = Depends(require_auth)):
+        return {"reaped": scheduler.reap()}
+
+    @app.post(f"/{API_VERSION}/jobs/{{job_id}}/preempt")
+    def preempt_job(job_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        return scheduler.preempt(job_id, reason=str(payload.get("reason", "preempted by operator")))
+
+    @app.post(f"/{API_VERSION}/workers/{{worker_id}}/drain")
+    def drain_worker(worker_id: str, _: None = Depends(require_auth)):
+        return scheduler.drain_worker(worker_id)
+
+    @app.post(f"/{API_VERSION}/workers/{{worker_id}}/resume")
+    def resume_worker(worker_id: str, _: None = Depends(require_auth)):
+        return scheduler.resume_worker(worker_id)
+
+    @app.get(f"/{API_VERSION}/jobs/{{job_id}}/dispatch")
+    def job_dispatch_history(job_id: str, _: None = Depends(require_auth)):
+        return scheduler.history(job_id)
+
+    @app.get(f"/{API_VERSION}/jobs/{{job_id}}/eligibility")
+    def job_eligibility(job_id: str, _: None = Depends(require_auth)):
+        return scheduler.eligible_workers(job_id)
 
     return app

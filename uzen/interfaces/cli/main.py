@@ -242,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--reload", action="store_true")
+    serve.add_argument(
+        "--no-auto-run",
+        action="store_true",
+        help="leave submitted jobs QUEUED for registered workers instead of running them in-process",
+    )
+    serve.add_argument("--lease-seconds", type=float, default=120.0)
+    serve.add_argument("--max-attempts", type=int, default=3)
+    serve.add_argument("--retry-backoff-seconds", type=float, default=0.0)
+    serve.add_argument("--retry-backoff-cap-seconds", type=float, default=300.0)
+    serve.add_argument("--aging-seconds", type=float, default=0.0)
+    serve.add_argument("--max-in-flight-per-worker", type=int, default=0)
 
     worker = sub.add_parser("worker", help="worker daemon")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -252,6 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_run.add_argument("--worker-id", default=None)
     worker_run.add_argument("--once", action="store_true")
     worker_run.add_argument("--poll", type=float, default=1.0)
+    worker_run.add_argument("--lease-seconds", type=float, default=120.0)
+    worker_run.add_argument("--wait-seconds", type=float, default=0.0)
 
     mcp = sub.add_parser("mcp", help="run the MCP stdio server")
     mcp.add_argument("--root", default="./uzen-workspace")
@@ -546,7 +559,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             import uvicorn
         except ImportError as exc:  # pragma: no cover
             raise SystemExit("uvicorn is required for `uzen serve`: pip install 'uzen[api]'") from exc
-        app = create_app(root=args.root)
+        app = create_app(
+            root=args.root,
+            auto_run=not args.no_auto_run,
+            lease_seconds=args.lease_seconds,
+            max_attempts=args.max_attempts,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            retry_backoff_cap_seconds=args.retry_backoff_cap_seconds,
+            aging_seconds=args.aging_seconds,
+            max_in_flight_per_worker=args.max_in_flight_per_worker,
+        )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
@@ -558,6 +580,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             worker_id=args.worker_id,
             control_plane=args.url,
             secret=args.secret,
+            lease_seconds=args.lease_seconds,
+            claim_wait_seconds=args.wait_seconds,
+            poll_interval=args.poll,
         )
         if args.once:
             _emit(daemon.run_once())

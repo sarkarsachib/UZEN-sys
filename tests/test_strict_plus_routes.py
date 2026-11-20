@@ -25,6 +25,34 @@ from uzen.policies.strict_plus.effects import TaskScope
 from uzen.policies.strict_plus.engine import AuditLog, StrictPlusEngine
 
 
+def test_cli_submit_rejects_a_prohibited_operation(tmp_path, capsys):
+    """The CLI has no separate mutation path; its refusal must come from the service."""
+    request = {
+        "task_scope": "weight_modification",
+        "objective": "try to train",
+        "operations": [{"op": "w.train.finetune", "params": {}}],
+    }
+    code = cli_main(
+        ["--root", str(tmp_path / "cli-workspace"), "job", "submit", "--json", json.dumps(request)]
+    )
+    assert code == 2
+    captured = capsys.readouterr()
+    assert '"error"' in captured.err
+
+
+def test_cli_submit_rejects_an_operation_outside_the_scope(tmp_path, capsys):
+    request = {
+        "task_scope": "inspection",
+        "objective": "try to mutate during inspection",
+        "operations": [{"op": "w.arithmetic.scale", "params": {"factor": 2.0}}],
+    }
+    code = cli_main(
+        ["--root", str(tmp_path / "cli-workspace-2"), "job", "submit", "--json", json.dumps(request)]
+    )
+    assert code == 2
+    assert "error" in capsys.readouterr().err
+
+
 def test_registry_route_rejects_training_operation(mlp_package):
     with pytest.raises(OperationNotRegistered):
         default_registry().invoke(

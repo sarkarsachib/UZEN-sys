@@ -18,11 +18,11 @@ listed gate passes.
 | **N1** | Native CPU arithmetic: C++17 kernels, ctypes ABI, NIR executor, native runtime adapter, parity tests, working demo | **implemented** |
 | **N2** | Native graph compiler: lower NIR to a native execution plan, fuse linear+activation and residual+norm, prepack weights, add conv/pool/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, liveness memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | **implemented** |
-| **N4** | Distributed execution: durable queue adapter (Redis/Valkey or PostgreSQL), capability-aware native worker scheduling, leases, idempotent dispatch, remote artifact fetch | planned; local SQLite leases and S3-compatible transport already exist |
+| **N4** | Distributed execution: durable queue adapter, capability-aware worker scheduling, leases with expiry and attempts, priority and backoff, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite verified across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | GPU/native boundary: real CUDA/HIP kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | planned; **no GPU acceleration is claimed now** |
 | **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
 
-N4 is the next phase. N4–N6 build on N2's plan and N3's layouts and are not started.
+N5 is the next phase. N5–N6 build on N2's plan and N3's layouts and are not started.
 
 ## N1 — implemented native CPU layer
 
@@ -365,12 +365,177 @@ shows the real number.
 8. **Still float32 activations and still CPU.** No CUDA, no mixed-precision
    hardware path, no quantized attention.
 
-## N4–N6 boundaries
+## N4 — implemented distributed scheduling
 
-* **N4** adds distributed scheduling around the existing job/worker contracts; it
-  must not weaken lease/idempotency semantics.
+N4 keeps the NIR/graph work untouched and hardens the *control plane* around it: which
+worker may take a job, for how long, what happens when it dies, and what stops a second
+report from changing an outcome. Workers still pull; nothing is pushed at a worker that
+did not ask.
+
+### Guarantees and the mechanism behind each
+
+| Guarantee | Mechanism |
+| --- | --- |
+| A job only goes to a worker that can run it | requirements are derived from the request (`requirements_from_request`) into `job_requirements` rows plus numeric budgets; the worker's advertised document becomes `worker_capabilities` rows through the same `capability_index`, so the SQL predicate and the Python explanation cannot disagree |
+| Two workers can never hold one job | the eligibility predicate is inside the claiming `UPDATE` … `WHERE id = (SELECT …)`, a single SQLite statement; concurrent control-plane processes are serialized by the writer lock, and the claim installs `lease_expires_at` in the same statement |
+| A dead worker's job comes back | `reap_expired_leases` returns expired leases to `QUEUED` (incrementing nothing but re-using the attempt counter), or fails the job with `job.lease_expired` once attempts are exhausted; the reaper runs inside every claim, so a polling fleet heals itself |
+| A superseded worker cannot publish | every claim mints a `dispatch_token`; renew and report must present it, and the report compares it against the *current* token, so a zombie worker is answered `stale` instead of overwriting the replacement |
+| A repeated report changes nothing | `dispatch_records(job_id, attempt)` is unique and flips from `dispatched` to a terminal outcome exactly once; later reports answer `duplicate` with the recorded outcome |
+| Re-execution does not duplicate artifacts | the worker's local job keeps the control-plane job id and returns the stored result for an already-terminal job instead of running it again |
+| Hungry jobs are visible | `JobScheduler.unroutable_jobs()` reports queued jobs no registered worker satisfies, with the exact capability each worker lacked |
+| Urgent work goes first without starving the rest | `jobs.priority` is an operator bias (clamped to ±1000) inside the claim's `ORDER BY`; optional `aging_seconds` adds one effective priority point per aging interval waited, so an old low-priority job eventually overtakes a stream of fresh ones |
+| A failed attempt is not retried in a hot loop | the reaper stores `available_at = now + min(cap, base * 2^(attempt-1))`; the claim predicate refuses the row until that instant, and the delay is recorded on the lease-expiry event |
+| An operator can take a job back | `JobScheduler.preempt` clears the lease and token, returns the row to `QUEUED` at once, and records a `preempted` event; the old worker's next renew or report is refused as `stale` |
+| A worker can leave the fleet without killing work | a `draining` worker is excluded inside the claiming predicate but keeps renewing its current lease; `resume_worker` puts it back. A routine heartbeat only touches `last_seen`, so it cannot silently un-drain a worker |
+| Idle polling is bounded | `claim(wait_seconds=...)` long-polls the same atomic claim and returns as soon as a job appears; the REST claim and the worker daemon expose the same window |
+| A skewed worker clock cannot move a Redis lease | the Redis adapter reads the server's `TIME` for claim, renew, reap and preempt instead of trusting the caller's clock |
+
+Job states gained one transition: `DISPATCHED → QUEUED` (and `RUNNING → QUEUED`) for lease
+expiry and preemption, and `DISPATCHED → VALIDATING` for a worker that reports success
+without an intermediate poll. A worker never chooses its own next state.
+
+### Durable queue
+
+`JobScheduler` talks to the job database, and the database is the queue: WAL SQLite with
+a single atomic claim statement. That is a real multi-process deployment on one host (or
+one host with the database on local disk), which is what this build verifies.
+
+`uzen/infrastructure/storage/redis_queue.py` is the multi-node adapter: a RESP2 client
+with no third-party dependency, and Lua scripts that keep claim, renew, report and reap
+atomic on the server (`uzen:q:ready`, `uzen:q:job:<id>`, `uzen:q:caps:<worker>`,
+`uzen:q:lease` sorted set, `uzen:q:reports`). It mirrors the SQLite semantics — same
+token, attempt and duplicate-report rules — plus priority selection, backoff, draining,
+preemption and the server-side clock.
+
+> **Status:** the Redis adapter is exercised against a **live Redis 7.4.2 server** in
+> this workspace (built from source; the integration test is gated by `UZEN_REDIS_URL`).
+> It is not yet exercised across physical hosts, network partitions or a failover pair,
+> so the Redis topology itself remains a deployment concern. Do not run a multi-node
+> fleet on SQLite over NFS: WAL needs shared memory.
+
+### Code
+
+```python
+from uzen.jobs.scheduler import JobScheduler
+from uzen.jobs.service import JobService
+
+service = JobService("./uzen-plane")
+scheduler = JobScheduler(
+    service.db,
+    lease_seconds=120,
+    max_attempts=3,
+    retry_backoff_seconds=5,
+    retry_backoff_cap_seconds=60,
+    aging_seconds=30,
+    max_in_flight_per_worker=2,
+)
+
+# control plane
+job = service.submit({"task_scope": "weight_modification", ..., "priority": 10})
+
+# worker
+claimed = scheduler.claim(
+    "fleet-a", capabilities=my_capabilities, wait_seconds=15.0
+)
+token = claimed["lease"]["token"]
+executed = service.run(claimed["id"], worker_id="fleet-a", token=token)
+
+# operator
+scheduler.drain_worker("fleet-a")
+scheduler.preempt(job["id"], reason="maintenance")
+scheduler.resume_worker("fleet-a")
+```
+
+`service.run(job_id, worker_id=..., token=...)` settles the job through the same
+dispatch record a remote worker uses; without a token it is the local execution path.
+
+REST: `POST /v1/workers/{register,heartbeat,claim,renew,report}`,
+`POST /v1/workers/{id}/{drain,resume}`, `GET /v1/scheduler`, `POST /v1/scheduler/reap`,
+`POST /v1/jobs/{id}/preempt`, `GET /v1/jobs/{id}/dispatch`,
+`GET /v1/jobs/{id}/eligibility`. `uzen serve --no-auto-run` keeps submitted jobs `QUEUED`
+for workers instead of running them inside the API process. `uzen serve` also accepts
+`--retry-backoff-seconds`, `--aging-seconds` and `--max-in-flight-per-worker`;
+`uzen worker run --wait-seconds` enables long polling.
+
+### Verification
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_distributed_scheduling.py
+.venv/bin/python examples/distributed_scheduling_demo.py --root /tmp/uzen-distributed-demo
+```
+
+`40 passed` (with `UZEN_REDIS_URL` pointing at a live server; 39 otherwise). The suite
+covers the capability model, capability-aware and budget-aware claims, two database
+connections racing over 20 jobs (every job claimed exactly once), token-guarded
+renewals, expiry requeue with exponential backoff and its cap, priority ordering,
+priority aging, preemption and the stale report that follows it, draining and resuming,
+the per-worker in-flight cap, long-poll claim, attempt exhaustion into
+`job.lease_expired`, cancellation during a lease, duplicate/stale/rejected reports, the
+unroutable report, the REST claim → execute → report loop, the daemon's idempotent
+re-execution and artifact refusal, exchange-cache pruning, the RESP client against a
+scripted socket, and the full priority/backoff/preempt/drain flow against live Redis.
+
+Demo output on this machine (4 worker processes, 2 s leases, live Redis configured):
+
+```text
+control plane: /tmp/uzen-distributed-demo/plane
+workers: fleet-a-mlp, fleet-b-general, fleet-c-cnn, fleet-d-doomed
+crashed job 24011ce9… claimed by fleet-d-doomed, never reported
+  recovered on attempt 2 by fleet-a-mlp → SUCCEEDED
+  replayed report: duplicate
+scale_mlp        SUCCEEDED  workers=['fleet-a-mlp'] artifacts=1
+cnn_synthesis    SUCCEEDED  workers=['fleet-c-cnn', 'fleet-c-cnn'] artifacts=1
+big_cpu_scale    SUCCEEDED  workers=['fleet-b-general', 'fleet-b-general'] artifacts=1
+needs_cuda       QUEUED     workers=[] artifacts=0
+unroutable jobs: ['7abdff04']
+  reason: ["worker does not advertise device ['cuda']"]
+policy: priority=ok, preempt=preempted, stale_report=stale, drain_claim=none, too_early=none
+redis adapter: exercised
+gate: PASS
+```
+
+Thirteen gates pass: crash recovery on a later attempt, exactly one artifact for the
+recovered job, duplicate report refused, every routable job succeeded, `cnn` routing,
+12-CPU routing, unroutable detection, no job with two artifacts, unique outputs per job,
+priority ordering, preemption with a stale old token, drain/resume, and the backoff
+delay. The demo runs real worker **processes**; the killed one calls `os._exit(9)` after
+taking the lease. The `cnn` and 12-CPU jobs show two dispatch records because their
+first worker's 2 s lease expired mid-run and the job was retried; each still produced
+exactly one artifact.
+
+### Honest limitations
+
+1. **One machine, not one network.** SQLite is verified across processes on one host.
+   The Redis adapter is verified against a live server on localhost, but not across
+   physical hosts, partitions or failover, and no PostgreSQL adapter exists.
+2. **Capabilities are self-advertised.** A registered worker decides what it claims; the
+   control plane trusts that document. There is no hardware attestation, and an
+   overclaiming worker produces a failed job, not a routed-around one.
+3. **Fairness is bounded, not weighted.** Priority plus optional aging orders work and a
+   per-worker in-flight cap stops one worker hoarding claims, but there is no
+   tenant-weighted fair queue, quota or reservation.
+4. **Preemption is cooperative.** Revoking the token and requeueing is immediate, but a
+   worker already inside a kernel only stops at its next renew/report; no kernel is
+   interrupted.
+5. **Pull, now with long polling.** There is still no server push; `wait_seconds`
+   shortens the idle latency without a persistent connection per worker.
+6. **SQLite leases are same-host wall clocks.** The Redis path uses the server's clock,
+   but a SQLite database must not be shared across hosts (WAL needs shared memory), so
+   cross-host clock skew does not apply there by construction.
+7. **Cache eviction is explicit.** `WorkerDaemon.prune_exchange(..., dry_run=True)`
+   removes old exchange entries on request and keeps referenced ids, but there is no
+   background GC or object-store lifecycle policy.
+8. **Artifact transfer is per-transport.** Object-store transport is used when injected
+   explicitly, otherwise the shared exchange directory.
+9. **Native layouts are advertised only when a built kernel library resolves** — a
+   worker without one never claims representation work.
+
+## N5–N6 boundaries
+
 * **N5** is the only phase allowed to claim GPU execution, and only with real
-  kernels, device transfer tests and measurements.
+  kernels, device transfer tests and measurements. Device *requirements* already route
+  jobs (a `cuda` job stays queued until a worker advertises CUDA), but no CUDA kernel
+  exists.
 * **N6** builds research campaigns on the deterministic engines; candidate
   generation may be autonomous, but every candidate still passes the same
   STRICT_PLUS, validation and provenance path.

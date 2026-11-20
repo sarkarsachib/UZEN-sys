@@ -66,7 +66,7 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N3
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N4
 are implemented; the rest are designs, not partially working claims.
 
 | Phase | Scope | State |
@@ -74,7 +74,7 @@ are implemented; the rest are designs, not partially working claims.
 | **N1** | Native C++ CPU kernels, ctypes ABI, NIR executor, runtime adapter, parity tests, demo | **implemented** |
 | **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block int8/int4 with group scales, low-rank factors, CSR sparse and transposed layouts, representation-aware execution | **implemented** |
-| **N4** | Durable distributed queue/scheduler and capability-aware native workers | planned |
+| **N4** | Durable distributed queue/scheduler, capability-aware worker routing, priority and aging, leases with expiry, backoff and attempts, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | Real CUDA/HIP kernels and a device boundary; no GPU claim before kernels exist | planned |
 | **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |
 

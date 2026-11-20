@@ -171,14 +171,21 @@ single-objective contract.
 | CLI (argparse) | implemented |
 | REST API (FastAPI, OpenAPI) | implemented (optional extra) |
 | MCP stdio server (13 tools) | implemented |
-| Worker protocol + daemon (local and remote) | implemented |
+| Worker protocol + daemon (local and remote) | implemented: claim under a token-guarded lease, input fetching through the object-store transport or the shared exchange directory, local job id equal to the control-plane job id, and reuse of a completed result instead of re-execution |
+| Distributed scheduler (capability routing, priority, leases, attempts, idempotent dispatch) | implemented: requirements derived from the job request and matched inside the atomic claiming statement, operator `priority` with optional aging, `dispatch_token` per attempt, lease expiry requeue with exponential backoff and attempt cap (`job.lease_expired`), cooperative preemption, worker draining/resume, a per-worker in-flight cap, long-poll claims, first-report-wins via `dispatch_records`, and unroutable-job reporting. Verified across real worker processes in `examples/distributed_scheduling_demo.py` |
 | Object-store artifact transport | implemented for S3-compatible endpoints: local SigV4 signing, streamed single and multipart uploads, SHA-256 verification before publication, parent-lineage closure and stored-tokenizer sidecars; validated against a real S3-compatible server and by an independently signature-checking test server |
-| Redis/durable queue adapter | planned (SQLite-backed lease queue implemented) |
+| Durable queue adapter | implemented for the SQLite job database (atomic capability-aware claim, verified across processes) and a Redis/Valkey RESP2 adapter whose Lua scripts keep claim/renew/report/reap atomic and mirror priority, backoff, draining, preemption and the server-side clock; **verified against a live Redis 7.4.2 server on localhost** (not yet across physical hosts, partitions or failover) |
 
 ## Known limitations (explicit)
 
-1. **No distributed scheduler.** The job service claims jobs with SQLite leases; a
-   multi-node deployment needs a shared database and an object store.
+1. **Distributed scheduling is verified on one machine.** Claims, leases, attempts and
+   idempotent reports are tested across processes over SQLite (WAL, so not safe on a
+   network filesystem) and over a live local Redis 7.4.2 server. Neither has been run
+   across physical hosts, network partitions or a failover pair, and no PostgreSQL
+   adapter exists. Capabilities are self-advertised (no attestation); fairness is a
+   priority/aging order plus a per-worker in-flight cap rather than tenant-weighted
+   queueing; preemption is cooperative; and Redis takes its lease clock from the server
+   while SQLite remains single-host by construction.
 2. **Remote artifact transfer** between control plane and worker supports a shared
    filesystem, inline tensors and S3-compatible object storage. The worker daemon
    does not fetch artifacts implicitly; callers invoke

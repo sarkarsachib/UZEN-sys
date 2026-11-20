@@ -186,10 +186,22 @@ artifact index) plus the artifact store and engines. States:
 retry re-reads the same authorized scope.
 
 `WorkerDaemon` runs jobs either locally or against the REST control plane
-(register → heartbeat → claim under lease → execute → report). Workers advertise
-detected capabilities (CPU/memory/Python/torch, supported operation codes, supported
-families). They never execute user-supplied scripts: only registered operations over
-artifacts.
+(register → heartbeat → claim under lease → fetch inputs → execute → report). Workers
+advertise detected capabilities (CPU/memory/Python/torch, supported operation codes,
+operators, families, artifact transports, native weight layouts). They never execute
+user-supplied scripts: only registered operations over artifacts.
+
+`JobScheduler` owns distribution: it derives a requirement set from each job request,
+stores it with the job, and lets the claiming statement take a lease only when the
+worker's advertised capability rows satisfy it and the worker is not draining. Claims
+order by operator priority plus optional aging, and mint a `dispatch_token`; renewals
+and reports must present it, and `dispatch_records` makes the first terminal report the
+only one that applies. A worker that stops renewing loses its lease: the reaper returns
+the job to the queue after an exponential backoff, or fails it with `job.lease_expired`
+once attempts are exhausted. An operator can drain a worker or preempt a job
+cooperatively, and a long-poll claim returns as soon as work appears. Queued jobs no
+registered worker can run are reported as unroutable with the missing capability, never
+left to starve silently.
 
 Worker authentication uses versioned HMAC envelopes (`uzen.worker.envelope/2`) with
 signing-key rotation, an optional signed expiry, a bounded timestamp window and either
@@ -211,6 +223,9 @@ rotation and revocation; plaintext secrets are never persisted.
   compiled path — blocked dense, transposed, group-wise int8/int4, low-rank factors
   and CSR sparse — each packed once with a measured cost and error report, and
   dispatched by the plan to its own kernel. The NIR graph language is unchanged.
-* Rust integration, distributed execution (N4) and CUDA kernels (N5) are future
-  layers, not stub modules. No GPU acceleration is claimed before real kernels
-  exist.
+* Distributed execution is a control-plane concern: one job database (SQLite across
+  processes) or a Redis/Valkey queue, capability-routed claims, token-guarded leases and
+  idempotent reports. Compute stays where it was — NumPy, torch or the native CPU
+  runtime — and a device requirement only routes work; it never implies a kernel.
+* Rust integration and CUDA kernels (N5) are future layers, not stub modules. No GPU
+  acceleration is claimed before real kernels exist.

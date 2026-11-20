@@ -74,9 +74,16 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | GET | `/v1/workers` | worker registry |
 | POST | `/v1/workers/register` | register, returns one-time secret |
 | POST | `/v1/workers/heartbeat` | liveness |
-| POST | `/v1/workers/claim` | claim a job under a lease |
-| POST | `/v1/workers/renew` | renew lease |
-| POST | `/v1/workers/report` | report result |
+| POST | `/v1/workers/claim` | claim the highest-priority eligible job (capability + budget matched), returns the job plus `lease.token`; optional `wait_seconds` long-polls |
+| POST | `/v1/workers/renew` | renew lease (requires `token`) |
+| POST | `/v1/workers/report` | report a terminal state for a held lease (requires `token`); answers `accepted`, `duplicate`, `stale` or `rejected` |
+| GET | `/v1/scheduler` | queue depth, leased/retried counts, worker liveness, unroutable jobs with reasons |
+| POST | `/v1/scheduler/reap` | return expired leases to the queue with their backoff window (also runs on every claim) |
+| POST | `/v1/jobs/{id}/preempt` | revoke the lease, requeue at once; the old token is answered `stale` |
+| POST | `/v1/workers/{id}/drain` | stop routing new claims to a worker; its current lease continues |
+| POST | `/v1/workers/{id}/resume` | put a draining worker back into rotation |
+| GET | `/v1/jobs/{id}/dispatch` | every dispatch attempt: worker, token, outcome |
+| GET | `/v1/jobs/{id}/eligibility` | which registered workers could take this job, and what each one lacks |
 
 Auth: `Authorization: Bearer <UZEN_API_TOKEN>` when the variable is set. Worker routes
 carry `worker_id` + `secret` in the body; the control plane compares
@@ -94,12 +101,15 @@ carry `worker_id` + `secret` in the body; the control plane compares
   "policy": "STRICT_PLUS",
   "evaluation_plan": {"metric": "distance_to_target", "target_artifact_id": "..."},
   "output_format": "safetensors",
+  "priority": 10,
   "seed": 0,
   "budget": {"candidates": 8, "evaluations": 16, "search_algorithm": "cma_es"}
 }
 ```
 
-Inputs accept `artifact_id`, `path` or `inline` arrays. The job result contains the
+`priority` is an optional scheduling bias (clamped to ±1000; higher runs first, with
+optional aging against starvation). Inputs accept `artifact_id`, `path` or `inline`
+arrays. The job result contains the
 plan, per-stage operation records, policy decisions, candidates with metrics, the best
 candidate's artifact id, the VEL report, trace, warnings and diagnosis.
 
@@ -157,9 +167,16 @@ fabricated success.
 
 1. `register` → `{worker_id, secret}` (secret shown once, stored as a hash).
 2. `heartbeat` with detected capabilities.
-3. `claim` → job or `null`; leases expire (`lease_seconds`), `renew` extends.
-4. Execute locally through `JobService` (registered operations only).
-5. `report` with state, result/error, duration.
+3. `claim` → `{job, lease}` or `job: null`. The lease carries `token`, `attempt` and
+   `expires_at`; a job is only returned when the worker's advertised capabilities
+   satisfy the requirements stored with the job (operations, operators, family, policy,
+   device, native layouts, artifact transport, CPU/memory budgets).
+4. Renew with the token while executing (the daemon renews every `lease_seconds / 3`).
+5. `report` with state, result/error and the **token**. The first terminal report
+   applies; a repeat is `duplicate`, a report for a superseded attempt is `stale`.
+6. Inputs are fetched and verified before execution (`ObjectStoreArtifactTransport` or
+   the shared exchange directory); the local job id equals the control-plane job id, so
+   a re-delivered claim reuses the stored result instead of recomputing.
 
 Artifact transport in this build: shared filesystem (`exchange_dir`), inline
 tensors, or an S3-compatible object store.
