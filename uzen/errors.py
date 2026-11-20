@@ -123,6 +123,13 @@ class ArtifactImmutable(UzenError):
     http_status = 409
 
 
+class NativeKernelError(UzenError):
+    """A native C/C++ kernel rejected its arguments or returned a failure."""
+
+    code = "runtime.native_kernel"
+    http_status = 500
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415

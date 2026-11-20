@@ -53,6 +53,11 @@ uzen = "uzen.interfaces.cli.main:main"
 [tool.setuptools.packages.find]
 include = ["uzen*"]
 
+[tool.setuptools.package-data]
+# The native runtime compiles this checked-in source on demand; a wheel must
+# include it, not just the Python bridge.
+"uzen.runtimes.native" = ["*.cpp"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

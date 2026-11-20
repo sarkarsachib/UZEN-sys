@@ -50,14 +50,34 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | ONNX interchange (export/import of the supported NIR subset) | **implemented** (requires the `onnx` extra; opset 20, `Gelu(approximate="tanh")` round trip, validated with `onnx.checker`; the Erf GELU form is refused rather than rewritten) |
 | Sparse-dispatch MoE (only routed tokens are computed per expert) | **implemented** |
 | Prometheus `/metrics` + structured JSON logging (no extra dependencies) | **implemented** |
+| Native CPU kernels (C++17, ctypes, optional OpenMP) | **implemented** for linear/matmul, norms, softmax, activations, elementwise arithmetic, embedding, reductions and masked attention; float32 only, with explicit typed refusal outside that set |
+| Native NIR executor + runtime adapter | **implemented** for MLP and transformer-decoder graphs, parity-tested against NumPy; no silent fallback |
+| Native graph compiler, blocked GEMM, conv/RNN/SSM/MoE native kernels, int8 native linear | **planned** (phase N2; see [docs/P6_NATIVE.md](docs/P6_NATIVE.md)) |
 | Embedded ONNX runtime / GGUF quantized tensor types | **planned** (typed refusal, no simulation) |
-| Rust / C++/CUDA kernels, native compiler | **planned** |
+| Rust integration / CUDA kernels | **planned** — UZEN never claims GPU acceleration it does not have |
 | S3-compatible object-store artifact transport | **implemented** (stdlib SigV4 client, streamed single/multipart uploads, SHA-256 and tensor-fingerprint verification, parent lineage and tokenizer sidecars; validated against a real S3-compatible server) |
 | LLM-assisted planning | **implemented when an OpenAI-compatible endpoint is configured** |
 
 Anything not implemented reports `planned`/`unsupported` and raises a typed error.
 Random initialization is always labelled `randomly_initialized`. No operation claims
 CUDA acceleration that does not exist.
+
+### Computational-substrate phase plan
+
+The master roadmap's Phase 6 is split into six phases with explicit gates. Only N1
+is implemented; the rest are designs, not partially working claims.
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| **N1** | Native C++ CPU kernels, ctypes ABI, NIR executor, runtime adapter, parity tests, demo | **implemented** |
+| **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/MoE/int8 kernels | planned |
+| **N3** | Advanced parameter representations (block int4/int8, sparse/low-rank native layouts) | planned |
+| **N4** | Durable distributed queue/scheduler and capability-aware native workers | planned |
+| **N5** | Real CUDA/HIP kernels and a device boundary; no GPU claim before kernels exist | planned |
+| **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |
+
+See [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
+measurements and limitations.
 
 ---
 
@@ -325,7 +345,7 @@ uzen/
 ├── engines/      # wge, wme, war, mar
 ├── operations/   # arithmetic, merging, decomposition, structural, generation,
 │                 # reconstruction, alignment, search
-├── runtimes/     # numpy reference runtime, PyTorch adapter
+├── runtimes/     # numpy reference, PyTorch adapter, native C++ CPU runtime
 ├── workers/      # protocol messages, worker daemon
 ├── interfaces/   # REST API, MCP server, CLI, Python SDK
 ├── infrastructure/ # storage (safetensors, SQLite), security, provenance
@@ -341,6 +361,7 @@ uzen/
 * [docs/API.md](docs/API.md) — REST/SDK/CLI/MCP contracts and error codes.
 * [docs/P1_IMPORT.md](docs/P1_IMPORT.md) — Hugging Face/safetensors import and compatibility report.
 * [docs/P2_MODEL_EXECUTION.md](docs/P2_MODEL_EXECUTION.md) — stored-model execution and modified-model comparison.
+* [docs/P6_NATIVE.md](docs/P6_NATIVE.md) — native CPU kernels, phase plan and measured limits.
 
 ## Tests
 
