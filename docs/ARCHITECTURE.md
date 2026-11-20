@@ -225,7 +225,13 @@ rotation and revocation; plaintext secrets are never persisted.
   dispatched by the plan to its own kernel. The NIR graph language is unchanged.
 * Distributed execution is a control-plane concern: one job database (SQLite across
   processes) or a Redis/Valkey queue, capability-routed claims, token-guarded leases and
-  idempotent reports. Compute stays where it was — NumPy, torch or the native CPU
-  runtime — and a device requirement only routes work; it never implies a kernel.
-* Rust integration and CUDA kernels (N5) are future layers, not stub modules. No GPU
-  acceleration is claimed before real kernels exist.
+  idempotent reports. Compute stays where it was — NumPy, torch, the native CPU
+  runtime or the CUDA runtime — and a device requirement only routes work; it never
+  implies a kernel.
+* CUDA (N5) is a real execution backend, not a routing label. `kernels.cu` is compiled
+  to PTX with NVRTC or nvcc, loaded through the driver API and launched per node;
+  weights are resident, activations are pooled, host layout operators and transfers are
+  reported separately, and `fallback="error"` refuses without a device. On the
+  authoring host (no driver/device) the kernels compile and assemble but are not
+  executed, and no GPU speed is claimed. HIP is not implemented.
+* Rust integration remains a future layer, not a stub module.

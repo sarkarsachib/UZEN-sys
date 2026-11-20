@@ -130,6 +130,13 @@ class NativeKernelError(UzenError):
     http_status = 500
 
 
+class CudaKernelError(UzenError):
+    """The CUDA driver or a launched kernel rejected its arguments or failed."""
+
+    code = "runtime.cuda_kernel"
+    http_status = 500
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415
