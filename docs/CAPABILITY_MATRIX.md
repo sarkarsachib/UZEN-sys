@@ -141,7 +141,8 @@ single-objective contract.
 | Runtime | Status |
 | --- | --- |
 | NumPy reference (safetensors, sharded safetensors index, npz, GGUF including dequantization; atomic writes; graph execution) | implemented |
-| Native CPU runtime (`uzen.runtimes.native`) | implemented for the native operator set above; build-on-demand with the local C++ compiler, cached by source digest; MLP/transformer-decoder graphs are parity-tested against NumPy. Layout operators use NumPy and are reported separately. Unsupported operators/dtypes raise instead of falling back. No native graph compiler or CUDA |
+| Native CPU runtime (`uzen.runtimes.native`) | implemented: a direct per-node executor and a compiled plan path (fusion, prepacked blocked GEMM, liveness buffer planner). Build-on-demand with the local C++ compiler, cached by source digest; all seven supported architecture families are parity-tested against NumPy. Layout operators use NumPy and are reported separately. Unsupported operators/dtypes raise instead of falling back. Seeded sampling operators and multi-axis reductions are refused. No CUDA |
+| Native compiled plan (`compile_native_plan` / `execute_plan`) | implemented: linear+bias+activation and residual+norm fusion, 64x64 weight prepacking, slot reuse by liveness, shape-polymorphic binding, measured 0.63x the direct executor's time on a 2-layer transformer (batch 4, seq 16, d_model 64); not a GPU claim |
 | PyTorch adapter (weights-only state-dict IO, bf16 widening, `inference_mode` forward) | implemented and verified against `torch 2.15.0+cpu` (CPU only; CUDA availability is reported, never claimed); otherwise typed `runtime.unavailable` |
 | Torch-CPU NIR executor (all 44 operators) | implemented; parity-tested against the NumPy reference across all 24 architecture families, including direct `rope` and `repeat_kv` kernels and a torch-forced Llama graph. |
 | GGUF v3 container + GGML type registry (F32/F16; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K codecs; remaining K-quant/IQ metadata) | implemented: Q4_K/Q5_K/Q6_K/Q8_K are ported from upstream and C-reference validated; other K-quant/IQ tensors are inspectable without decoding and refused for reads by type name/id |
@@ -187,10 +188,12 @@ single-objective contract.
    fabricate activations for unsupported architectures.
 5. **Architecture families beyond the five implemented** are reported `planned`; UZEN
    will not synthesize a graph it cannot execute.
-6. **The native CPU backend is correctness-first, not fast.** It is float32-only,
-   covers the operator set in [P6_NATIVE.md](P6_NATIVE.md), uses a naive GEMM and
-   NumPy for layout ops, and does not implement conv/recurrent/SSM/MoE/sampling or
-   int8 `quantized_linear`. It is not a CUDA backend.
+6. **The native CPU backend is float32-only and correctness-first.** The direct
+   executor uses a naive GEMM and NumPy for layout ops and covers
+   [P6_NATIVE.md](P6_NATIVE.md)'s documented operator set; the compiled plan adds
+   conv/pool, recurrent, SSM, GCN, MoE, int8 `quantized_linear`, a prepacked GEMM
+   and single-pass attention. Seeded `sample_normal`/`add_noise` are refused. It is
+   not a CUDA backend.
 
 ## P0 substrate hardening
 

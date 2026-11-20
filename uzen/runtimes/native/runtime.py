@@ -21,8 +21,10 @@ from uzen.core.nws.tensors import WeightPackage
 from uzen.runtimes.base import RuntimeCapabilities
 from uzen.runtimes.numpy_runtime import NumpyRuntime
 
+from .compiler import PLAN_OPS, NativePlan, compile_native_plan
 from .executor import NativeExecution, execute_native
 from .library import NativeLibrary, native_available, resolve_library_path
+from .plan_executor import NativePlanExecution, execute_plan
 
 
 class NativeRuntime:
@@ -103,6 +105,14 @@ class NativeRuntime:
                     "select",
                 ],
                 "float32_only": True,
+                "compiled_plan": True,
+                "plan_ops": sorted(PLAN_OPS),
+                "plan_fusions": [
+                    "linear + bias + activation",
+                    "residual add + layernorm/rmsnorm",
+                ],
+                "prepacked_gemm": True,
+                "threaded_attention": "single-pass (flash-style) online softmax",
                 "openmp": "optional; enabled when the compiler accepts -fopenmp",
                 "cuda": False,
                 "note": (
@@ -177,6 +187,54 @@ class NativeRuntime:
         """Return outputs plus the native/layout operator evidence."""
         return execute_native(
             graph, inputs, package, capture=capture, library=self.library
+        )
+
+    # ------------------------------------------------------------------ #
+    # compiled plans
+    # ------------------------------------------------------------------ #
+
+    def compile(
+        self,
+        graph: Graph,
+        package: WeightPackage | None = None,
+        *,
+        fuse: bool = True,
+    ) -> NativePlan:
+        """Lower a graph into a native execution plan (fusions + prepacking)."""
+        return compile_native_plan(graph, package, fuse=fuse)
+
+    def execute_compiled_graph(
+        self,
+        plan: NativePlan,
+        inputs: Mapping[str, np.ndarray],
+        package: WeightPackage,
+        *,
+        capture: Sequence[str] | None = None,
+    ) -> NativePlanExecution:
+        """Execute a previously compiled plan (prepacked weights are cached)."""
+        return execute_plan(
+            plan,
+            inputs,
+            package,
+            capture=capture,
+            library=self.library,
+        )
+
+    def execute_compiled(
+        self,
+        graph: Graph,
+        inputs: Mapping[str, np.ndarray],
+        package: WeightPackage,
+        *,
+        capture: Sequence[str] | None = None,
+        fuse: bool = True,
+    ) -> dict[str, np.ndarray]:
+        """Compile and run a graph, returning only the outputs."""
+        plan = self.compile(graph, package, fuse=fuse)
+        return dict(
+            self.execute_compiled_graph(
+                plan, inputs, package, capture=capture
+            ).outputs
         )
 
     def describe(self) -> dict[str, Any]:

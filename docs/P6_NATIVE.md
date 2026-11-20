@@ -16,13 +16,13 @@ listed gate passes.
 | Phase | Deliverable | Status |
 | --- | --- | --- |
 | **N1** | Native CPU arithmetic: C++17 kernels, ctypes ABI, NIR executor, native runtime adapter, parity tests, working demo | **implemented** |
-| **N2** | Native graph compiler: lower NIR to a native execution plan, fuse elementwise chains, prepack weights, add conv/RNN/SSM/MoE/quantized kernels, memory planner | planned |
+| **N2** | Native graph compiler: lower NIR to a native execution plan, fuse linear+activation and residual+norm, prepack weights, add conv/pool/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, liveness memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | planned |
 | **N4** | Distributed execution: durable queue adapter (Redis/Valkey or PostgreSQL), capability-aware native worker scheduling, leases, idempotent dispatch, remote artifact fetch | planned; local SQLite leases and S3-compatible transport already exist |
 | **N5** | GPU/native boundary: real CUDA/HIP kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | planned; **no GPU acceleration is claimed now** |
 | **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
 
-N2 is the next phase. N3–N6 depend on N2's execution plan and are not started.
+N3 is the next phase. N4–N6 build on N2's plan and are not started.
 
 ## N1 — implemented native CPU layer
 
@@ -119,14 +119,17 @@ fused plans and prepacking target the matmul gap.
 
 1. **float32 only.** The ABI and executor reject float64, float16 and bfloat16
    arithmetic; no silent upcast/downcast.
-2. **No native graph compiler yet.** Nodes call C functions one by one; layout
-   operators use NumPy; there is no fusion, prepacking or memory planner.
-3. **Naive GEMM.** Correctness-first triple loop with OpenMP. It is not competitive
-   with OpenBLAS at medium/large sizes.
+2. **The direct executor has no graph compiler.** Nodes call C functions one by one
+   and layout operators use NumPy. Fusion, prepacking and the buffer planner live
+   in the N2 plan path below.
+3. **The direct path's GEMM is naive.** Correctness-first triple loop with OpenMP;
+   it is not competitive with OpenBLAS at medium/large sizes. The plan path uses
+   the prepacked blocked GEMM instead.
 4. **Attention is correct but not optimized.** Scores are recomputed for the
    softmax pass; there is no flash-attention tiling, KV cache or fused kernel.
-5. **Coverage is partial.** Conv, recurrent, SSM, GNN, MoE, sampling and int8
-   `quantized_linear` remain unsupported in this backend; use NumPy or torch.
+5. **The direct path's coverage is partial.** Conv, recurrent, SSM, GNN, MoE,
+   sampling and int8 `quantized_linear` are unsupported there. The N2 plan path
+   implements all of them except the two seeded sampling operators.
 6. **OpenMP is optional.** The build retries without `-fopenmp` if the compiler
    rejects it; the capability report does not claim a thread count.
 7. **No CUDA.** `capabilities()["extra"]["cuda"]` is always `False`. A GPU claim
@@ -134,23 +137,110 @@ fused plans and prepacking target the matmul gap.
 8. **No mobile/Windows validation.** The library is built and tested on Linux
    x86_64; macOS uses `.dylib` naming, but was not exercised here.
 
-## N2 design (not implemented)
+## N2 — implemented native plan compiler
 
-N2 will introduce a native execution-plan compiler rather than changing the
-existing NIR semantics:
+`uzen.runtimes.native.compiler.compile_native_plan` lowers a validated NIR graph
+into a linear plan of native steps over explicitly planned buffers;
+`plan_executor.execute_plan` runs it. The N1 direct executor is unchanged and
+remains available.
 
-* lower a validated NIR graph into a linear native plan with explicit buffers;
-* fuse `linear` + bias + activation and residual + norm chains;
-* prepack weights into the layout the kernels consume (transposed/blocked);
-* allocate and reuse buffers with a liveness planner;
-* add native conv2d/pool2d, recurrent, SSM, GNN and sparse-MoE kernels;
-* implement int8 `quantized_linear` with per-channel scales and a typed
-  dequantize boundary;
-* add blocked GEMM and a tiled attention kernel;
-* compare every compiled plan against the NumPy reference and the N1 direct path.
+### Pipeline
 
-The acceptance gate will be numerical parity plus a measured improvement over N1
-on defined shapes, not a claim based on compilation alone.
+| Stage | Implementation |
+| --- | --- |
+| Lowering | each node becomes one plan step over the compiled kernel set; `split_qkv` writes all three head tensors from one step |
+| Fusion — linear | `linear` + bias + the single activation that consumes it become one `gemm_packed` call with the activation code compiled in |
+| Fusion — residual | an `add` feeding a `layernorm`/`rmsnorm` becomes one `add_norm` pass; the sum is still stored when another consumer or a graph output needs it |
+| Prepacking | linear weights are packed once per package fingerprint into 64x64 (k x n) panels, zero-padded to whole blocks |
+| Memory planning | buffers are allocated by liveness; a freed slot is reused only for an identical element count, and a target is allocated *before* the step's dying inputs are released, so no kernel can read the buffer it writes |
+| Shape polymorphism | a plan is compiled once and bound per input signature; symbolic dims — including dims an operator left unknown, such as a symbolic `slice` — are resolved at bind time |
+| Reporting | `plan.describe()` and `NativePlanExecution.summary()` expose steps, fusions, operators, prepacked weights, peak bytes, slot reuse and capturable intermediates |
+
+### Kernel coverage
+
+| Plan operator | Implementation | Limits |
+| --- | --- | --- |
+| `gemm_packed` | prepacked blocked GEMM, optional bias and fused activation (none/relu/gelu/gelu_exact/silu/tanh/sigmoid) | float32; any batch rank flattened to rows |
+| `add_norm` | residual add + layernorm/rmsnorm in one pass, optional residual write | operands must have identical shapes (the compiler only fuses then) |
+| `conv2d` | direct NCHW convolution with stride/padding | no dilation or groups |
+| `maxpool2d` | NCHW max pooling; padding contributes -inf like the NumPy reference | max only (the NIR operator is max pooling) |
+| `recurrent` | tanh RNN, LSTM (i,f,g,o) and GRU (r,z,n) with per-batch state | float32 in/out, double state |
+| `ssm` | diagonal S4D-style recurrence | float32 |
+| `gcn` | symmetric degree-normalized adjacency, then projection | dense adjacency |
+| `moe` | top-k routed experts, deterministic selection, gate renormalization | unused experts are never evaluated |
+| `quantized_linear` | int8 weights with per-output-channel scales, dequantized inside the accumulation | int8 weights only |
+| `reduce` | mean/sum over any single axis | one axis per node |
+| `attention` | single-pass online-softmax attention; the score matrix is never materialized | float32; no dropout |
+| `layout` | NumPy byte movement from the direct executor, reported separately | no arithmetic claim |
+
+Operators outside this set — the seeded `sample_normal`/`add_noise` and multi-axis
+reductions — are refused at compile time with the node id. There is no fallback.
+
+### Build and use
+
+```bash
+# Both translation units are compiled into one cached shared library.
+python -m uzen.runtimes.native.build --force
+python examples/native_compiler_demo.py --root /tmp/uzen-compiler-demo
+```
+
+```python
+from uzen.runtimes.native import NativeRuntime
+
+runtime = NativeRuntime()
+plan = runtime.compile(graph, package)              # fusions + prepacking + memory plan
+result = runtime.execute_compiled_graph(plan, inputs, package)
+print(result.summary())                             # steps, fusions, peak bytes
+```
+
+### Verification
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_native_runtime.py tests/test_native_compiler.py
+.venv/bin/python examples/native_compiler_demo.py --root /tmp/uzen-compiler-demo
+```
+
+`41 passed` (16 direct-executor, 25 compiler). The compiler tests check every
+prepared kernel against its NumPy reference, fusion detection, shape polymorphism,
+slot reuse against the unfused path, all seven supported families, int8 plans,
+capture/fusion interaction and typed refusal. Demo output on this machine
+(g++ 13.3, x86_64):
+
+```text
+mlp                  nodes=  5 steps=  4 fused= 1 max_abs_error=5.588e-09
+transformer_decoder  nodes= 28 steps= 22 fused= 6 max_abs_error=1.118e-08
+cnn                  nodes=  8 steps=  8          max_abs_error=1.863e-08
+recurrent (lstm)     nodes=  5 steps=  5          max_abs_error=1.185e-09
+moe                  nodes=  4 steps=  4          max_abs_error=2.330e-10
+state_space          nodes=  4 steps=  4          max_abs_error=1.490e-08
+gnn                  nodes=  6 steps=  6          max_abs_error=1.863e-09
+memory (transformer) 29 buffers in 7 slots, peak 112 KiB of 160 KiB allocated, 22 reused
+prepack padding overhead: 1.00x on every weight
+int8 plan: 9 rewritten nodes, max_abs_error=7.451e-09
+latency, batch=4 seq=16 d_model=64 2 layers (median of 5):
+  numpy 3.578 ms | direct native 3.847 ms | compiled plan 2.432 ms
+gate: PASS
+```
+
+The latency row is measured, not predicted: on this machine the compiled plan took
+0.63x the direct executor's time and 0.68x NumPy's for that shape, from fusing the
+residual/norm and activation steps and from contiguous prepacked GEMM panels. It is
+still a CPU float32 backend and makes no GPU claim.
+
+### Honest limitations
+
+1. **float32 only**, with the same typed refusals as N1.
+2. **Seeded stochastic operators are not planned.** `sample_normal` and `add_noise`
+   would need a bit-exact NumPy PCG64 stream; the plan refuses them rather than
+   changing the numbers. Use the NumPy executor for VAE/diffusion graphs.
+3. **Fusion is intentionally narrow**: linear+bias+activation and residual+norm.
+   No conv+activation, attention+rope or multi-op elementwise chains yet.
+4. **Prepacked weights are dense float32.** There is no int4/sparse/low-rank native
+   layout yet — that is N3.
+5. **One reduction axis per node**, and reductions do not fuse into consumers.
+6. **No thread-pool ownership.** OpenMP remains optional; the plan does not pick a
+   thread count.
+7. **No CUDA.** `capabilities()["extra"]["cuda"]` is still always `False`.
 
 ## N3–N6 boundaries
 

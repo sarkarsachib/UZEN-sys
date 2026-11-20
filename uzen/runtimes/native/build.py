@@ -25,6 +25,10 @@ from pathlib import Path
 from uzen.errors import RuntimeUnavailable
 
 SOURCE = Path(__file__).with_name("kernels.cpp")
+PLAN_SOURCE = Path(__file__).with_name("plan_kernels.cpp")
+# Compiled into one shared library: the direct executor's kernels and the
+# compiled-plan kernels.
+SOURCES = (SOURCE, PLAN_SOURCE)
 BASE_FLAGS = ("-O3", "-std=c++17", "-fPIC", "-shared", "-Wno-unknown-pragmas")
 OPENMP_FLAG = "-fopenmp"
 
@@ -47,9 +51,12 @@ def native_compiler() -> str | None:
     return None
 
 
-def source_digest(source: Path = SOURCE) -> str:
+def source_digest(source: Path | None = None) -> str:
     digest = hashlib.sha256()
-    digest.update(source.read_bytes())
+    sources = (source,) if source is not None else SOURCES
+    for path in sources:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
     digest.update("|".join(BASE_FLAGS).encode("utf-8"))
     digest.update(platform.machine().encode("utf-8"))
     digest.update(sys.platform.encode("utf-8"))
@@ -88,16 +95,10 @@ def build_native_library(
     temporary = destination.with_name(destination.name + ".tmp")
     temporary.unlink(missing_ok=True)
 
-    base_command = [
-        compiler,
-        *BASE_FLAGS,
-        *extra_flags,
-        str(SOURCE),
-        "-o",
-        str(temporary),
-    ]
+    tail = [*(str(path) for path in SOURCES), "-o", str(temporary)]
+    base_command = [compiler, *BASE_FLAGS, *extra_flags, *tail]
     attempts = [
-        [*base_command[:-3], OPENMP_FLAG, *base_command[-3:]],
+        [compiler, *BASE_FLAGS, *extra_flags, OPENMP_FLAG, *tail],
         base_command,
     ]
     errors: list[str] = []

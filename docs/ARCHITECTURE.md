@@ -201,8 +201,12 @@ rotation and revocation; plaintext secrets are never persisted.
 * Base44 (or any host) can provide control-plane metadata, orchestration and API
   exposure. It must never pretend to execute tensor math.
 * Tensor computation happens in Python/NumPy (reference), PyTorch (adapter) or the
-  native C++ CPU runtime. The native path implements only its documented float32
-  operator set and raises `UnsupportedOperator` for everything else; layout
-  operators are NumPy byte movement and are reported as such.
-* The native graph compiler, Rust integration and CUDA kernels are future layers,
-  not stub modules. No GPU acceleration is claimed before real kernels exist.
+  native C++ CPU runtime. The native runtime has two paths: a direct executor that
+  calls one kernel per node, and a compiled plan that lowers the graph into steps
+  with fusion, prepacked weights and a liveness buffer plan. Both implement only
+  their documented float32 operator sets and raise `UnsupportedOperator` for
+  everything else; layout operators are NumPy byte movement and are reported as
+  such.
+* Rust integration, advanced parameter representations (N3), distributed execution
+  (N4) and CUDA kernels (N5) are future layers, not stub modules. No GPU
+  acceleration is claimed before real kernels exist.

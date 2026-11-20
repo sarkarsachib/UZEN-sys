@@ -52,7 +52,8 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Prometheus `/metrics` + structured JSON logging (no extra dependencies) | **implemented** |
 | Native CPU kernels (C++17, ctypes, optional OpenMP) | **implemented** for linear/matmul, norms, softmax, activations, elementwise arithmetic, embedding, reductions and masked attention; float32 only, with explicit typed refusal outside that set |
 | Native NIR executor + runtime adapter | **implemented** for MLP and transformer-decoder graphs, parity-tested against NumPy; no silent fallback |
-| Native graph compiler, blocked GEMM, conv/RNN/SSM/MoE native kernels, int8 native linear | **planned** (phase N2; see [docs/P6_NATIVE.md](docs/P6_NATIVE.md)) |
+| Native graph compiler (fusion, prepacked blocked GEMM, liveness buffer planner) | **implemented**; plans fuse linear+bias+activation and residual+norm, prepack linear weights and reuse dead buffer slots, with parity tests per family |
+| Native conv/pool, RNN/LSTM/GRU, SSM, GCN, sparse-MoE and int8 quantized-linear kernels | **implemented** in the compiled plan path; seeded sampling operators are refused |
 | Embedded ONNX runtime / GGUF quantized tensor types | **planned** (typed refusal, no simulation) |
 | Rust integration / CUDA kernels | **planned** — UZEN never claims GPU acceleration it does not have |
 | S3-compatible object-store artifact transport | **implemented** (stdlib SigV4 client, streamed single/multipart uploads, SHA-256 and tensor-fingerprint verification, parent lineage and tokenizer sidecars; validated against a real S3-compatible server) |
@@ -64,13 +65,13 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. Only N1
-is implemented; the rest are designs, not partially working claims.
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1 and N2
+are implemented; the rest are designs, not partially working claims.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | **N1** | Native C++ CPU kernels, ctypes ABI, NIR executor, runtime adapter, parity tests, demo | **implemented** |
-| **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/MoE/int8 kernels | planned |
+| **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, memory planner | **implemented** |
 | **N3** | Advanced parameter representations (block int4/int8, sparse/low-rank native layouts) | planned |
 | **N4** | Durable distributed queue/scheduler and capability-aware native workers | planned |
 | **N5** | Real CUDA/HIP kernels and a device boundary; no GPU claim before kernels exist | planned |
