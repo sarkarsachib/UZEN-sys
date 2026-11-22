@@ -5,7 +5,7 @@ Advanced computational substrate**, and exactly what is implemented. The master
 specification lists Rust integration, a native compiler, C++/CUDA kernels,
 additional runtime backends, advanced parameter representations and large-scale
 autonomous research. Those are too large to pretend to finish in one step, so
-they are split into six verifiable phases.
+they are split into six core phases, plus the N7 post-P6 campaign extension.
 
 No phase below is claimed because a directory or interface name exists. A phase is
 `implemented` only when its kernels/engine execute real computation and the
@@ -21,6 +21,7 @@ listed gate passes.
 | **N4** | Distributed execution: durable queue adapter, capability-aware worker scheduling, leases with expiry and attempts, priority and backoff, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite verified across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | GPU/native boundary: real CUDA kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | **implemented at the CUDA boundary** (17 kernels compile to PTX with NVRTC and assemble with `ptxas`; driver-API runtime and GPU tests present; execution not verified in the authoring environment because it has no driver/device; HIP not implemented) |
 | **N6** | Large-scale autonomous research: candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | **implemented** (in-process batch scheduler; inference-only proxy metrics; see [N6_CAMPAIGNS.md](N6_CAMPAIGNS.md)) |
+| **N7** | Distributed campaign trials over the N4 worker queue | **implemented** (post-P6 extension; see [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md)) |
 
 N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
 a machine with a device. N6 runs real architecture and weight-transform campaigns with
@@ -634,3 +635,19 @@ The CLI exposes `campaign run|show|list|events|verify|replay`; the SDK exposes
 5. Weight campaigns cover scale, magnitude sparsity and symmetric int8 round-trip
    simulation; they do not perform learned pruning or quantization-aware optimization.
 6. The REST run endpoint is synchronous and is not a background campaign daemon.
+
+## N7 — distributed campaign trials (post-P6 extension)
+
+N7 keeps N6's planners, scoring, SQLite campaign store and corpus unchanged and moves
+only trial evaluation onto the N4 queue. A trial is a read-only `inspection` job with
+`options.task_kind=campaign_trial`; it carries the campaign spec and candidate, is
+validated by recomputing the candidate digest, and returns metrics without creating an
+artifact. `DistributedTrialExecutor` submits every proposal with a stable idempotency
+key, waits for workers, and records the same `Trial` rows a local run records.
+
+Workers use the normal atomic claim and token-guarded `JobService.run` path. A timeout
+pauses the campaign with `stop_reason=worker_timeout`; resuming resubmits the same
+idempotency keys and reuses jobs that settled in the meantime. The coordinator remains
+single-host SQLite: this is distributed execution, not a distributed campaign database.
+See [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md) for the job schema,
+worker loop, demo gates and limits.

@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_order ON events (campaign_id, id);
+CREATE TABLE IF NOT EXISTS campaign_jobs (
+    campaign_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, job_id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS campaign_jobs_order ON campaign_jobs (campaign_id, created_at);
 """
 
 
@@ -179,6 +188,29 @@ class CampaignStore:
                     now,
                 ),
             )
+
+    def link_job(
+        self,
+        campaign_id: str,
+        job_id: str,
+        *,
+        candidate_digest: str = "",
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO campaign_jobs "
+                "(campaign_id, job_id, candidate_digest, created_at) VALUES (?, ?, ?, ?)",
+                (campaign_id, job_id, candidate_digest, utc_now_iso()),
+            )
+
+    def job_ids(self, campaign_id: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT job_id FROM campaign_jobs WHERE campaign_id = ? "
+                "ORDER BY created_at, job_id",
+                (campaign_id,),
+            ).fetchall()
+        return [str(row["job_id"]) for row in rows]
 
     # ------------------------------------------------------------------ #
     # trials

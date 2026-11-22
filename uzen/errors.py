@@ -151,6 +151,13 @@ class CampaignNotFound(UzenError):
     http_status = 404
 
 
+class CampaignTimeout(UzenError):
+    """A distributed campaign batch did not settle before its deadline."""
+
+    code = "campaign.timeout"
+    http_status = 504
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415

@@ -732,7 +732,7 @@ class Uzen:
         )
 
     # ------------------------------------------------------------------ #
-    # research campaigns (N6)
+    # research campaigns (N6/N7)
     # ------------------------------------------------------------------ #
 
     def run_campaign(
@@ -741,18 +741,39 @@ class Uzen:
         *,
         resume: bool = True,
         max_rounds: int | None = None,
+        distributed: bool = False,
+        trial_timeout_seconds: float = 600.0,
+        poll_interval_seconds: float = 0.1,
     ) -> dict[str, Any]:
-        """Run or resume a deterministic architecture/weight campaign."""
+        """Run or resume a deterministic architecture/weight campaign.
+
+        ``distributed=True`` submits each trial to the N4 control-plane queue and
+        waits for workers; it never silently falls back to local evaluation.
+        """
         if not self.local:
             return self._request(
                 "POST",
                 "/v1/campaigns",
-                {"spec": dict(spec), "resume": resume, "max_rounds": max_rounds},
+                {
+                    "spec": dict(spec),
+                    "resume": resume,
+                    "max_rounds": max_rounds,
+                    "distributed": distributed,
+                    "trial_timeout_seconds": trial_timeout_seconds,
+                    "poll_interval_seconds": poll_interval_seconds,
+                },
             )
-        from uzen.core.campaign import CampaignEngine, CampaignSpec
+        from uzen.core.campaign import CampaignEngine, CampaignSpec, DistributedTrialExecutor
 
         parsed = CampaignSpec.from_dict(spec)
-        engine = CampaignEngine(self.service.root)
+        executor = None
+        if distributed:
+            executor = DistributedTrialExecutor(
+                self.service,
+                timeout_seconds=trial_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        engine = CampaignEngine(self.service.root, trial_executor=executor)
         return engine.run(parsed, resume=resume, max_rounds=max_rounds).to_dict()
 
     def campaign(self, campaign_id: str) -> dict[str, Any]:

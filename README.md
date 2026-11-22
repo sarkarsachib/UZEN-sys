@@ -34,6 +34,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | VEL verification: structural, numerical, functional, regression, performance, provenance | **implemented** |
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
 | N6 research campaigns: seeded architecture/weight-transform search, batch evaluator, resumable SQLite scheduler, Pareto reports, content-addressed replay corpus | **implemented** (in-process scheduler; inference-only proxy metrics, not task quality) |
+| N7 distributed campaign trials over the N4 worker queue: read-only trial jobs, token-guarded workers, deterministic resume and local-equivalent corpus replay | **implemented** (worker processes over a shared SQLite control plane; synchronous coordinator; no task-quality claim) |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
@@ -69,8 +70,9 @@ CUDA acceleration that does not exist.
 ### Computational-substrate phase plan
 
 The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N6
-are implemented at their stated level; N6 is an in-process campaign engine, not a
-distributed training/quality-optimization system.
+are implemented at their stated level; N6 is the local campaign engine, and N7 adds
+distributed campaign trials over the N4 queue. Neither is a training or
+task-quality-optimization system.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -80,11 +82,13 @@ distributed training/quality-optimization system.
 | **N4** | Durable distributed queue/scheduler, capability-aware worker routing, priority and aging, leases with expiry, backoff and attempts, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | CUDA kernels and a device boundary: 17 real kernels, NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
 | **N6** | Large-scale autonomous research campaigns on the deterministic engines: seeded architecture/parameter search, batch scheduler, Pareto reporting, replayable benchmark corpus | **implemented** (in-process scheduler; no training and no task-quality claim) |
+| **N7** | Distributed campaign trials over the N4 worker queue: read-only trial jobs, capability/lease-guarded execution, deterministic resume, local-equivalent corpus replay | **implemented** (post-P6 extension; shared SQLite control plane and a synchronous coordinator) |
 
 See [docs/N5_CUDA.md](docs/N5_CUDA.md) for the CUDA kernels, build, fallback policy and
 limitations, [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) for campaign specs, determinism,
-corpus replay and limits, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
-measurements and limitations.
+corpus replay and limits, [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md)
+for distributed trial execution, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage,
+build instructions, verified measurements and limitations.
 
 ---
 
@@ -151,6 +155,7 @@ uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[1
 uzen architecture compose <id_a> <id_b> --mode sequential
 uzen architecture edit <artifact_id> --operation truncate --keep-layers 1
 uzen campaign run --spec-file campaign.json
+uzen campaign run --spec-file campaign.json --distributed --trial-timeout 120
 uzen campaign verify
 uzen serve --host 0.0.0.0 --port 8080
 uzen mcp --root ./uzen-workspace
@@ -351,7 +356,8 @@ uzen/
 │   ├── nwpc/     # operation registry, operation context
 │   ├── npa/      # neural parameter alignment
 │   ├── nase/     # architecture synthesis and graph surgery
-│   ├── campaign/ # N6 planners, evaluator, SQLite store, benchmark corpus
+│   ├── campaign/ # N6 planners, evaluator, SQLite store, benchmark corpus,
+│   │             # N7 distributed trial executor
 │   ├── wcomp/    # compiler, pipeline, execution plan
 │   ├── vel/      # verification & evaluation lab
 │   └── ane/      # autonomous neural engineer, search, planning, LLM bridge
@@ -376,6 +382,7 @@ uzen/
 * [docs/P2_MODEL_EXECUTION.md](docs/P2_MODEL_EXECUTION.md) — stored-model execution and modified-model comparison.
 * [docs/P6_NATIVE.md](docs/P6_NATIVE.md) — native CPU kernels, phase plan and measured limits.
 * [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) — campaign specs, determinism, corpus replay and limits.
+* [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md) — N4-backed trial execution, worker protocol and limits.
 
 ## Tests
 

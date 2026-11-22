@@ -721,31 +721,39 @@ class JobService:
         job_request = JobRequest.from_dict(request)
         if job_request.policy != "STRICT_PLUS":
             raise InvalidOperationParameters("only STRICT_PLUS jobs are accepted")
-        # Reject unregistered / out-of-scope / malformed operations at submission, so a
-        # job never enters the queue carrying work the engine cannot legally perform.
-        from uzen.core.nwpc.registry import default_registry
-        from uzen.errors import OperationUnavailable
+        # Campaign trial jobs are a read-only task kind, not a registered engineering
+        # operation. Validate their closed payload before they enter the queue.
+        task_kind = job_request.options.get("task_kind")
+        if task_kind == "campaign_trial":
+            from uzen.core.campaign.distributed import validate_campaign_trial_request
 
-        registry = default_registry()
-        for index, entry in enumerate(job_request.operations):
-            if not isinstance(entry, Mapping):
-                raise InvalidOperationParameters(f"operation #{index} must be an object")
-            code = str(entry.get("op") or entry.get("code") or "")
-            if not code:
-                raise InvalidOperationParameters(f"operation #{index} has no 'op' code")
-            spec = registry.get(code)
-            if not spec.maturity.executable:
-                raise OperationUnavailable(
-                    f"operation '{code}' is '{spec.maturity.value}' and cannot be executed",
-                    operation=code,
-                )
-            if job_request.task_scope not in spec.scopes:
-                raise OperationUnavailable(
-                    f"operation '{code}' is not authorized in scope '{job_request.task_scope.value}'",
-                    operation=code,
-                    scope=job_request.task_scope.value,
-                )
-            spec.validate_params(dict(entry.get("params") or {}))
+            validate_campaign_trial_request(request)
+        else:
+            # Reject unregistered / out-of-scope / malformed operations at submission, so a
+            # job never enters the queue carrying work the engine cannot legally perform.
+            from uzen.core.nwpc.registry import default_registry
+            from uzen.errors import OperationUnavailable
+
+            registry = default_registry()
+            for index, entry in enumerate(job_request.operations):
+                if not isinstance(entry, Mapping):
+                    raise InvalidOperationParameters(f"operation #{index} must be an object")
+                code = str(entry.get("op") or entry.get("code") or "")
+                if not code:
+                    raise InvalidOperationParameters(f"operation #{index} has no 'op' code")
+                spec = registry.get(code)
+                if not spec.maturity.executable:
+                    raise OperationUnavailable(
+                        f"operation '{code}' is '{spec.maturity.value}' and cannot be executed",
+                        operation=code,
+                    )
+                if job_request.task_scope not in spec.scopes:
+                    raise OperationUnavailable(
+                        f"operation '{code}' is not authorized in scope '{job_request.task_scope.value}'",
+                        operation=code,
+                        scope=job_request.task_scope.value,
+                    )
+                spec.validate_params(dict(entry.get("params") or {}))
         # The capability requirement set is derived from the request itself and stored
         # with the job, so dispatch can decide eligibility inside the claiming statement
         # without re-parsing the request (and without trusting the worker's word).
@@ -878,6 +886,8 @@ class JobService:
     # ------------------------------------------------------------------ #
 
     def _execute(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        if request.options.get("task_kind") == "campaign_trial":
+            return self._execute_campaign_trial(job_id, request)
         scope = request.task_scope
         if scope.value in ("model_architecture_research", "architecture_synthesis", "model_creation"):
             return self._execute_architecture(job_id, request)
@@ -1033,6 +1043,30 @@ class JobService:
         return target, reference, graph, graph_inputs
 
     # ------------------------------------------------------------------ #
+
+    def _execute_campaign_trial(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        from uzen.core.campaign.distributed import (
+            campaign_trial_outcome,
+            validate_campaign_trial_request,
+        )
+
+        spec, candidate = validate_campaign_trial_request(request.to_dict())
+        outcome = campaign_trial_outcome(spec, candidate)
+        self.db.append_event(
+            job_id,
+            "campaign_trial",
+            {
+                "campaign_id": spec.candidate_id,
+                "candidate_digest": candidate.digest,
+                "status": outcome["status"],
+            },
+        )
+        return {
+            "task_kind": "campaign_trial",
+            "campaign_id": spec.candidate_id,
+            "candidate_digest": candidate.digest,
+            "trial": outcome,
+        }
 
     def _execute_weight_research(self, job_id: str, request: JobRequest) -> dict[str, Any]:
         packages = self._resolve_inputs(request)

@@ -32,7 +32,8 @@ Implemented:
 
 Not implemented:
 
-* distributed campaign execution across N4 workers (the scheduler is in-process);
+* distributed campaign execution inside N6 itself (the local scheduler is in-process);
+  see [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md) for the N7 extension;
 * task-quality metrics or any learned surrogate model;
 * training, gradient-based search or fine-tuning of any kind;
 * a latency objective (wall-clock latency is environment-dependent and is not part of

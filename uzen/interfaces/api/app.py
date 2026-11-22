@@ -586,7 +586,7 @@ def create_app(
         return service.run(job["id"])
 
     # ------------------------------------------------------------------ #
-    # research campaigns (N6)
+    # research campaigns (N6/N7)
     # ------------------------------------------------------------------ #
 
     @app.post(f"/{API_VERSION}/campaigns")
@@ -596,7 +596,16 @@ def create_app(
         if "spec" not in payload:
             raise HTTPException(400, detail={"code": "request.invalid", "message": "provide spec"})
         spec = CampaignSpec.from_dict(payload["spec"])
-        engine = CampaignEngine(service.root)
+        executor = None
+        if bool(payload.get("distributed", False)):
+            from uzen.core.campaign import DistributedTrialExecutor
+
+            executor = DistributedTrialExecutor(
+                service,
+                timeout_seconds=float(payload.get("trial_timeout_seconds", 600.0)),
+                poll_interval_seconds=float(payload.get("poll_interval_seconds", 0.1)),
+            )
+        engine = CampaignEngine(service.root, trial_executor=executor)
         report = engine.run(
             spec,
             resume=bool(payload.get("resume", True)),

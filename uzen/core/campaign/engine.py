@@ -13,7 +13,7 @@ import json
 import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from uzen.core.campaign.corpus import BenchmarkCorpus
 from uzen.core.campaign.evaluate import Evaluator
@@ -22,8 +22,16 @@ from uzen.core.campaign.space import propose
 from uzen.core.campaign.spec import CampaignSpec, Objective
 from uzen.core.campaign.store import CampaignStore
 from uzen.core.nir.graph import GraphValidationError
-from uzen.errors import CampaignNotFound, InvalidOperationParameters, ShapeMismatch, UzenError
+from uzen.errors import (
+    CampaignNotFound,
+    CampaignTimeout,
+    InvalidOperationParameters,
+    ShapeMismatch,
+    UzenError,
+)
 from uzen.util.canonical import utc_now_iso
+
+TrialExecutor = Callable[[CampaignSpec, Sequence[Candidate]], list[dict[str, Any]]]
 
 TERMINAL_STOP_REASONS = ("budget", "patience", "exhausted")
 PAUSE_STOP_REASON = "max_rounds"
@@ -138,10 +146,14 @@ class CampaignEngine:
         *,
         store: CampaignStore | None = None,
         corpus: BenchmarkCorpus | None = None,
+        trial_executor: TrialExecutor | None = None,
     ) -> None:
         self.root = Path(root)
         self.store = store or CampaignStore(self.root)
         self.corpus = corpus or BenchmarkCorpus(self.store.directory)
+        # ``None`` keeps the N6 local thread-pool evaluator. N7 supplies a
+        # DistributedTrialExecutor, which submits trials to the N4 queue.
+        self.trial_executor = trial_executor
 
     # ------------------------------------------------------------------ #
     # run / resume
@@ -190,7 +202,35 @@ class CampaignEngine:
                 stop_reason = "exhausted"
                 break
 
-            results = self._evaluate_batch(evaluator, proposals, spec.parallel)
+            try:
+                if self.trial_executor is None:
+                    results = self._evaluate_batch(evaluator, proposals, spec.parallel)
+                else:
+                    results = self.trial_executor(spec, proposals)
+                    if len(results) != len(proposals):
+                        raise InvalidOperationParameters(
+                            "trial executor returned a different number of outcomes than candidates"
+                        )
+            except CampaignTimeout:
+                # The batch is not lost: its jobs remain in the queue and the same
+                # idempotency keys recover their results when the campaign is resumed.
+                self.store.update_campaign(
+                    campaign_id,
+                    status="paused",
+                    stop_reason="worker_timeout",
+                    rounds=round_count,
+                )
+                raise
+            except UzenError:
+                # A coordinator-side submission failure must not leave the campaign
+                # looking active forever; trials already queued remain resumable.
+                self.store.update_campaign(
+                    campaign_id,
+                    status="paused",
+                    stop_reason="trial_executor_error",
+                    rounds=round_count,
+                )
+                raise
             inserted = 0
             for sequence, (candidate, outcome) in enumerate(zip(proposals, results)):
                 if outcome["status"] == "ok":

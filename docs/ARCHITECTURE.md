@@ -9,7 +9,7 @@ artifact carries provenance and validation evidence.
                  │
         ┌────────┴─────────┐
         ▼                  ▼
-      jobs/          core/campaign (N6)
+      jobs/          core/campaign (N6 local, N7 distributed trials)
  control plane       scheduler · Pareto · replay corpus
         │                  │
         └────────┬─────────┘
@@ -183,7 +183,7 @@ none exists it reports `NO_VALID_ALIGNMENT` rather than inventing a result.
 `LLMPlanner` optionally consults an OpenAI-compatible endpoint, but every proposed
 stage is re-validated through the same registry/scope/policy path.
 
-## Campaigns (N6)
+## Campaigns (N6/N7)
 
 `uzen.core.campaign` is a separate research loop over the deterministic engines. A
 seeded planner (`grid`/`random`/`evolution`) proposes architecture specs or weight
@@ -194,6 +194,13 @@ run resumes from the same seed. Successful trials are written to a content-addre
 corpus whose `verify`/`replay` paths rebuild and execute the candidate instead of
 trusting stored numbers. Campaigns never train, fine-tune or update weights by
 gradients, and their proxy metrics are not task quality.
+
+N7 (`uzen.core.campaign.distributed`) passes a `DistributedTrialExecutor` to the same
+engine. It submits each proposal as a read-only `inspection` job with
+`options.task_kind=campaign_trial`; `CampaignWorker` claims those jobs through the N4
+scheduler and returns metrics through the token-guarded job result. The coordinator
+waits for the batch, stores the same trials and corpus records as a local run, and
+pauses on a typed timeout. The campaign database remains local to the coordinator.
 
 ## Control and execution planes
 

@@ -460,9 +460,10 @@ class MCPServer:
             "uzen.run_campaign": (
                 {
                     "description": (
-                        "Run or resume a deterministic N6 research campaign over architecture "
-                        "fields or weight transforms. Returns trials, Pareto front, best "
-                        "candidate and a content-addressed corpus digest."
+                        "Run or resume a deterministic N6/N7 research campaign over architecture "
+                        "fields or weight transforms. Set distributed=true to submit read-only "
+                        "trials to N4 workers. Returns trials, Pareto front, best candidate and "
+                        "a content-addressed corpus digest."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -470,6 +471,9 @@ class MCPServer:
                             "spec": {"type": "object"},
                             "resume": {"type": "boolean"},
                             "max_rounds": {"type": "integer"},
+                            "distributed": {"type": "boolean"},
+                            "trial_timeout_seconds": {"type": "number"},
+                            "poll_interval_seconds": {"type": "number"},
                         },
                         "required": ["spec"],
                     },
@@ -806,6 +810,9 @@ class MCPServer:
             args["spec"],
             resume=bool(args.get("resume", True)),
             max_rounds=args.get("max_rounds"),
+            distributed=bool(args.get("distributed", False)),
+            trial_timeout_seconds=float(args.get("trial_timeout_seconds", 600.0)),
+            poll_interval_seconds=float(args.get("poll_interval_seconds", 0.1)),
         )
 
     def _get_campaign(self, args: Mapping[str, Any]) -> Any:

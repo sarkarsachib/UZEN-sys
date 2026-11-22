@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     ae.add_argument("--param", action="append", default=[])
 
     # campaigns ------------------------------------------------------- #
-    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6)")
+    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6/N7)")
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     cr = campaign_sub.add_parser("run")
     cr.add_argument("--spec", help="inline campaign spec JSON")
@@ -227,6 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--id", help="override the campaign id")
     cr.add_argument("--no-resume", action="store_true")
     cr.add_argument("--max-rounds", type=int)
+    cr.add_argument("--distributed", action="store_true", help="submit trials to N4 workers")
+    cr.add_argument("--trial-timeout", type=float, default=600.0)
+    cr.add_argument("--poll-interval", type=float, default=0.1)
     cs = campaign_sub.add_parser("show")
     cs.add_argument("campaign_id")
     cl = campaign_sub.add_parser("list")
@@ -585,6 +588,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                     spec,
                     resume=not args.no_resume,
                     max_rounds=args.max_rounds,
+                    distributed=args.distributed,
+                    trial_timeout_seconds=args.trial_timeout,
+                    poll_interval_seconds=args.poll_interval,
                 )
             )
         elif args.campaign_command == "show":

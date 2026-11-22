@@ -36,6 +36,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | `budget.exhausted` | 429 | search budget exhausted |
 | `campaign.conflict` | 409 | campaign id reused with a different spec |
 | `campaign.not_found` | 404 | unknown campaign id |
+| `campaign.timeout` | 504 | a distributed trial batch did not settle before its deadline |
 
 ## REST (v1)
 
@@ -51,7 +52,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/architectures/research` | compare architecture variants |
 | POST | `/v1/architectures/compose` | compose stored graphs (sequential/parallel/residual), validate, execute and persist with lineage |
 | POST | `/v1/architectures/{id}/edit` | bypass, truncate or substitute a stored graph and persist the surviving parameters |
-| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`) |
+| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`); optional `distributed=true` submits N7 trial jobs to workers (`trial_timeout_seconds`, `poll_interval_seconds`) |
 | GET | `/v1/campaigns` | list campaigns |
 | POST | `/v1/campaigns/verify` | replay benchmark records (optional `digests`) |
 | GET | `/v1/campaigns/{id}` | campaign report and trials |
@@ -169,8 +170,9 @@ Tools: `uzen.import_model`, `uzen.quantize_model`, `uzen.forward_model`,
 `uzen.research_weight_architecture`, `uzen.research_model_architecture`,
 `uzen.modify_architecture`, `uzen.compose_architectures`, `uzen.create_model`,
 `uzen.evaluate_candidate`, `uzen.inspect_provenance`, `uzen.get_job_status`,
-`uzen.run_campaign`, `uzen.get_campaign`, `uzen.list_campaigns`,
-`uzen.verify_campaign_corpus`, `uzen.replay_benchmark`.
+`uzen.run_campaign` (including distributed trial execution), `uzen.get_campaign`,
+`uzen.list_campaigns`, `uzen.verify_campaign_corpus`, `uzen.replay_benchmark`.
+The server exposes 26 tools.
 
 Transport: JSON-RPC 2.0 over stdio; `initialize`, `tools/list`, `tools/call`, `ping`.
 Tool failures return `isError: true` with the typed error payload rather than a
