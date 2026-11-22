@@ -187,7 +187,11 @@ def test_registry_reports_geometry_and_codec_availability():
     q2k = type_info(10)
     assert (q2k["name"], q2k["block_size"], q2k["block_bytes"]) == ("q2_k", 256, 84)
     assert q2k["effective_bits"] == pytest.approx(2.625)
-    assert q2k["decoder_available"] is False
+    assert q2k["decoder_available"] is True
+    assert type_info(11)["decoder_available"] is True  # q3_k
+    assert type_info(20)["decoder_available"] is True  # iq4_nl
+    # IQ2/IQ3/IQ1 still need their grid tables and stay metadata-only.
+    assert type_info(16)["decoder_available"] is False
 
     q4k = type_info(12)
     assert (q4k["name"], q4k["block_size"], q4k["block_bytes"]) == ("q4_k", 256, 144)
@@ -218,18 +222,18 @@ def _synthetic_gguf(tmp_path, dims, type_id, payload):
     return path
 
 
-def test_inspect_reports_metadata_only_k_quant_tensors(tmp_path):
-    path = _synthetic_gguf(tmp_path, (256,), 10, b"\x00" * 84)
+def test_inspect_reports_metadata_only_iq_tensors(tmp_path):
+    path = _synthetic_gguf(tmp_path, (256,), 16, b"\x00" * 66)
     report = inspect_gguf(path)
     tensor = report["tensors"][0]
-    assert tensor["type_name"] == "q2_k"
-    assert tensor["byte_length"] == 84
+    assert tensor["type_name"] == "iq2_xxs"
+    assert tensor["byte_length"] == 66
     assert tensor["decoder_available"] is False
     assert tensor["in_registry"] is True
 
     with pytest.raises(UnsupportedFormat) as exc:
         read_gguf(path)
-    assert "q2_k" in str(exc.value)
+    assert "iq2_xxs" in str(exc.value)
 
 
 def test_requantize_reports_quantization_error(tmp_path):

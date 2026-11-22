@@ -318,3 +318,59 @@ def test_attention_semantics_match_the_reference():
             execution.outputs[output], expected, rtol=3e-4, atol=2e-4
         )
         allocator.close()
+
+
+@requires_compiler
+def test_batchnorm_kernel_is_declared_and_compiles(compiled_ptx: tuple[Path, dict]):
+    """The inference batchnorm kernel must exist in the source and the PTX."""
+    from uzen.runtimes.cuda.nvrtc import SOURCE
+
+    assert "uzen_batchnorm_f32" in KERNELS
+    assert "batchnorm" in DEVICE_OPS
+    source = SOURCE.read_text(encoding="utf-8")
+    assert "uzen_batchnorm_f32" in source
+    assert "running_mean" in source and "running_var" in source
+    path, report = compiled_ptx
+    assert report["kernels"] == list(KERNELS)
+    assert "uzen_batchnorm_f32" in path.read_text(encoding="utf-8")
+
+
+@requires_device
+def test_batchnorm_executes_on_device():
+    """Device parity for the inference batchnorm operator (needs a real GPU)."""
+    from uzen.core.nir.graph import Graph
+    from uzen.core.nir.types import Ref, TensorType
+    from uzen.core.nws.tensors import WeightPackage
+    from uzen.runtimes.cuda import CudaRuntime
+
+    rng = np.random.default_rng(0)
+    graph = Graph(name="batchnorm_probe")
+    graph.add_input("x", TensorType.of([2, 4], "float32"))
+    graph.add_node(
+        "bn",
+        "batchnorm",
+        {"x": Ref("input:x")},
+        {
+            "running_mean": "param:mean",
+            "running_var": "param:var",
+            "weight": "param:weight",
+            "bias": "param:bias",
+            "eps": 1e-5,
+        },
+    )
+    graph.set_output("y", Ref("bn:0"))
+    package = WeightPackage.from_arrays(
+        {
+            "mean": rng.standard_normal(4).astype(np.float32),
+            "var": (np.abs(rng.standard_normal(4)) + 0.5).astype(np.float32),
+            "weight": rng.standard_normal(4).astype(np.float32),
+            "bias": rng.standard_normal(4).astype(np.float32),
+        },
+        name="bn",
+        family="generic",
+    )
+    inputs = {"x": rng.standard_normal((2, 4)).astype(np.float32)}
+    reference = numpy_execute(graph, inputs, package)
+    with CudaRuntime(fallback="error") as runtime:
+        execution = runtime.execute_graph(graph, inputs, package)
+        np.testing.assert_allclose(execution.outputs["y"], reference.outputs["y"], rtol=1e-4, atol=1e-5)

@@ -1,0 +1,18 @@
+[package]
+name = "uzen_rust"
+version = "0.1.0"
+edition = "2021"
+description = "UZEN Rust kernel library (C ABI) for inference operators"
+license = "MIT"
+
+[lib]
+name = "uzen_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+codegen-units = 1

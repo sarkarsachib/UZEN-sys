@@ -43,6 +43,7 @@ KERNELS = (
     "uzen_matmul_f32",
     "uzen_layernorm_f32",
     "uzen_rmsnorm_f32",
+    "uzen_batchnorm_f32",
     "uzen_softmax_f32",
     "uzen_gelu_tanh_f32",
     "uzen_gelu_exact_f32",

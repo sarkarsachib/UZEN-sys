@@ -58,6 +58,8 @@ def detect_capabilities() -> dict[str, Any]:
         except Exception:
             cuda = False
     registry = default_registry()
+    from uzen.workers.sandbox import describe_isolation
+
     return {
         "protocol_version": PROTOCOL_VERSION,
         "hostname": socket.gethostname(),
@@ -76,6 +78,11 @@ def detect_capabilities() -> dict[str, Any]:
         "max_tensor_bytes": None,
         "artifact_transport": ["shared_filesystem", "inline_tensors"],
         "representations": native_representations(),
+        # What this host can actually enforce for untrusted payloads: whether a
+        # container runtime answers, whether rlimit isolation exists, and whether an
+        # unprivileged network namespace can be created. A scheduler can therefore
+        # route isolation-sensitive work instead of assuming it.
+        "sandbox": describe_isolation(),
         "strict_plus": True,
         "detected_at": utc_now_iso(),
     }

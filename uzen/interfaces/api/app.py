@@ -36,6 +36,21 @@ from uzen.core.nwpc.registry import default_registry
 from uzen.core.nws.families import family_catalogue
 from uzen.errors import UzenError
 from uzen.infrastructure.observability.metrics import METRICS
+from uzen.infrastructure.observability.tracing import (
+    SPAN_KIND_SERVER,
+    TRACER,
+    format_traceparent,
+    parse_traceparent,
+)
+from uzen.infrastructure.security.access import (
+    ANONYMOUS,
+    Principal,
+    TokenAuthority,
+    current_principal,
+    enforce_resource_scope,
+    principal_context,
+    required_scope,
+)
 from uzen.infrastructure.security.tokens import hash_secret
 from uzen.infrastructure.storage.db import JOB_STATES
 from uzen.jobs.scheduler import JobScheduler
@@ -59,6 +74,7 @@ def create_app(
     retry_backoff_cap_seconds: float = 300.0,
     aging_seconds: float = 0.0,
     max_in_flight_per_worker: int = 0,
+    auth_required: bool | None = None,
 ) -> Any:
     if not FASTAPI_AVAILABLE:
         from uzen.errors import RuntimeUnavailable
@@ -80,6 +96,7 @@ def create_app(
         max_in_flight_per_worker=max_in_flight_per_worker,
     )
     token = api_token if api_token is not None else os.environ.get("UZEN_API_TOKEN")
+    authority = TokenAuthority(service.db, legacy_token=token, required=auth_required)
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="uzen-job")
     lock = threading.Lock()
 
@@ -95,39 +112,100 @@ def create_app(
     app.state.service = service
     app.state.scheduler = scheduler
     app.state.auto_run = auto_run
+    app.state.authority = authority
+
+    def _error_response(
+        status: int, code: str, message: str, details: Mapping[str, Any] | None = None
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status,
+            content={"detail": {"code": code, "message": message, "details": dict(details or {})}},
+        )
 
     @app.middleware("http")
     async def observe_http(request: Request, call_next):
+        """Trace + authenticate + authorize every request in one place.
+
+        Collection and resource routes share one ordered scope table, and a request
+        that names another project's job or artifact is refused here, before any
+        handler can return its body. The span continues an incoming W3C trace.
+        """
         started = time.perf_counter()
-        response = await call_next(request)
-        route = request.scope.get("route")
-        path = getattr(route, "path", request.url.path)
-        METRICS.inc(
-            "uzen_http_requests_total",
-            method=request.method,
-            path=path,
-            status=str(response.status_code),
+        parent = parse_traceparent(request.headers.get("traceparent"))
+        span = TRACER.start_span(
+            f"{request.method} {request.url.path}",
+            kind=SPAN_KIND_SERVER,
+            parent=parent,
+            attributes={
+                "http.request.method": request.method,
+                "url.path": request.url.path,
+                "http.route": request.url.path,
+            },
         )
-        METRICS.observe(
-            "uzen_http_request_duration_seconds",
-            time.perf_counter() - started,
-            method=request.method,
-            path=path,
-        )
-        return response
+        response: Any = None
+        context = None
+        try:
+            try:
+                # Public routes (health, metrics, operation catalogue, worker plane) are
+                # decided by the scope table before any token is demanded.
+                scope = required_scope(request.method, request.url.path)
+                if scope is None:
+                    principal = ANONYMOUS
+                else:
+                    principal = authority.authenticate(
+                        request.headers.get("authorization"),
+                        project=request.headers.get("x-uzen-project"),
+                    )
+                    principal.require(scope)
+                    enforce_resource_scope(service.db, principal, request.method, request.url.path)
+                span.set_attribute("uzen.project_id", principal.project_id)
+                span.set_attribute("uzen.token_id", principal.token_id)
+                if scope:
+                    span.set_attribute("uzen.required_scope", scope)
+                request.state.principal = principal
+            except UzenError as exc:
+                span.record_exception(exc)
+                span.set_attribute("http.response.status_code", exc.http_status)
+                response = _error_response(exc.http_status, exc.code, exc.message, exc.details)
+                return response
+            context = principal_context(principal)
+            context.__enter__()
+            response = await call_next(request)
+            span.set_attribute("http.response.status_code", response.status_code)
+            response.headers["traceparent"] = format_traceparent(span.trace_id, span.span_id)
+            return response
+        finally:
+            if context is not None:
+                context.__exit__(None, None, None)
+            route = request.scope.get("route")
+            path = getattr(route, "path", request.url.path)
+            status_code = getattr(response, "status_code", 500)
+            METRICS.inc(
+                "uzen_http_requests_total",
+                method=request.method,
+                path=path,
+                status=str(status_code),
+            )
+            METRICS.observe(
+                "uzen_http_request_duration_seconds",
+                time.perf_counter() - started,
+                method=request.method,
+                path=path,
+            )
+            span.end()
 
     # ------------------------------------------------------------------ #
     # auth / errors
     # ------------------------------------------------------------------ #
 
-    def require_auth(authorization: str | None = Header(default=None)) -> None:
-        if not token:
-            return
-        if not authorization or not authorization.lower().startswith("bearer "):
-            raise HTTPException(status_code=401, detail={"code": "auth.missing", "message": "bearer token required"})
-        presented = authorization.split(" ", 1)[1].strip()
-        if not hmac.compare_digest(hash_secret(presented), hash_secret(token)):
-            raise HTTPException(status_code=401, detail={"code": "auth.invalid", "message": "invalid token"})
+    def require_auth(authorization: str | None = Header(default=None)) -> Principal:
+        """Expose the principal the middleware authenticated and authorized.
+
+        Authentication itself happens once, in the middleware, before routing: a
+        handler that is reachable has already satisfied the route's scope. Public
+        routes still depend on this to receive the anonymous principal.
+        """
+        return current_principal()
 
     @app.exception_handler(UzenError)
     async def uzen_error_handler(request: Request, exc: UzenError) -> JSONResponse:
@@ -223,8 +301,14 @@ def create_app(
                 pass
 
     @app.get(f"/{API_VERSION}/jobs")
-    def list_jobs(state: str | None = None, limit: int = 50, _: None = Depends(require_auth)):
-        return {"jobs": service.list(state=state, limit=limit)}
+    def list_jobs(
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        project_id: str | None = None,
+        _: None = Depends(require_auth),
+    ):
+        return service.list_page(state=state, limit=limit, cursor=cursor, project_id=project_id)
 
     @app.get(f"/{API_VERSION}/jobs/{{job_id}}")
     def get_job(job_id: str, _: None = Depends(require_auth)):
@@ -423,12 +507,28 @@ def create_app(
         )
 
     @app.get(f"/{API_VERSION}/models")
-    def list_models(limit: int = 100, _: None = Depends(require_auth)):
-        return {"models": service.models(limit=limit)}
+    def list_models(
+        limit: int = 100,
+        cursor: str | None = None,
+        project_id: str | None = None,
+        _: None = Depends(require_auth),
+    ):
+        return service.models_page(limit=limit, cursor=cursor, project_id=project_id)
 
     @app.get(f"/{API_VERSION}/weights")
-    def list_weights(limit: int = 100, _: None = Depends(require_auth)):
-        return {"weights": service.artifacts(limit=limit)}
+    def list_weights(
+        limit: int = 100,
+        cursor: str | None = None,
+        project_id: str | None = None,
+        _: None = Depends(require_auth),
+    ):
+        page = service.artifacts_page(limit=limit, cursor=cursor, project_id=project_id)
+        return {
+            "weights": page["artifacts"],
+            "next_cursor": page["next_cursor"],
+            "has_more": page["has_more"],
+            "limit": page["limit"],
+        }
 
     @app.post(f"/{API_VERSION}/weights/analyze")
     def analyze_weights(payload: dict[str, Any], _: None = Depends(require_auth)):
@@ -820,5 +920,91 @@ def create_app(
     @app.get(f"/{API_VERSION}/jobs/{{job_id}}/eligibility")
     def job_eligibility(job_id: str, _: None = Depends(require_auth)):
         return scheduler.eligible_workers(job_id)
+
+    # ------------------------------------------------------------------ #
+    # tenancy: principals, tokens, artifact sharing, traces
+    # ------------------------------------------------------------------ #
+
+    @app.get(f"/{API_VERSION}/whoami")
+    def whoami(_: None = Depends(require_auth)):
+        return current_principal().to_dict()
+
+    @app.post(f"/{API_VERSION}/tokens", status_code=201)
+    def mint_token(payload: dict[str, Any], _: None = Depends(require_auth)):
+        return authority.mint(
+            current_principal(),
+            project_id=payload.get("project_id"),
+            scopes=payload.get("scopes") or [],
+            description=payload.get("description"),
+        )
+
+    @app.get(f"/{API_VERSION}/tokens")
+    def list_tokens(_: None = Depends(require_auth)):
+        principal = current_principal()
+        return {
+            "tokens": service.db.list_api_tokens(
+                project_id=None if principal.is_admin else principal.project_id
+            )
+        }
+
+    @app.delete(f"/{API_VERSION}/tokens/{{token_id}}")
+    def revoke_token(token_id: str, _: None = Depends(require_auth)):
+        principal = current_principal()
+        target = next(
+            (row for row in service.db.list_api_tokens() if row["token_id"] == token_id),
+            None,
+        )
+        if target is None:
+            raise HTTPException(
+                404, detail={"code": "token.not_found", "message": f"token '{token_id}' not found"}
+            )
+        if not principal.is_admin and target["project_id"] != principal.project_id:
+            from uzen.errors import AuthorizationDenied
+
+            raise AuthorizationDenied("token belongs to another project", token_id=token_id)
+        return {"token_id": token_id, "revoked": service.db.revoke_api_token(token_id)}
+
+    @app.post(f"/{API_VERSION}/artifacts/{{artifact_id}}/share", status_code=201)
+    def share_artifact(artifact_id: str, payload: dict[str, Any], _: None = Depends(require_auth)):
+        from uzen.errors import AuthorizationDenied
+
+        principal = current_principal()
+        project = service.db.artifact_project(artifact_id)
+        if project is None:
+            raise HTTPException(
+                404,
+                detail={"code": "artifact.not_found", "message": f"artifact '{artifact_id}' not found"},
+            )
+        if not principal.is_admin and project != principal.project_id:
+            raise AuthorizationDenied(
+                "only the owning project may share an artifact", artifact_id=artifact_id
+            )
+        target_project = payload.get("project_id")
+        if not target_project:
+            raise HTTPException(
+                400,
+                detail={"code": "request.invalid", "message": "payload.project_id is required"},
+            )
+        return service.db.grant_artifact_access(
+            artifact_id,
+            str(target_project),
+            permission=str(payload.get("permission", "read")),
+        )
+
+    @app.get(f"/{API_VERSION}/artifacts/{{artifact_id}}/acl")
+    def artifact_acl(artifact_id: str, _: None = Depends(require_auth)):
+        return {
+            "artifact_id": artifact_id,
+            "owner_project": service.db.artifact_project(artifact_id),
+            "grants": service.db.artifact_acls(artifact_id),
+        }
+
+    @app.get(f"/{API_VERSION}/traces")
+    def recent_traces(limit: int = 100, _: None = Depends(require_auth)):
+        return {"spans": TRACER.recent(limit=limit), "stats": TRACER.stats()}
+
+    @app.get(f"/{API_VERSION}/traces/otlp")
+    def traces_otlp(_: None = Depends(require_auth)):
+        return TRACER.to_otlp()
 
     return app

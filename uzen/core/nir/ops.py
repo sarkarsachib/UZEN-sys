@@ -790,6 +790,57 @@ def _reduction_run(fn):
     return run
 
 
+def _batchnorm_axis(params: Any, rank: int) -> int:
+    axis = int(params.get("axis", 1 if rank == 4 else -1))
+    if axis < 0:
+        axis += rank
+    if not 0 <= axis < rank:
+        raise InvalidOperationParameters(f"batchnorm axis {axis} out of range for rank {rank}")
+    return axis
+
+
+def _batchnorm_infer(inputs, params, bound):
+    x = inputs[0]
+    if x.rank < 2:
+        raise InvalidOperationParameters("batchnorm expects an input with at least 2 axes")
+    axis = _batchnorm_axis(params, x.rank)
+    for name in ("running_mean", "running_var"):
+        stat = _require_bound(bound, str(params.get(name, name)).replace("param:", ""), "batchnorm")
+        if stat.rank != 1:
+            raise InvalidOperationParameters(f"batchnorm {name} must be one-dimensional")
+        if isinstance(x.shape[axis], int) and isinstance(stat.shape[0], int) and x.shape[axis] != stat.shape[0]:
+            raise ShapeMismatch(
+                f"batchnorm {name} has {stat.shape[0]} values for axis {axis} with size {x.shape[axis]}"
+            )
+    for name in ("weight", "bias"):
+        if not params.get(name):
+            continue
+        value = _require_bound(bound, str(params[name]).replace("param:", ""), "batchnorm")
+        if value.rank != 1 or (isinstance(x.shape[axis], int) and value.shape[0] != x.shape[axis]):
+            raise ShapeMismatch(f"batchnorm {name} shape {value.shape} does not match axis {axis}")
+    return [TensorType(x.shape, _float_dtype(x))]
+
+
+def _batchnorm_run(inputs, params, bound):
+    x = inputs[0]
+    axis = _batchnorm_axis(params, x.ndim)
+    mean = bound[str(params.get("running_mean", "running_mean")).replace("param:", "")]
+    var = bound[str(params.get("running_var", "running_var")).replace("param:", "")]
+    eps = float(params.get("eps", 1e-5))
+    shape = [1] * x.ndim
+    shape[axis] = x.shape[axis]
+    scale = np.reshape(mean, shape)
+    variance = np.reshape(var, shape)
+    y = (x - scale) / np.sqrt(variance + eps)
+    if params.get("weight"):
+        weight = bound[str(params["weight"]).replace("param:", "")]
+        y = y * np.reshape(weight, shape)
+    if params.get("bias"):
+        bias = bound[str(params["bias"]).replace("param:", "")]
+        y = y + np.reshape(bias, shape)
+    return [y.astype(np.result_type(x.dtype, np.float32), copy=False)]
+
+
 def _conv2d_infer(inputs, params, bound):
     x = inputs[0]
     w = _require_bound(bound, str(params.get("weight", "weight")).replace("param:", ""), "conv2d")
@@ -1238,6 +1289,7 @@ _reg("slice", 1, 1, _slice_infer, _slice_run, "axis slice", "structure")
 _reg("flatten", 1, 1, _flatten_infer, _flatten_run, "flatten trailing dimensions", "structure")
 _reg("mean", 1, 1, _reduction_infer, _reduction_run(np.mean), "mean reduction", "math")
 _reg("sum", 1, 1, _reduction_infer, _reduction_run(np.sum), "sum reduction", "math")
+_reg("batchnorm", 1, 1, _batchnorm_infer, _batchnorm_run, "inference batch normalization with stored running statistics", "norm")
 _reg("conv2d", 1, 1, _conv2d_infer, _conv2d_run, "2-D convolution (optional padding/stride)", "conv")
 _reg("maxpool2d", 1, 1, _pool2d_infer, _pool2d_run, "2-D max pooling", "conv")
 _reg("rnn", 1, 1, _recurrent_infer("rnn"), _rnn_run, "vanilla tanh recurrent layer over time", "recurrent")

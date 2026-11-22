@@ -1,15 +1,23 @@
 """WPL compiler: program AST -> typed execution plan -> executed artifacts.
 
-The compiler performs four checks before anything runs:
+The compiler performs five checks before anything runs:
 
-1. **Operation resolution** — every called operation exists in the registry, either
-   by full code (``w.arithmetic.delta``) or by unambiguous shorthand (``delta``).
-2. **Parameter typing** — every argument is validated against the operation's
-   declared parameter spec; unknown parameters are rejected.
-3. **Reference/dataflow checking** — a step may only reference declared inputs or
-   outputs of earlier steps.
-4. **Policy authorization** — each stage's declared effect is authorized for the
+1. **Parameter typing** — every declared parameter is resolved to a typed value,
+   with unknown overrides rejected.
+2. **Constraints** — ``constraint`` expressions are evaluated against the parameter
+   values; a false constraint refuses the program before execution.
+3. **Control flow** — ``if``/``else`` conditions are evaluated against parameters
+   only. **Both** branches are compiled (operation resolution, parameter typing,
+   dataflow and policy effects); only the selected branch enters the plan. A
+   condition that depends on tensors is rejected by the expression evaluator.
+4. **Reference/dataflow checking** — a step may only reference declared inputs or
+   outputs of earlier steps on the selected path.
+5. **Policy authorization** — each stage's declared effect is authorized for the
    program's scope *before* execution (STRICT_PLUS dry run).
+
+``expect`` annotations become postconditions on the produced package and are
+enforced by :func:`run_program` after execution; a failed postcondition raises
+:class:`~uzen.errors.ValidationFailed` and never reports success.
 
 Execution is delegated to :class:`uzen.core.wcomp.compiler.CompiledPipeline`, which
 calls the operation registry. There is no interpreter that evaluates arbitrary code.
@@ -17,8 +25,10 @@ calls the operation registry. There is no interpreter that evaluates arbitrary c
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
+
+import numpy as np
 
 from uzen.core.nwpc.registry import OperationRegistry, default_registry
 from uzen.core.wcomp.compiler import (
@@ -28,12 +38,26 @@ from uzen.core.wcomp.compiler import (
     Stage,
     compile_stages,
 )
-from uzen.core.wpl.parser import Call, Program, parse_program
-from uzen.errors import ProgramInvalid
+from uzen.core.wpl.parser import (
+    Binary,
+    Call,
+    Expression,
+    Expectation,
+    If,
+    Literal,
+    Program,
+    Reference,
+    Step,
+    Unary,
+    evaluate_expression,
+    parse_program,
+)
+from uzen.errors import ProgramInvalid, ValidationFailed
 from uzen.policies.strict_plus.effects import TaskScope
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
 
 TYPE_MAP = {"float": float, "int": int, "bool": bool, "str": str}
+EXPECTATION_KEYS = frozenset({"finite", "tensors", "max_abs", "min_abs"})
 
 
 @dataclass
@@ -41,6 +65,9 @@ class CompiledProgram:
     program: Program
     pipeline: CompiledPipeline
     report: CompilationReport
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[dict[str, Any]] = field(default_factory=list)
+    expectations: list[Expectation] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +77,9 @@ class CompiledProgram:
             "outputs": dict(self.program.outputs),
             "compilation": self.report.to_dict(),
             "effects": self.pipeline.effects(),
+            "control_flow": list(self.decisions),
+            "constraints": list(self.constraints),
+            "expectations": [expectation.describe() for expectation in self.expectations],
         }
 
 
@@ -76,6 +106,132 @@ def _resolve_value(value: Any, params: Mapping[str, tuple[str, Any]]) -> Any:
     if isinstance(value, str) and value in params and not value.startswith("w."):
         return params[value][1]
     return value
+
+
+def _param_values(params: Mapping[str, tuple[str, Any]]) -> dict[str, Any]:
+    return {name: value for name, (_type, value) in params.items()}
+
+
+def _stages_for_body(
+    body: Sequence[Any],
+    *,
+    params: Mapping[str, tuple[str, Any]],
+    registry: OperationRegistry,
+    scope: TaskScope,
+    engine: StrictPlusEngine,
+    available: set[str],
+    decisions: list[dict[str, Any]],
+    validate_unselected: bool = True,
+) -> tuple[list[Stage], set[str]]:
+    """Flatten one body into stages, evaluating compile-time branches."""
+    stages: list[Stage] = []
+    values = _param_values(params)
+    for statement in body:
+        if isinstance(statement, Step):
+            code = resolve_operation_code(statement.call.code, registry)
+            kwargs = {k: _resolve_value(v, params) for k, v in statement.call.kwargs.items()}
+            stages.append(
+                Stage(name=statement.name, code=code, args=list(statement.call.args), params=kwargs)
+            )
+            available.add(statement.name)
+            continue
+        if isinstance(statement, If):
+            condition_value = bool(evaluate_expression(statement.condition, values))
+            chosen = statement.then_body if condition_value else statement.else_body
+            decision_index = len(decisions)
+            unselected_label = "else" if condition_value else "then"
+            unselected = statement.else_body if condition_value else statement.then_body
+            if validate_unselected and unselected:
+                try:
+                    branch_stages, _branch_available = _stages_for_body(
+                        unselected,
+                        params=params,
+                        registry=registry,
+                        scope=scope,
+                        engine=engine,
+                        available=set(available),
+                        decisions=[],
+                        validate_unselected=False,
+                    )
+                    _pipeline, branch_report = compile_stages(
+                        branch_stages,
+                        scope=scope,
+                        registry=registry,
+                        engine=engine,
+                        available_inputs=sorted(available),
+                        outputs=[],
+                    )
+                except ProgramInvalid as exc:
+                    raise ProgramInvalid(
+                        f"the '{unselected_label}' branch of 'if "
+                        f"{statement.condition.describe()}' does not compile even though it "
+                        f"is not selected: {exc.message}",
+                        branch=unselected_label,
+                    ) from exc
+                if not branch_report.ok:
+                    raise ProgramInvalid(
+                        f"the '{unselected_label}' branch of 'if "
+                        f"{statement.condition.describe()}' does not compile even though it "
+                        f"is not selected: {branch_report.to_dict()}",
+                        branch=unselected_label,
+                    )
+            chosen_stages, available = _stages_for_body(
+                chosen,
+                params=params,
+                registry=registry,
+                scope=scope,
+                engine=engine,
+                available=set(available),
+                decisions=decisions,
+                validate_unselected=True,
+            )
+            stages.extend(chosen_stages)
+            decisions.insert(
+                decision_index,
+                {
+                    "condition": statement.condition.describe(),
+                    "value": condition_value,
+                    "branch": "then" if condition_value else "else",
+                    "steps": [stage.name for stage in chosen_stages],
+                },
+            )
+            continue
+        raise ProgramInvalid(f"unsupported WPL statement {statement!r}")
+    return stages, available
+
+
+def _resolve_expectations(
+    program: Program, expectations: Sequence[Expectation]
+) -> list[Expectation]:
+    """Map each expectation target onto a concrete pipeline output name."""
+    resolved: list[Expectation] = []
+    references = {value: key for key, value in program.outputs.items()}
+    for expectation in expectations:
+        unknown = sorted(set(expectation.checks) - EXPECTATION_KEYS)
+        if unknown:
+            raise ProgramInvalid(
+                f"'expect {expectation.target}' has unsupported annotations {unknown}; "
+                f"supported: {sorted(EXPECTATION_KEYS)}"
+            )
+        target = expectation.target
+        if target in program.outputs:
+            output = program.outputs[target]
+        elif target in references:
+            output = target
+        else:
+            raise ProgramInvalid(
+                f"'expect {target}' does not name a program output; outputs: "
+                f"{sorted(program.outputs)}"
+            )
+        resolved.append(
+            Expectation(
+                target=target,
+                checks=dict(expectation.checks),
+                line=expectation.line,
+                pipeline_output=output,
+            )
+        )
+    return resolved
 
 
 def compile_program(
@@ -125,11 +281,28 @@ def compile_program(
             )
         params[name] = (ptype, value)
 
-    stages: list[Stage] = []
-    for name, call in program.steps:
-        code = resolve_operation_code(call.code, registry)
-        kwargs = {k: _resolve_value(v, params) for k, v in call.kwargs.items()}
-        stages.append(Stage(name=name, code=code, args=list(call.args), params=kwargs))
+    values = _param_values(params)
+    constraint_records: list[dict[str, Any]] = []
+    for constraint in program.constraints:
+        result = bool(evaluate_expression(constraint, values))
+        constraint_records.append({"expression": constraint.describe(), "value": result})
+        if not result:
+            raise ProgramInvalid(
+                f"constraint '{constraint.describe()}' is false for {values}",
+                constraint=constraint.describe(),
+                parameters=values,
+            )
+
+    decisions: list[dict[str, Any]] = []
+    stages, _available = _stages_for_body(
+        program.body,
+        params=params,
+        registry=registry,
+        scope=scope,
+        engine=engine,
+        available=set(program.inputs),
+        decisions=decisions,
+    )
 
     pipeline, report = compile_stages(
         stages,
@@ -141,10 +314,66 @@ def compile_program(
         metadata={
             "program": program.name,
             "outputs": sorted(set(program.outputs.values())),
+            "control_flow": decisions,
+            "constraints": constraint_records,
         },
     )
     report.require()
-    return CompiledProgram(program=program, pipeline=pipeline, report=report)
+    return CompiledProgram(
+        program=program,
+        pipeline=pipeline,
+        report=report,
+        decisions=decisions,
+        constraints=constraint_records,
+        expectations=_resolve_expectations(program, program.expectations),
+    )
+
+
+def enforce_expectations(result: PipelineResult, expectations: Sequence[Expectation]) -> None:
+    """Check ``expect`` postconditions against the produced packages."""
+    for expectation in expectations:
+        package = result.package(expectation.pipeline_output or expectation.target)
+        tensors = list(package.tensors.values())
+        for key, value in expectation.checks.items():
+            if key == "finite":
+                if value is False:
+                    continue
+                bad = [name for name, tensor in package.tensors.items() if not np.isfinite(tensor).all()]
+                if bad:
+                    raise ValidationFailed(
+                        f"expect {expectation.target} finite: tensors {bad} contain non-finite values",
+                        expected="finite",
+                        tensors=bad,
+                    )
+            elif key == "tensors":
+                count = int(value)
+                if len(tensors) != count:
+                    raise ValidationFailed(
+                        f"expect {expectation.target} tensors={count}: package has {len(tensors)}",
+                        expected=count,
+                        actual=len(tensors),
+                    )
+            elif key in ("max_abs", "min_abs"):
+                limit = float(value)
+                if not tensors:
+                    raise ValidationFailed(
+                        f"expect {expectation.target} {key}={limit}: package has no tensors"
+                    )
+                maximum = max(float(np.max(np.abs(tensor))) for tensor in tensors)
+                if key == "max_abs" and maximum > limit:
+                    raise ValidationFailed(
+                        f"expect {expectation.target} max_abs={limit}: observed {maximum}",
+                        expected=limit,
+                        observed=maximum,
+                    )
+                if key == "min_abs" and maximum < limit:
+                    raise ValidationFailed(
+                        f"expect {expectation.target} min_abs={limit}: observed maximum {maximum}",
+                        expected=limit,
+                        observed=maximum,
+                    )
+            else:  # pragma: no cover - compiler validates annotation keys
+                raise ValidationFailed(f"unsupported expectation '{key}'")
 
 
 def run_program(
@@ -166,31 +395,85 @@ def run_program(
         param_overrides=param_overrides,
     )
     result = compiled.pipeline.execute(inputs, seed=seed, scope=scope, job_id=job_id)
+    enforce_expectations(result, compiled.expectations)
     return result, compiled
 
 
-def describe_program(source: str, *, scope: TaskScope | None = None, registry: OperationRegistry | None = None) -> dict[str, Any]:
-    """Static analysis of a program without executing it."""
+def describe_program(
+    source: str,
+    *,
+    scope: TaskScope | None = None,
+    registry: OperationRegistry | None = None,
+    param_overrides: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Static analysis of a program without executing it.
+
+    ``if`` conditions are evaluated when their parameters have defaults (or an
+    override); otherwise both branches are listed with ``"branch": null``.
+    """
     program = parse_program(source)
     registry = registry or default_registry()
-    stages = []
+    overrides = dict(param_overrides or {})
+    values = {
+        name: overrides.get(name, default) for name, (_type, default) in program.params.items()
+    }
+    stages: list[dict[str, Any]] = []
     effects: list[str] = []
-    for name, call in program.steps:
-        code = resolve_operation_code(call.code, registry)
-        spec = registry.get(code)
-        effects.append(spec.effect.value)
-        stages.append(
-            {
-                "name": name,
-                "code": code,
-                "title": spec.title,
-                "effect": spec.effect.value,
-                "maturity": spec.maturity.value,
-                "args": list(call.args),
-                "params": dict(call.kwargs),
-                "assumptions": list(spec.assumptions),
-            }
-        )
+    decisions: list[dict[str, Any]] = []
+    constraint_records: list[dict[str, Any]] = []
+
+    for constraint in program.constraints:
+        try:
+            constraint_records.append(
+                {"expression": constraint.describe(), "value": bool(evaluate_expression(constraint, values))}
+            )
+        except ProgramInvalid:
+            constraint_records.append({"expression": constraint.describe(), "value": None})
+
+    def walk(body: Sequence[Any], *, branch: str | None, depth: int) -> None:
+        for statement in body:
+            if isinstance(statement, Step):
+                code = resolve_operation_code(statement.call.code, registry)
+                spec = registry.get(code)
+                effects.append(spec.effect.value)
+                stages.append(
+                    {
+                        "name": statement.name,
+                        "code": code,
+                        "title": spec.title,
+                        "effect": spec.effect.value,
+                        "maturity": spec.maturity.value,
+                        "args": list(statement.call.args),
+                        "params": dict(statement.call.kwargs),
+                        "assumptions": list(spec.assumptions),
+                        "branch": branch,
+                        "depth": depth,
+                    }
+                )
+                continue
+            assert isinstance(statement, If)
+            try:
+                condition: bool | None = bool(evaluate_expression(statement.condition, values))
+            except ProgramInvalid:
+                condition = None
+            decisions.append(
+                {
+                    "condition": statement.condition.describe(),
+                    "value": condition,
+                    "branch": None if condition is None else ("then" if condition else "else"),
+                }
+            )
+            if condition is None:
+                walk(statement.then_body, branch="then", depth=depth + 1)
+                walk(statement.else_body, branch="else", depth=depth + 1)
+            else:
+                walk(
+                    statement.then_body if condition else statement.else_body,
+                    branch="then" if condition else "else",
+                    depth=depth + 1,
+                )
+
+    walk(program.body, branch=None, depth=0)
     return {
         "program": program.name,
         "inputs": program.inputs,
@@ -198,6 +481,9 @@ def describe_program(source: str, *, scope: TaskScope | None = None, registry: O
         "steps": stages,
         "outputs": program.outputs,
         "effects": sorted(set(effects)),
+        "constraints": constraint_records,
+        "control_flow": decisions,
+        "expectations": [expectation.describe() for expectation in program.expectations],
         "scope_requested": scope.value if scope else None,
         "executable": True,
     }

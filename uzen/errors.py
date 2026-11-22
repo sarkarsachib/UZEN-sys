@@ -195,6 +195,27 @@ class BudgetExhausted(UzenError):
     http_status = 429
 
 
+class AuthenticationRequired(UzenError):
+    """No valid bearer token accompanied a request that requires one."""
+
+    code = "auth.required"
+    http_status = 401
+
+
+class AuthorizationDenied(UzenError):
+    """The caller is authenticated but not allowed to touch this resource."""
+
+    code = "auth.denied"
+    http_status = 403
+
+
+class InvalidCursor(UzenError):
+    """A pagination cursor or page size is malformed."""
+
+    code = "pagination.invalid_cursor"
+    http_status = 400
+
+
 class WorkerAuthError(UzenError):
     code = "worker.auth_failed"
     http_status = 401

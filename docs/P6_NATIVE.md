@@ -5,7 +5,8 @@ Advanced computational substrate**, and exactly what is implemented. The master
 specification lists Rust integration, a native compiler, C++/CUDA kernels,
 additional runtime backends, advanced parameter representations and large-scale
 autonomous research. Those are too large to pretend to finish in one step, so
-they are split into six core phases, plus the N7 and N8 post-P6 campaign extensions.
+they are split into six core phases, plus the N7, N8 and N9 post-P6 campaign
+extensions.
 
 No phase below is claimed because a directory or interface name exists. A phase is
 `implemented` only when its kernels/engine execute real computation and the
@@ -23,6 +24,7 @@ listed gate passes.
 | **N6** | Large-scale autonomous research: candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | **implemented** (in-process batch scheduler; inference-only proxy metrics; see [N6_CAMPAIGNS.md](N6_CAMPAIGNS.md)) |
 | **N7** | Distributed campaign trials over the N4 worker queue | **implemented** (post-P6 extension; see [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md)) |
 | **N8** | Campaign control: durable background runs, cancellation propagation and job-kind isolation | **implemented** (post-P6 extension; see [N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md)) |
+| **N9** | Campaign run durability: atomic single-coordinator admission and lease keepalive | **implemented** (post-P6 extension; see [N9_CAMPAIGN_DURABILITY.md](N9_CAMPAIGN_DURABILITY.md)) |
 
 N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
 a machine with a device. N6 runs real architecture and weight-transform campaigns with
@@ -675,3 +677,25 @@ real-process demo has 10/10 gates PASS, and the full suite is 553 passed / 37 sk
 NVRTC is not installed in this restored environment). See
 [N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md) for the job contract, cancellation
 barrier, interfaces and limits.
+
+## N9 — campaign run durability (post-P6 extension)
+
+N9 closes the duplicate-admission and long-lease gaps documented by N8. A background
+submission now reserves the campaign's coordinator slot atomically with
+`CampaignStore.reserve_run` under `BEGIN IMMEDIATE`, then creates the job under that
+reserved id; concurrent submitters return the same job instead of each creating one.
+`JobService.run(..., lease_seconds=N)` renews a leased job every `N/3` seconds with the
+dispatch token, and `CampaignWorker` passes its lease into that path. A campaign that
+runs longer than its initial lease therefore stays on attempt 1 instead of being reaped
+and executed twice.
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_campaign_durability.py
+.venv/bin/python examples/campaign_durability_demo.py --root /tmp/uzen-n9-demo
+```
+
+Measured in this workspace: 4 focused N9 tests pass, the 10 N8 and 9 N7 tests stay
+green, the full suite is 557 passed / 37 skipped, and the four-process demo reports 9/9
+gates PASS with one admitted job, 64 trials, and a ~0.4-second run under a 0.15-second
+lease. Admission remains single-host SQLite and cancellation remains cooperative; see
+[N9_CAMPAIGN_DURABILITY.md](N9_CAMPAIGN_DURABILITY.md) for the protocol and limits.

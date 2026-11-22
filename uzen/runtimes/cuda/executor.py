@@ -80,6 +80,7 @@ DEVICE_OPS = frozenset(
         "matmul",
         "layernorm",
         "rmsnorm",
+        "batchnorm",
         "softmax",
         "embedding",
         "mean",
@@ -490,6 +491,34 @@ class CudaExecutor:
                 )
             ], "device"
 
+        if op == "batchnorm":
+            mean = self._bound_weight(
+                node, params, bound, "running_mean", "running_mean"
+            )
+            variance = self._bound_weight(
+                node, params, bound, "running_var", "running_var"
+            )
+            weight = (
+                self._bound_weight(node, params, bound, "weight", "weight")
+                if params.get("weight")
+                else None
+            )
+            bias = (
+                self._bound_weight(node, params, bound, "bias", "bias")
+                if params.get("bias")
+                else None
+            )
+            if params.get("axis", -1) not in (-1, x.ndim - 1):
+                raise UnsupportedOperator(
+                    "CUDA batchnorm applies its statistics along the last axis; "
+                    f"node '{node.id}' requested axis {params.get('axis')}",
+                    node=node.id,
+                    operator=op,
+                )
+            return [
+                self._batchnorm(x, weight, bias, mean, variance, float(params.get("eps", 1e-5)))
+            ], "device"
+
         if op == "softmax":
             axes = _axes(params.get("axis", -1), x.ndim)
             if axes != (x.ndim - 1,):
@@ -724,6 +753,49 @@ class CudaExecutor:
                 [ptr(output.buffer), i32(rows), i32(cols), f32(eps)]
             )
             self._launch(kernel, (rows, 1, 1), (256, 1, 1), arguments)
+        return output
+
+    def _batchnorm(
+        self,
+        x: DeviceTensor,
+        weight: DeviceTensor | None,
+        bias: DeviceTensor | None,
+        running_mean: DeviceTensor,
+        running_var: DeviceTensor,
+        eps: float,
+    ) -> DeviceTensor:
+        if x.ndim < 2:
+            raise ShapeMismatch("CUDA batchnorm requires a rank >= 2 input")
+        cols = x.shape[-1]
+        rows = _count(x.shape[:-1])
+        for label, parameter in (
+            ("weight", weight),
+            ("bias", bias),
+            ("running_mean", running_mean),
+            ("running_var", running_var),
+        ):
+            if parameter is not None and parameter.shape != (cols,):
+                raise ShapeMismatch(
+                    f"CUDA batchnorm {label} {parameter.shape} != ({cols},)"
+                )
+        output = self._new(x.shape)
+        if rows and cols:
+            self._launch(
+                "uzen_batchnorm_f32",
+                (rows, 1, 1),
+                (256, 1, 1),
+                [
+                    ptr(x.buffer),
+                    ptr(weight.buffer) if weight is not None else null_ptr(),
+                    ptr(bias.buffer) if bias is not None else null_ptr(),
+                    ptr(running_mean.buffer),
+                    ptr(running_var.buffer),
+                    ptr(output.buffer),
+                    i32(rows),
+                    i32(cols),
+                    f32(eps),
+                ],
+            )
         return output
 
     def _softmax(self, x: DeviceTensor) -> DeviceTensor:

@@ -13,15 +13,21 @@ in :class:`uzen.jobs.service.JobService`, and cancellation lives in
 
 from __future__ import annotations
 
+import time
+import uuid
 from typing import Any, Mapping
 
 from uzen.core.campaign.distributed import CAMPAIGN_RUN_KIND
 from uzen.core.campaign.spec import CampaignSpec
-from uzen.errors import InvalidOperationParameters, JobNotFound
+from uzen.errors import CampaignConflict, InvalidOperationParameters, JobNotFound
 from uzen.infrastructure.storage.db import TERMINAL_STATES
 from uzen.jobs.service import JobService
 
 CAMPAIGN_RUN_CANDIDATE = "__campaign_run__"
+#: How long a duplicate submitter waits for the winning coordinator job to appear.
+RUN_ADMISSION_WAIT_SECONDS = 5.0
+#: A reservation older than this may be recovered if its creator never created the job.
+RUN_RESERVATION_GRACE_SECONDS = 30.0
 
 
 def campaign_run_request(
@@ -114,37 +120,13 @@ def submit_campaign_run(
 
     A completed or cancelled campaign is returned as a report with no new job. An
     already queued/leased run job is returned instead of starting a second coordinator.
+    Concurrent callers are serialized by an atomic reservation in :class:`CampaignStore`;
+    the winner creates a job under the reserved id and every loser returns that same job.
     """
     from uzen.core.campaign.engine import CampaignEngine
     from uzen.core.campaign.store import CampaignStore
 
     store = CampaignStore(service.root)
-    row = store.create_or_load(spec, resume=resume)
-    campaign_id = str(row["campaign_id"])
-    if row["status"] in ("completed", "cancelled"):
-        return {
-            "campaign_id": campaign_id,
-            "job": None,
-            "campaign": CampaignEngine(service.root, store=store, job_service=service)
-            .report(campaign_id)
-            .to_dict(),
-        }
-
-    existing_job_id = store.run_job_id(campaign_id)
-    if existing_job_id:
-        try:
-            existing = service.get(existing_job_id)
-        except JobNotFound:
-            existing = None
-        if existing is not None and str(existing.get("state")) not in TERMINAL_STATES:
-            return {
-                "campaign_id": campaign_id,
-                "job": existing,
-                "campaign": CampaignEngine(service.root, store=store, job_service=service)
-                .report(campaign_id)
-                .to_dict(),
-            }
-
     request = campaign_run_request(
         spec,
         distributed=distributed,
@@ -153,16 +135,72 @@ def submit_campaign_run(
         trial_timeout_seconds=trial_timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
     )
-    # A campaign may legitimately need a new run job after a prior run failed or was
-    # paused. ``run_job_id`` prevents a second live coordinator; no request-level
-    # idempotency key is used because the same specification can be retried.
-    job = service.submit(request)
-    store.set_run_job_id(campaign_id, str(job["id"]))
-    store.link_job(campaign_id, str(job["id"]), candidate_digest=CAMPAIGN_RUN_CANDIDATE)
-    return {
-        "campaign_id": campaign_id,
-        "job": job,
-        "campaign": CampaignEngine(service.root, store=store, job_service=service)
-        .report(campaign_id)
-        .to_dict(),
-    }
+    deadline = time.monotonic() + RUN_ADMISSION_WAIT_SECONDS
+    first_lookup = True
+    while True:
+        row = store.create_or_load(spec, resume=resume if first_lookup else True)
+        first_lookup = False
+        campaign_id = str(row["campaign_id"])
+
+        def result(job: Mapping[str, Any] | None) -> dict[str, Any]:
+            return {
+                "campaign_id": campaign_id,
+                "job": job,
+                "campaign": CampaignEngine(service.root, store=store, job_service=service)
+                .report(campaign_id)
+                .to_dict(),
+            }
+
+        if row["status"] in ("completed", "cancelled") or row["cancel_requested"]:
+            # Cancellation is a durable barrier: do not reopen a campaign that is still
+            # settling its coordinator or trial jobs.
+            return result(None)
+
+        reservation = store.run_reservation(campaign_id)
+        existing_job_id = str(reservation["job_id"])
+        if existing_job_id:
+            try:
+                existing = service.get(existing_job_id)
+            except JobNotFound:
+                existing = None
+            if existing is not None and str(existing.get("state")) not in TERMINAL_STATES:
+                return result(existing)
+            # The reservation is either terminal (a failed/paused run may be retried) or
+            # names a job that never reached the queue. A fresh missing job belongs to a
+            # submitter that is still between reservation and creation: wait for it
+            # rather than stealing the slot. A stale one is safe to recover.
+            reservation_age = time.time() - float(reservation["reserved_at"])
+            if existing is None and reservation_age < RUN_RESERVATION_GRACE_SECONDS:
+                if time.monotonic() >= deadline:
+                    raise CampaignConflict(
+                        "campaign run admission is still in progress; retry the submission",
+                        campaign_id=campaign_id,
+                    )
+                time.sleep(0.02)
+                continue
+            if store.release_run(campaign_id, existing_job_id):
+                continue
+            if time.monotonic() >= deadline:
+                raise CampaignConflict(
+                    "campaign run admission changed while waiting; retry the submission",
+                    campaign_id=campaign_id,
+                )
+            continue
+
+        candidate_job_id = uuid.uuid4().hex
+        if not store.reserve_run(campaign_id, candidate_job_id):
+            if time.monotonic() >= deadline:
+                raise CampaignConflict(
+                    "campaign run admission is contended; retry the submission",
+                    campaign_id=campaign_id,
+                )
+            time.sleep(0.01)
+            continue
+
+        try:
+            job = service.submit(request, job_id=candidate_job_id)
+        except Exception:
+            store.release_run(campaign_id, candidate_job_id)
+            raise
+        store.link_job(campaign_id, str(job["id"]), candidate_digest=CAMPAIGN_RUN_CANDIDATE)
+        return result(job)

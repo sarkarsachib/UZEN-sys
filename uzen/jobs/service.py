@@ -14,6 +14,7 @@ provenance and verification evidence.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -52,10 +53,97 @@ from uzen.errors import (
     UnsupportedFormat,
     UzenError,
 )
+from uzen.infrastructure.observability.tracing import TRACER
+from uzen.infrastructure.pagination import clamp_limit, decode_cursor, page_payload
+from uzen.infrastructure.security.access import (
+    current_project,
+    project_filter,
+    require_project_access,
+)
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
 from uzen.jobs.scheduling import requirements_from_request
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
 from uzen.util.canonical import sha256_file, utc_now_iso
+
+
+def _traced_execution(method: Any) -> Any:
+    """Record one span per executed job (parented to the request span when present)."""
+
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self: "JobService", job_id: str, request: JobRequest) -> dict[str, Any]:
+        attributes = {
+            "uzen.job.id": job_id,
+            "uzen.job.task_scope": request.task_scope.value,
+            "uzen.job.kind": str(request.options.get("task_kind") or "engineering"),
+            "uzen.job.operations": len(request.operations),
+        }
+        with TRACER.span("uzen.job.execute", attributes=attributes) as span:
+            try:
+                result = method(self, job_id, request)
+            except Exception as exc:
+                span.set_attribute("uzen.job.outcome", "failed")
+                raise exc
+            span.set_attribute("uzen.job.outcome", "completed")
+            return result
+
+    return wrapper
+
+
+class _LeaseRenewer:
+    """Keep a leased execution's claim alive while its work runs.
+
+    A campaign coordinator can execute for longer than its initial lease. Without a
+    renewer the reaper would return the job to the queue and another worker could run
+    it concurrently with the still-live coordinator. Renewal is guarded by the same
+    dispatch token, so a lease that was already lost cannot be taken back.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        job_id: str,
+        worker_id: str,
+        token: str,
+        lease_seconds: float,
+    ) -> None:
+        self.db = db
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.token = token
+        self.lease_seconds = float(lease_seconds)
+        # Three renewals per lease leaves room for scheduling and SQLite contention.
+        self.interval = max(0.02, min(self.lease_seconds / 3.0, 30.0))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"uzen-lease-{job_id[:8]}", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.interval * 2.0))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = self.db.renew_lease(
+                    self.job_id,
+                    self.worker_id,
+                    lease_seconds=self.lease_seconds,
+                    token=self.token,
+                )
+            except Exception:
+                # A transient database failure must not take down the job thread; the
+                # next tick retries while the existing lease may still be valid.
+                continue
+            if not renewed:
+                # The lease was reaped or replaced. The worker keeps its local result
+                # fence: settlement checks the token and cannot publish over a winner.
+                return
 
 
 class JobService:
@@ -70,7 +158,11 @@ class JobService:
         self.root.mkdir(parents=True, exist_ok=True)
         self.engine = engine or default_engine()
         self.store = ArtifactStore(self.root / "artifacts")
-        self.db = Database(db_path or (self.root / "uzen.sqlite3"))
+        # A postgresql:// location selects the multi-host store; anything else is the
+        # single-node SQLite database (see uzen.infrastructure.storage.factory).
+        from uzen.infrastructure.storage.factory import open_database
+
+        self.db = open_database(db_path or (self.root / "uzen.sqlite3"))
         self.ane = AutonomousNeuralEngineer(engine=self.engine)
         self.wie = WeightIntelligenceEngine()
         self.wme = WeightModificationEngine(engine=self.engine)
@@ -717,7 +809,14 @@ class JobService:
     # jobs
     # ------------------------------------------------------------------ #
 
-    def submit(self, request: Mapping[str, Any], *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        request: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        job_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         job_request = JobRequest.from_dict(request)
         if job_request.policy != "STRICT_PLUS":
             raise InvalidOperationParameters("only STRICT_PLUS jobs are accepted")
@@ -766,9 +865,11 @@ class JobService:
         requirements = requirements_from_request(request)
         row = self.db.create_job(
             request,
+            job_id=job_id,
             idempotency_key=idempotency_key,
             requirements=requirements,
             priority=int(request.get("priority") or 0),
+            project_id=project_id or current_project(),
         )
         self.db.append_event(
             row.id,
@@ -782,15 +883,55 @@ class JobService:
         return row.to_dict()
 
     def get(self, job_id: str) -> dict[str, Any]:
-        return self.db.get_job(job_id).to_dict()
+        row = self.db.get_job(job_id)
+        require_project_access(row.project_id)
+        return row.to_dict()
 
-    def list(self, *, state: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        return [r.to_dict() for r in self.db.list_jobs(state=state, limit=limit)]
+    def list(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.list_page(
+            state=state, limit=limit, cursor=cursor, project_id=project_id
+        )["jobs"]
+
+    def list_page(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One cursor page of jobs plus ``next_cursor``/``has_more``."""
+        size = clamp_limit(limit)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "id"))
+            before = (key["created_at"], key["id"])
+        rows = self.db.list_jobs(
+            state=state,
+            project_id=project_filter(project_id),
+            before=before,
+            limit=size + 1,
+        )
+        return page_payload(
+            [row.to_dict() for row in rows],
+            limit=size,
+            cursor_of=lambda job: {"created_at": job["created_at"], "id": job["id"]},
+            key="jobs",
+        )
 
     def events(self, job_id: str, *, after: int = 0) -> list[dict[str, Any]]:
+        require_project_access(self.db.project_of_job(job_id))
         return self.db.events(job_id, after=after)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
+        require_project_access(self.db.project_of_job(job_id))
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
             return row.to_dict()
@@ -806,14 +947,19 @@ class JobService:
         *,
         worker_id: str | None = None,
         token: str | None = None,
+        lease_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Execute a job, either as the control plane or as a worker holding a lease.
 
         A leased execution (``worker_id`` and ``token`` supplied) settles the job through
         :meth:`Database.finish_from_worker`, so the dispatch record, the attempt number and
         the idempotency guard are the same ones a remote worker goes through. A local
-        execution settles it directly. Either way the caller never declares success: the
+        execution settles it directly.         Either way the caller never declares success: the
         state comes from the executed work or from the recorded error.
+
+        ``lease_seconds`` enables a keepalive for a leased execution. The worker daemon
+        renews its own lease while it runs; an in-process coordinator uses this argument
+        so a long campaign does not lose its claim mid-execution.
         """
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
@@ -834,6 +980,28 @@ class JobService:
                 return self._settle_cancelled(job_id, worker_id, token)
             raise
         request = JobRequest.from_dict(row.request)
+        renewer = (
+            _LeaseRenewer(self.db, job_id, worker_id, token, float(lease_seconds))
+            if leased and lease_seconds is not None and float(lease_seconds) > 0
+            else None
+        )
+        if renewer is not None:
+            renewer.start()
+        try:
+            return self._serve_claimed(job_id, request, worker_id, token, leased)
+        finally:
+            if renewer is not None:
+                renewer.stop()
+
+    def _serve_claimed(
+        self,
+        job_id: str,
+        request: JobRequest,
+        worker_id: str | None,
+        token: str | None,
+        leased: bool,
+    ) -> dict[str, Any]:
+        """Execute and settle a job whose RUNNING transition has already won."""
         try:
             result = self._execute(job_id, request)
             if isinstance(result, dict) and "artifact_id" in result:
@@ -940,6 +1108,7 @@ class JobService:
 
     # ------------------------------------------------------------------ #
 
+    @_traced_execution
     def _execute(self, job_id: str, request: JobRequest) -> dict[str, Any]:
         task_kind = request.options.get("task_kind")
         if task_kind == "campaign_trial":
@@ -954,11 +1123,25 @@ class JobService:
 
         packages = self._resolve_inputs(request)
         target, reference, graph, graph_inputs = self._resolve_context(request, packages)
+        planner = request.options.get("planner")
+        if planner not in (None, "deterministic", "llm"):
+            raise InvalidOperationParameters(
+                "options.planner must be 'deterministic', 'llm', or omitted"
+            )
         self.db.append_event(
             job_id,
             "planning",
-            {"objective": request.objective, "inputs": list(packages)},
+            {
+                "objective": request.objective,
+                "inputs": list(packages),
+                "planner": planner or "deterministic",
+            },
         )
+        engineering_plan = None
+        if planner == "llm":
+            from uzen.core.ane.llm import LLMPlanner
+
+            engineering_plan = LLMPlanner(engine=self.engine).propose(request, list(packages))
         result: ANEResult = self.ane.execute(
             request,
             packages,
@@ -967,6 +1150,7 @@ class JobService:
             graph_inputs=graph_inputs,
             reference=reference,
             job_id=job_id,
+            plan=engineering_plan,
         )
         self.db.set_plan(job_id, result.plan.to_dict())
         self.db.append_event(
@@ -1460,8 +1644,39 @@ class JobService:
     # read APIs
     # ------------------------------------------------------------------ #
 
-    def artifacts(self, limit: int = 100) -> list[dict[str, Any]]:
-        return self.db.artifacts(limit=limit)
+    def artifacts(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.artifacts_page(limit=limit, cursor=cursor, project_id=project_id)["artifacts"]
+
+    def artifacts_page(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        size = clamp_limit(limit, default=100)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "artifact_id"))
+            before = (key["created_at"], key["artifact_id"])
+        rows = self.db.artifacts(
+            limit=size + 1, project_id=project_filter(project_id), before=before
+        )
+        return page_payload(
+            rows,
+            limit=size,
+            cursor_of=lambda row: {
+                "created_at": row["created_at"],
+                "artifact_id": row["artifact_id"],
+            },
+            key="artifacts",
+        )
 
     def artifact_manifest(self, artifact_id: str) -> dict[str, Any]:
         return self.store.manifest(artifact_id).to_dict()
@@ -1469,8 +1684,36 @@ class JobService:
     def verify_artifact(self, artifact_id: str) -> dict[str, Any]:
         return self.store.verify(artifact_id)
 
-    def models(self, limit: int = 100) -> list[dict[str, Any]]:
-        return self.db.models(limit=limit)
+    def models(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.models_page(limit=limit, cursor=cursor, project_id=project_id)["models"]
+
+    def models_page(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        size = clamp_limit(limit, default=100)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "model_id"))
+            before = (key["created_at"], key["model_id"])
+        rows = self.db.models(
+            limit=size + 1, project_id=project_filter(project_id), before=before
+        )
+        return page_payload(
+            rows,
+            limit=size,
+            cursor_of=lambda row: {"created_at": row["created_at"], "model_id": row["model_id"]},
+            key="models",
+        )
 
     def stats(self) -> dict[str, Any]:
         return {"store": self.store.stats(), "database": self.db.stats()}

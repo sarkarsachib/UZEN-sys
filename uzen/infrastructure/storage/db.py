@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     min_memory_bytes INTEGER,
     progress REAL NOT NULL DEFAULT 0.0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
+    project_id TEXT NOT NULL DEFAULT 'default',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -76,14 +77,17 @@ CREATE TABLE IF NOT EXISTS artifacts_index (
     numel INTEGER,
     num_tensors INTEGER,
     job_id TEXT,
+    project_id TEXT NOT NULL DEFAULT 'default',
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts_index(project_id, created_at);
 
 CREATE TABLE IF NOT EXISTS models (
     model_id TEXT PRIMARY KEY,
     artifact_id TEXT NOT NULL,
     family TEXT NOT NULL,
     spec_json TEXT NOT NULL,
+    project_id TEXT NOT NULL DEFAULT 'default',
     created_at TEXT NOT NULL,
     UNIQUE(artifact_id)
 );
@@ -149,7 +153,40 @@ CREATE TABLE IF NOT EXISTS idempotency (
     request_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Only the SHA-256 of an API token is stored; the plaintext is returned once by
+-- ``create_api_token`` and is unrecoverable afterwards.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    token_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    scopes_json TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_project ON api_tokens(project_id);
+
+-- Cross-project artifact sharing. The owning project is artifacts_index.project_id;
+-- a row here grants another project read (or write) access to one artifact.
+CREATE TABLE IF NOT EXISTS artifact_acl (
+    artifact_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    permission TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    PRIMARY KEY(artifact_id, project_id, permission)
+);
 """
+
+def _ambient_project() -> str:
+    """The authenticated project, for rows created outside an explicit id."""
+    try:
+        from uzen.infrastructure.security.access import current_project
+
+        return current_project()
+    except Exception:  # pragma: no cover - engine without the security layer
+        return "default"
+
 
 JOB_STATES = (
     "CREATED",
@@ -205,6 +242,7 @@ class JobRow:
     job_kind: str = ""
     enqueued_at: float | None = None
     available_at: float | None = None
+    project_id: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,6 +269,7 @@ class JobRow:
             "job_kind": self.job_kind,
             "enqueued_at": self.enqueued_at,
             "available_at": self.available_at,
+            "project_id": self.project_id,
         }
 
 
@@ -265,6 +304,13 @@ class Database:
                 "job_kind": "TEXT NOT NULL DEFAULT ''",
                 "enqueued_at": "REAL",
                 "available_at": "REAL",
+                "project_id": "TEXT NOT NULL DEFAULT 'default'",
+            },
+            "artifacts_index": {
+                "project_id": "TEXT NOT NULL DEFAULT 'default'",
+            },
+            "models": {
+                "project_id": "TEXT NOT NULL DEFAULT 'default'",
             },
             "workers": {
                 "cpu_count": "INTEGER",
@@ -301,6 +347,7 @@ class Database:
         requirements: Any | None = None,
         max_attempts: int = 3,
         priority: int = 0,
+        project_id: str = "default",
     ) -> JobRow:
         import time as _time
 
@@ -338,8 +385,8 @@ class Database:
             self._conn.execute(
                 "INSERT INTO jobs(id, state, task_scope, objective, request_json, idempotency_key, "
                 "request_hash, max_attempts, priority, job_kind, enqueued_at, min_cpu_count, "
-                "min_memory_bytes, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "min_memory_bytes, project_id, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     state,
@@ -354,6 +401,7 @@ class Database:
                     _time.time(),
                     getattr(requirements, "min_cpu_count", None) or None,
                     getattr(requirements, "min_memory_bytes", None),
+                    str(project_id or "default"),
                     now,
                     now,
                 ),
@@ -377,6 +425,8 @@ class Database:
         *,
         state: str | None = None,
         job_kind: str | None = None,
+        project_id: str | None = None,
+        before: tuple[str, str] | None = None,
         limit: int = 50,
     ) -> list[JobRow]:
         query = "SELECT * FROM jobs"
@@ -388,13 +438,30 @@ class Database:
         if job_kind is not None:
             clauses.append("job_kind = ?")
             params.append(job_kind)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(str(project_id))
+        if before is not None:
+            # Keyset pagination on the (created_at, id) sort key: stable while rows are
+            # inserted, unlike OFFSET, and it uses the created_at index.
+            clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([before[0], before[0], before[1]])
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC LIMIT ?"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
         params.append(int(limit))
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [_row_to_job(r) for r in rows]
+
+    def project_of_job(self, job_id: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT project_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise JobNotFound(f"job '{job_id}' not found")
+        return str(row["project_id"] or "default")
 
     def transition(
         self,
@@ -572,44 +639,228 @@ class Database:
         numel: int | None = None,
         num_tensors: int | None = None,
         job_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
+        if project_id is None:
+            project_id = self.project_of_job(job_id) if job_id is not None else _ambient_project()
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO artifacts_index(artifact_id, name, family, operation, path, "
-                "numel, num_tensors, job_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (artifact_id, name, family, operation, path, numel, num_tensors, job_id, utc_now_iso()),
+                "numel, num_tensors, job_id, project_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    artifact_id,
+                    name,
+                    family,
+                    operation,
+                    path,
+                    numel,
+                    num_tensors,
+                    job_id,
+                    str(project_id or "default"),
+                    utc_now_iso(),
+                ),
             )
             self._conn.commit()
 
-    def artifacts(self, limit: int = 100) -> list[dict[str, Any]]:
+    def artifacts(
+        self,
+        limit: int = 100,
+        *,
+        project_id: str | None = None,
+        before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM artifacts_index"
+        params: list[Any] = []
+        clauses: list[str] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(str(project_id))
+        if before is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND artifact_id < ?))")
+            params.extend([before[0], before[0], before[1]])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, artifact_id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def artifact_project(self, artifact_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT project_id FROM artifacts_index WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()
+        return None if row is None else str(row["project_id"] or "default")
+
+    def grant_artifact_access(
+        self, artifact_id: str, project_id: str, *, permission: str = "read"
+    ) -> dict[str, Any]:
+        if permission not in ("read", "write"):
+            raise ValueError("artifact permission must be 'read' or 'write'")
+        grant = {
+            "artifact_id": artifact_id,
+            "project_id": str(project_id),
+            "permission": permission,
+            "granted_at": utc_now_iso(),
+        }
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO artifact_acl(artifact_id, project_id, permission, granted_at) "
+                "VALUES (?,?,?,?)",
+                (artifact_id, str(project_id), permission, grant["granted_at"]),
+            )
+            self._conn.commit()
+        return grant
+
+    def artifact_acls(self, artifact_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM artifacts_index ORDER BY created_at DESC LIMIT ?", (int(limit),)
+                "SELECT artifact_id, project_id, permission, granted_at FROM artifact_acl "
+                "WHERE artifact_id = ? ORDER BY project_id, permission",
+                (artifact_id,),
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def register_model(self, *, artifact_id: str, family: str, spec: Mapping[str, Any]) -> str:
-        model_id = f"model_{sha256_text(artifact_id)[:16]}"
+    def revoke_artifact_access(self, artifact_id: str, project_id: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM artifact_acl WHERE artifact_id = ? AND project_id = ?",
+                (artifact_id, str(project_id)),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    # ------------------------------------------------------------------ #
+    # api tokens (project scoped)
+    # ------------------------------------------------------------------ #
+
+    def create_api_token(
+        self,
+        project_id: str,
+        scopes: Iterable[str],
+        *,
+        description: str | None = None,
+        token_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Mint a token; the plaintext secret is returned once and never stored."""
+        import secrets as _secrets
+
+        token_id = token_id or f"tok_{uuid.uuid4().hex[:16]}"
+        secret = f"uzt_{_secrets.token_urlsafe(32)}"
+        scope_list = sorted({str(scope) for scope in scopes})
+        now = utc_now_iso()
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO models(model_id, artifact_id, family, spec_json, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (model_id, artifact_id, family, canonical_json(dict(spec)), utc_now_iso()),
+                "INSERT INTO api_tokens(token_id, project_id, token_hash, scopes_json, description, "
+                "created_at) VALUES (?,?,?,?,?,?)",
+                (token_id, str(project_id), sha256_text(secret), canonical_json(scope_list), description, now),
+            )
+            self._conn.commit()
+        return {
+            "token_id": token_id,
+            "token": secret,
+            "project_id": str(project_id),
+            "scopes": scope_list,
+            "description": description,
+            "created_at": now,
+        }
+
+    def authenticate_api_token(self, secret: str) -> dict[str, Any] | None:
+        if not isinstance(secret, str) or not secret:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_tokens WHERE token_hash = ?", (sha256_text(secret),)
+            ).fetchone()
+        if row is None or row["revoked_at"]:
+            return None
+        return {
+            "token_id": row["token_id"],
+            "project_id": str(row["project_id"]),
+            "scopes": json.loads(row["scopes_json"]),
+            "description": row["description"],
+            "created_at": row["created_at"],
+            "revoked_at": row["revoked_at"],
+        }
+
+    def revoke_api_token(self, token_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE api_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL",
+                (utc_now_iso(), token_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def list_api_tokens(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT token_id, project_id, scopes_json, description, created_at, revoked_at "
+            "FROM api_tokens"
+        )
+        params: list[Any] = []
+        if project_id is not None:
+            query += " WHERE project_id = ?"
+            params.append(str(project_id))
+        query += " ORDER BY created_at DESC"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [
+            {
+                "token_id": row["token_id"],
+                "project_id": row["project_id"],
+                "scopes": json.loads(row["scopes_json"]),
+                "description": row["description"],
+                "created_at": row["created_at"],
+                "revoked_at": row["revoked_at"],
+            }
+            for row in rows
+        ]
+
+    def register_model(
+        self, *, artifact_id: str, family: str, spec: Mapping[str, Any], project_id: str | None = None
+    ) -> str:
+        model_id = f"model_{sha256_text(artifact_id)[:16]}"
+        if project_id is None:
+            project_id = self.artifact_project(artifact_id) or _ambient_project()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO models(model_id, artifact_id, family, spec_json, project_id, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (model_id, artifact_id, family, canonical_json(dict(spec)), str(project_id), utc_now_iso()),
             )
             self._conn.commit()
         return model_id
 
-    def models(self, limit: int = 100) -> list[dict[str, Any]]:
+    def models(
+        self,
+        limit: int = 100,
+        *,
+        project_id: str | None = None,
+        before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM models"
+        params: list[Any] = []
+        clauses: list[str] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(str(project_id))
+        if before is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND model_id < ?))")
+            params.extend([before[0], before[0], before[1]])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, model_id DESC LIMIT ?"
+        params.append(int(limit))
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM models ORDER BY created_at DESC LIMIT ?", (int(limit),)
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         return [
             {
                 "model_id": r["model_id"],
                 "artifact_id": r["artifact_id"],
                 "family": r["family"],
                 "spec": json.loads(r["spec_json"]),
+                "project_id": r["project_id"],
                 "created_at": r["created_at"],
             }
             for r in rows
@@ -1319,4 +1570,5 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         job_kind=str(row["job_kind"] or "") if "job_kind" in row.keys() else "",
         enqueued_at=row["enqueued_at"] if "enqueued_at" in row.keys() else None,
         available_at=row["available_at"] if "available_at" in row.keys() else None,
+        project_id=str(row["project_id"] or "default") if "project_id" in row.keys() else "default",
     )

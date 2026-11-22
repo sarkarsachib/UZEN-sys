@@ -302,7 +302,12 @@ class CampaignWorker:
                 service.db.close()
             return {"worker_id": self.worker_id, "executed": None}
         token = (job.get("lease") or {}).get("token")
-        result = service.run(str(job["id"]), worker_id=self.worker_id, token=token)
+        result = service.run(
+            str(job["id"]),
+            worker_id=self.worker_id,
+            token=token,
+            lease_seconds=self.lease_seconds,
+        )
         self._executed += 1
         if owned:
             service.db.close()

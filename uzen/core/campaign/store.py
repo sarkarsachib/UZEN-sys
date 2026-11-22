@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     stop_reason TEXT NOT NULL DEFAULT '',
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     run_job_id TEXT NOT NULL DEFAULT '',
+    run_reserved_at REAL NOT NULL DEFAULT 0,
     seed INTEGER NOT NULL,
     budget INTEGER NOT NULL,
     rounds INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +96,10 @@ class CampaignStore:
         if "run_job_id" not in columns:
             connection.execute(
                 "ALTER TABLE campaigns ADD COLUMN run_job_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "run_reserved_at" not in columns:
+            connection.execute(
+                "ALTER TABLE campaigns ADD COLUMN run_reserved_at REAL NOT NULL DEFAULT 0"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -259,11 +265,66 @@ class CampaignStore:
             raise CampaignNotFound(f"campaign '{campaign_id}' not found", campaign_id=campaign_id)
         return str(row["run_job_id"] or "")
 
+    def run_reservation(self, campaign_id: str) -> dict[str, Any]:
+        """Return the current run-job reservation (empty when there is none)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT run_job_id, run_reserved_at FROM campaigns WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+        if row is None:
+            raise CampaignNotFound(f"campaign '{campaign_id}' not found", campaign_id=campaign_id)
+        return {
+            "job_id": str(row["run_job_id"] or ""),
+            "reserved_at": float(row["run_reserved_at"] or 0.0),
+        }
+
+    def reserve_run(self, campaign_id: str, job_id: str) -> bool:
+        """Atomically reserve the campaign's single coordinator slot.
+
+        The reservation is made before the job exists, so two concurrent submitters
+        cannot both pass a read-then-write check and each create a coordinator. The
+        winner creates its job under the reserved id; a loser observes the reservation
+        and returns that job. ``run_reserved_at`` lets a later submitter recover a
+        reservation whose creator died before creating the job, without stealing one
+        that is merely still in progress.
+        """
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT run_job_id, cancel_requested FROM campaigns WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+            if row is None:
+                raise CampaignNotFound(
+                    f"campaign '{campaign_id}' not found", campaign_id=campaign_id
+                )
+            if str(row["run_job_id"] or "") or row["cancel_requested"]:
+                return False
+            connection.execute(
+                "UPDATE campaigns SET run_job_id = ?, run_reserved_at = ?, updated_at = ? "
+                "WHERE campaign_id = ?",
+                (job_id, time.time(), now, campaign_id),
+            )
+        return True
+
+    def release_run(self, campaign_id: str, job_id: str) -> bool:
+        """Release a reservation only if it still names the expected job."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE campaigns SET run_job_id = '', run_reserved_at = 0, updated_at = ? "
+                "WHERE campaign_id = ? AND run_job_id = ?",
+                (utc_now_iso(), campaign_id, job_id),
+            )
+        return cursor.rowcount == 1
+
     def set_run_job_id(self, campaign_id: str, job_id: str) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE campaigns SET run_job_id = ?, updated_at = ? WHERE campaign_id = ?",
-                (job_id, utc_now_iso(), campaign_id),
+                "UPDATE campaigns SET run_job_id = ?, run_reserved_at = ?, updated_at = ? "
+                "WHERE campaign_id = ?",
+                (job_id, time.time(), utc_now_iso(), campaign_id),
             )
 
     def job_ids(self, campaign_id: str) -> list[str]:

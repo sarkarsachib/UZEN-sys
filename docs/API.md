@@ -53,7 +53,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/architectures/research` | compare architecture variants |
 | POST | `/v1/architectures/compose` | compose stored graphs (sequential/parallel/residual), validate, execute and persist with lineage |
 | POST | `/v1/architectures/{id}/edit` | bypass, truncate or substitute a stored graph and persist the surviving parameters |
-| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`); optional `distributed=true` submits N7 trial jobs to workers (`trial_timeout_seconds`, `poll_interval_seconds`); `background=true` enqueues an N8 `campaign_run` job and returns `{campaign_id, job, campaign}` |
+| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`); optional `distributed=true` submits N7 trial jobs to workers (`trial_timeout_seconds`, `poll_interval_seconds`); `background=true` atomically admits and enqueues an N8/N9 `campaign_run` job and returns `{campaign_id, job, campaign}` |
 | GET | `/v1/campaigns` | list campaigns |
 | POST | `/v1/campaigns/verify` | replay benchmark records (optional `digests`) |
 | GET | `/v1/campaigns/{id}` | campaign report and trials |

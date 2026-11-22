@@ -208,11 +208,11 @@ installed in this restored environment. No N8 test is skipped.
    committed trials remain; trials evaluated after the barrier are not stored.
 5. **No push notification.** Operators poll the campaign or job. There is no webhook or
    persistent campaign-event stream beyond the job/campaign event tables.
-6. **One live coordinator per campaign in normal sequential use.** `run_job_id` is
-   checked before submission, but two simultaneous submissions from different processes
-   can still create two run jobs. N7's per-candidate idempotency keys prevent duplicate
-   trial work; the campaign-level duplicate job is a coordination race, not a data-loss
-   path.
+6. **One live coordinator per campaign.** In N8 this held for sequential use only:
+   `run_job_id` was checked before submission, so two simultaneous submissions from
+   different processes could create two run jobs. N9 closes this race with an atomic
+   reservation before job creation; see
+   [N9_CAMPAIGN_DURABILITY.md](N9_CAMPAIGN_DURABILITY.md).
 7. **No task-quality metric and no training.** Metrics remain inference-only proxies;
    cancellation changes scheduling, not the mathematical result of a completed trial.
 8. **A worker's kind filter is self-declared.** It prevents accidental work stealing; it

@@ -183,7 +183,7 @@ none exists it reports `NO_VALID_ALIGNMENT` rather than inventing a result.
 `LLMPlanner` optionally consults an OpenAI-compatible endpoint, but every proposed
 stage is re-validated through the same registry/scope/policy path.
 
-## Campaigns (N6/N7/N8)
+## Campaigns (N6/N7/N8/N9)
 
 `uzen.core.campaign` is a separate research loop over the deterministic engines. A
 seeded planner (`grid`/`random`/`evolution`) proposes architecture specs or weight
@@ -211,6 +211,14 @@ at the SQLite write boundary. Late worker reports are settled as `CANCELLED`, ne
 successful results. `job_kind` is stored on job rows and can be used as a claim filter, so
 `CampaignWorker` defaults to `campaign_trial` while a coordinator claims only
 `campaign_run`.
+
+N9 (`uzen.core.campaign.control` and `uzen.core.campaign.store`) admits one coordinator
+per campaign across processes. A submission reserves `run_job_id` atomically under
+`BEGIN IMMEDIATE` before creating the job under that id, so a concurrent submitter
+waits for and returns the same job instead of creating a second one. `JobService.run`
+can also keep a leased execution alive with a token-guarded renewal thread;
+`CampaignWorker` enables it with its configured lease so a long campaign is not reaped
+mid-run. The campaign database and reservation remain single-host SQLite.
 
 ## Control and execution planes
 

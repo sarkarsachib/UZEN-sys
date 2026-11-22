@@ -399,6 +399,24 @@ def _reduce(kind: str) -> Callable[..., list[Any]]:
     return kernel
 
 
+def _batchnorm(inputs, params, bound):
+    x = inputs[0]
+    axis = int(params.get("axis", 1 if x.dim() == 4 else -1))
+    if axis < 0:
+        axis += x.dim()
+    shape = [1] * x.dim()
+    shape[axis] = x.shape[axis]
+    mean = bound[_pn(params, "running_mean", "running_mean")].to(torch.float64)
+    var = bound[_pn(params, "running_var", "running_var")].to(torch.float64)
+    eps = float(params.get("eps", 1e-5))
+    y = (x.to(torch.float64) - mean.reshape(shape)) / torch.sqrt(var.reshape(shape) + eps)
+    if params.get("weight"):
+        y = y * bound[_pname(params, "weight")].to(torch.float64).reshape(shape)
+    if params.get("bias"):
+        y = y + bound[_pname(params, "bias")].to(torch.float64).reshape(shape)
+    return [y.to(x.dtype)]
+
+
 def _conv2d(inputs, params, bound):
     x = inputs[0]
     w = bound[_pn(params, "weight", "weight")]
@@ -609,6 +627,7 @@ _KERNELS: dict[str, Callable[..., list[Any]]] = {
     "flatten": _flatten,
     "mean": _reduce("mean"),
     "sum": _reduce("sum"),
+    "batchnorm": _batchnorm,
     "conv2d": _conv2d,
     "maxpool2d": _maxpool2d,
     "rnn": _rnn,
