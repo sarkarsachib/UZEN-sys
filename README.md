@@ -35,6 +35,7 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
 | N6 research campaigns: seeded architecture/weight-transform search, batch evaluator, resumable SQLite scheduler, Pareto reports, content-addressed replay corpus | **implemented** (in-process scheduler; inference-only proxy metrics, not task quality) |
 | N7 distributed campaign trials over the N4 worker queue: read-only trial jobs, token-guarded workers, deterministic resume and local-equivalent corpus replay | **implemented** (worker processes over a shared SQLite control plane; synchronous coordinator; no task-quality claim) |
+| N8 campaign control: durable background campaign-run jobs, cancellation propagated to linked trials, late-report refusal, and job-kind-isolated workers | **implemented** (post-N7 extension; single-host campaign state; cooperative cancellation; no task-quality claim) |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
@@ -70,9 +71,10 @@ CUDA acceleration that does not exist.
 ### Computational-substrate phase plan
 
 The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N6
-are implemented at their stated level; N6 is the local campaign engine, and N7 adds
-distributed campaign trials over the N4 queue. Neither is a training or
-task-quality-optimization system.
+are implemented at their stated level; N6 is the local campaign engine, N7 adds
+distributed campaign trials over the N4 queue, and N8 adds durable background runs,
+cancellation and job-kind isolation. None is a training or task-quality-optimization
+system.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -83,12 +85,14 @@ task-quality-optimization system.
 | **N5** | CUDA kernels and a device boundary: 17 real kernels, NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
 | **N6** | Large-scale autonomous research campaigns on the deterministic engines: seeded architecture/parameter search, batch scheduler, Pareto reporting, replayable benchmark corpus | **implemented** (in-process scheduler; no training and no task-quality claim) |
 | **N7** | Distributed campaign trials over the N4 worker queue: read-only trial jobs, capability/lease-guarded execution, deterministic resume, local-equivalent corpus replay | **implemented** (post-P6 extension; shared SQLite control plane and a synchronous coordinator) |
+| **N8** | Campaign control: durable background campaign-run jobs, cancellation propagated to coordinator/trial jobs, late-report refusal, and job-kind-isolated workers | **implemented** (post-P6 extension; single-host campaign state, cooperative cancellation) |
 
 See [docs/N5_CUDA.md](docs/N5_CUDA.md) for the CUDA kernels, build, fallback policy and
 limitations, [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) for campaign specs, determinism,
 corpus replay and limits, [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md)
-for distributed trial execution, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage,
-build instructions, verified measurements and limitations.
+for distributed trial execution, [docs/N8_CAMPAIGN_CONTROL.md](docs/N8_CAMPAIGN_CONTROL.md)
+for background campaigns and cancellation, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for
+coverage, build instructions, verified measurements and limitations.
 
 ---
 
@@ -156,10 +160,14 @@ uzen architecture compose <id_a> <id_b> --mode sequential
 uzen architecture edit <artifact_id> --operation truncate --keep-layers 1
 uzen campaign run --spec-file campaign.json
 uzen campaign run --spec-file campaign.json --distributed --trial-timeout 120
+uzen campaign run --spec-file campaign.json --distributed --background
+uzen campaign cancel <campaign_id>
+uzen campaign jobs <campaign_id>
 uzen campaign verify
 uzen serve --host 0.0.0.0 --port 8080
 uzen mcp --root ./uzen-workspace
 uzen worker run --root ./uzen-worker
+uzen worker run --root ./uzen-worker --job-kind campaign_trial
 ```
 
 ## Real-model demo: int8 release candidate
@@ -322,9 +330,10 @@ curl -s -X POST localhost:8080/v1/jobs -H 'content-type: application/json' \
 ## MCP
 
 `uzen mcp` speaks JSON-RPC 2.0 over stdio (newline or `Content-Length` framing) and
-exposes 26 deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
+exposes 28 deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
 `uzen.generate_weights`, `uzen.compose_architectures`, `uzen.run_campaign`,
-`uzen.verify_campaign_corpus`, `uzen.inspect_provenance`, and others. Each tool enforces
+`uzen.cancel_campaign`, `uzen.campaign_jobs`, `uzen.verify_campaign_corpus`,
+`uzen.inspect_provenance`, and others. Each tool enforces
 task scope and STRICT_PLUS; an AI client cannot widen scope or request a prohibited
 effect. A `tools/call` with `params._meta.progressToken` emits real JSON-RPC
 `notifications/progress` messages during import, incrementing per stage.
@@ -357,7 +366,7 @@ uzen/
 │   ├── npa/      # neural parameter alignment
 │   ├── nase/     # architecture synthesis and graph surgery
 │   ├── campaign/ # N6 planners, evaluator, SQLite store, benchmark corpus,
-│   │             # N7 distributed trial executor
+│   │             # N7 distributed trial executor, N8 background/cancel control
 │   ├── wcomp/    # compiler, pipeline, execution plan
 │   ├── vel/      # verification & evaluation lab
 │   └── ane/      # autonomous neural engineer, search, planning, LLM bridge
@@ -383,6 +392,7 @@ uzen/
 * [docs/P6_NATIVE.md](docs/P6_NATIVE.md) — native CPU kernels, phase plan and measured limits.
 * [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) — campaign specs, determinism, corpus replay and limits.
 * [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md) — N4-backed trial execution, worker protocol and limits.
+* [docs/N8_CAMPAIGN_CONTROL.md](docs/N8_CAMPAIGN_CONTROL.md) — background campaign jobs, cancellation propagation and job-kind isolation.
 
 ## Tests
 

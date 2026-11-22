@@ -34,8 +34,9 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | `worker.auth_failed` | 401 | invalid worker credentials |
 | `runtime.unavailable` | 503 | optional backend missing (e.g. torch) |
 | `budget.exhausted` | 429 | search budget exhausted |
-| `campaign.conflict` | 409 | campaign id reused with a different spec |
+| `campaign.conflict` | 409 | campaign id reused with a different spec, or a completed campaign cannot be cancelled |
 | `campaign.not_found` | 404 | unknown campaign id |
+| `campaign.cancelled` | 409 | the campaign was cancelled before the operation could finish |
 | `campaign.timeout` | 504 | a distributed trial batch did not settle before its deadline |
 
 ## REST (v1)
@@ -52,11 +53,13 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | POST | `/v1/architectures/research` | compare architecture variants |
 | POST | `/v1/architectures/compose` | compose stored graphs (sequential/parallel/residual), validate, execute and persist with lineage |
 | POST | `/v1/architectures/{id}/edit` | bypass, truncate or substitute a stored graph and persist the surviving parameters |
-| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`); optional `distributed=true` submits N7 trial jobs to workers (`trial_timeout_seconds`, `poll_interval_seconds`) |
+| POST | `/v1/campaigns` | run/resume an N6 campaign synchronously (`spec`, `resume`, `max_rounds`); optional `distributed=true` submits N7 trial jobs to workers (`trial_timeout_seconds`, `poll_interval_seconds`); `background=true` enqueues an N8 `campaign_run` job and returns `{campaign_id, job, campaign}` |
 | GET | `/v1/campaigns` | list campaigns |
 | POST | `/v1/campaigns/verify` | replay benchmark records (optional `digests`) |
 | GET | `/v1/campaigns/{id}` | campaign report and trials |
 | GET | `/v1/campaigns/{id}/events` | campaign event history |
+| GET | `/v1/campaigns/{id}/jobs` | linked coordinator and trial jobs |
+| POST | `/v1/campaigns/{id}/cancel` | cancel a campaign and its linked queued/leased jobs |
 | GET | `/v1/campaigns/{id}/corpus` | corpus merkle root and record digests |
 | GET | `/v1/benchmarks/{digest}` | replay one content-addressed benchmark record |
 | POST | `/v1/models/import` | import a local HF directory/file, weights-only `.pt/.pth/.bin/.ckpt`, single-file `.onnx`, or `repo_id` + `revision`; returns the compatibility report or provenance report, plus graph/reconstruction status when available |
@@ -86,7 +89,7 @@ All interfaces share one engine. Responses are JSON; errors carry a machine-read
 | GET | `/v1/workers` | worker registry |
 | POST | `/v1/workers/register` | register, returns one-time secret |
 | POST | `/v1/workers/heartbeat` | liveness |
-| POST | `/v1/workers/claim` | claim the highest-priority eligible job (capability + budget matched), returns the job plus `lease.token`; optional `wait_seconds` long-polls |
+| POST | `/v1/workers/claim` | claim the highest-priority eligible job (capability + budget matched), returns the job plus `lease.token`; optional `wait_seconds` long-polls and `job_kinds` restricts the claim |
 | POST | `/v1/workers/renew` | renew lease (requires `token`) |
 | POST | `/v1/workers/report` | report a terminal state for a held lease (requires `token`); answers `accepted`, `duplicate`, `stale` or `rejected` |
 | GET | `/v1/scheduler` | queue depth, leased/retried counts, worker liveness, unroutable jobs with reasons |
@@ -148,6 +151,8 @@ local.modify(artifact_id, "svd_truncate", params={"rank": 32})
 local.evaluate(artifact_id, family=..., spec=...)
 local.submit_job(request); local.run_job(job_id); local.job_events(job_id)
 local.run_local(request)                # submit + run, returns full result
+local.run_campaign(spec, background=True)  # durable N8 campaign-run job
+local.cancel_campaign(campaign_id); local.campaign_jobs(campaign_id)
 local.verify_artifact(artifact_id); local.lineage(artifact_id)
 local.operations(); local.policy(); local.families()
 ```
@@ -170,9 +175,10 @@ Tools: `uzen.import_model`, `uzen.quantize_model`, `uzen.forward_model`,
 `uzen.research_weight_architecture`, `uzen.research_model_architecture`,
 `uzen.modify_architecture`, `uzen.compose_architectures`, `uzen.create_model`,
 `uzen.evaluate_candidate`, `uzen.inspect_provenance`, `uzen.get_job_status`,
-`uzen.run_campaign` (including distributed trial execution), `uzen.get_campaign`,
-`uzen.list_campaigns`, `uzen.verify_campaign_corpus`, `uzen.replay_benchmark`.
-The server exposes 26 tools.
+`uzen.run_campaign` (including `distributed` trial execution and `background` durable
+runs), `uzen.get_campaign`, `uzen.list_campaigns`, `uzen.cancel_campaign`,
+`uzen.campaign_jobs`, `uzen.verify_campaign_corpus`, `uzen.replay_benchmark`.
+The server exposes 28 tools.
 
 Transport: JSON-RPC 2.0 over stdio; `initialize`, `tools/list`, `tools/call`, `ping`.
 Tool failures return `isError: true` with the typed error payload rather than a

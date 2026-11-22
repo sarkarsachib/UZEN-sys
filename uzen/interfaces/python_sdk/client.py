@@ -732,7 +732,7 @@ class Uzen:
         )
 
     # ------------------------------------------------------------------ #
-    # research campaigns (N6/N7)
+    # research campaigns (N6/N7/N8)
     # ------------------------------------------------------------------ #
 
     def run_campaign(
@@ -744,11 +744,14 @@ class Uzen:
         distributed: bool = False,
         trial_timeout_seconds: float = 600.0,
         poll_interval_seconds: float = 0.1,
+        background: bool = False,
     ) -> dict[str, Any]:
-        """Run or resume a deterministic architecture/weight campaign.
+        """Run, resume or enqueue a deterministic architecture/weight campaign.
 
         ``distributed=True`` submits each trial to the N4 control-plane queue and
         waits for workers; it never silently falls back to local evaluation.
+        ``background=True`` returns a durable campaign-run job instead of blocking;
+        a ``CampaignWorker`` restricted to ``campaign_run`` must be running.
         """
         if not self.local:
             return self._request(
@@ -761,11 +764,24 @@ class Uzen:
                     "distributed": distributed,
                     "trial_timeout_seconds": trial_timeout_seconds,
                     "poll_interval_seconds": poll_interval_seconds,
+                    "background": background,
                 },
             )
         from uzen.core.campaign import CampaignEngine, CampaignSpec, DistributedTrialExecutor
 
         parsed = CampaignSpec.from_dict(spec)
+        if background:
+            from uzen.core.campaign.control import submit_campaign_run
+
+            return submit_campaign_run(
+                self.service,
+                parsed,
+                distributed=distributed,
+                resume=resume,
+                max_rounds=max_rounds,
+                trial_timeout_seconds=trial_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
         executor = None
         if distributed:
             executor = DistributedTrialExecutor(
@@ -773,7 +789,11 @@ class Uzen:
                 timeout_seconds=trial_timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds,
             )
-        engine = CampaignEngine(self.service.root, trial_executor=executor)
+        engine = CampaignEngine(
+            self.service.root,
+            trial_executor=executor,
+            job_service=self.service,
+        )
         return engine.run(parsed, resume=resume, max_rounds=max_rounds).to_dict()
 
     def campaign(self, campaign_id: str) -> dict[str, Any]:
@@ -798,6 +818,26 @@ class Uzen:
         return self._request(
             "GET", f"/v1/campaigns/{campaign_id}/events?after={after}"
         )["events"]
+
+    def campaign_jobs(self, campaign_id: str) -> list[dict[str, Any]]:
+        """N4 jobs linked to a campaign (trial evaluations and run coordinators)."""
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(
+                self.service.root, job_service=self.service
+            ).jobs(campaign_id)
+        return self._request("GET", f"/v1/campaigns/{campaign_id}/jobs")["jobs"]
+
+    def cancel_campaign(self, campaign_id: str) -> dict[str, Any]:
+        """Cancel a campaign and its linked queued or leased jobs."""
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(
+                self.service.root, job_service=self.service
+            ).cancel(campaign_id)
+        return self._request("POST", f"/v1/campaigns/{campaign_id}/cancel", {})
 
     def verify_campaign_corpus(self, digests: Sequence[str] | None = None) -> dict[str, Any]:
         if self.local:

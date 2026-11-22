@@ -16,13 +16,14 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from uzen.core.campaign.evaluate import Evaluator
 from uzen.core.campaign.models import Candidate
 from uzen.core.campaign.spec import CampaignSpec
 from uzen.core.campaign.store import CampaignStore
 from uzen.errors import (
+    CampaignCancelled,
     CampaignTimeout,
     GraphValidationError,
     InvalidOperationParameters,
@@ -35,6 +36,7 @@ from uzen.jobs.service import JobService
 from uzen.workers.protocol.messages import detect_capabilities
 
 CAMPAIGN_TRIAL_KIND = "campaign_trial"
+CAMPAIGN_RUN_KIND = "campaign_run"
 
 
 def _open_job_service(root: str, *, timeout_seconds: float = 15.0) -> JobService:
@@ -179,6 +181,7 @@ class DistributedTrialExecutor:
     poll_interval_seconds: float = 0.1
     submitter_id: str = "campaign-coordinator"
     store: CampaignStore | None = None
+    should_stop: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
@@ -187,6 +190,21 @@ class DistributedTrialExecutor:
             raise InvalidOperationParameters("poll interval must be positive")
         if self.store is None:
             self.store = CampaignStore(self.service.root)
+
+    def _stopped(self, spec: CampaignSpec) -> bool:
+        if self.should_stop is not None and bool(self.should_stop()):
+            return True
+        assert self.store is not None
+        return self.store.cancel_requested(spec.candidate_id)
+
+    def _cancel_jobs(self, job_ids: Sequence[str]) -> None:
+        for job_id in job_ids:
+            try:
+                self.service.cancel(job_id)
+            except UzenError:
+                # A job that already settled is not an error for cancellation; the
+                # campaign state remains the authority.
+                pass
 
     def __call__(self, spec: CampaignSpec, candidates: Sequence[Candidate]) -> list[dict[str, Any]]:
         assert self.store is not None
@@ -205,6 +223,13 @@ class DistributedTrialExecutor:
         settled: dict[str, dict[str, Any]] = {}
         deadline = time.monotonic() + float(self.timeout_seconds)
         while pending:
+            if self._stopped(spec):
+                self._cancel_jobs(sorted(pending))
+                raise CampaignCancelled(
+                    "campaign was cancelled while waiting for trial jobs",
+                    campaign_id=spec.candidate_id,
+                    pending_jobs=sorted(pending),
+                )
             for job_id in list(pending):
                 row = self.service.get(job_id)
                 if str(row.get("state")) in TERMINAL_STATES:
@@ -241,6 +266,7 @@ class CampaignWorker:
     poll_interval_seconds: float = 0.1
     max_in_flight_per_worker: int = 1
     capabilities: Mapping[str, Any] | None = None
+    job_kinds: Sequence[str] | None = (CAMPAIGN_TRIAL_KIND,)
     _executed: int = field(default=0, init=False)
     _capability_cache: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
@@ -269,6 +295,7 @@ class CampaignWorker:
             lease_seconds=self.lease_seconds,
             wait_seconds=self.claim_wait_seconds,
             poll_interval=self.poll_interval_seconds,
+            job_kinds=self.job_kinds,
         )
         if job is None:
             if owned:

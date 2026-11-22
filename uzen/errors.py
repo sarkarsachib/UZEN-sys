@@ -158,6 +158,13 @@ class CampaignTimeout(UzenError):
     http_status = 504
 
 
+class CampaignCancelled(UzenError):
+    """A campaign was cancelled before it could finish."""
+
+    code = "campaign.cancelled"
+    http_status = 409
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415

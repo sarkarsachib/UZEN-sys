@@ -23,6 +23,8 @@ from uzen.core.campaign.spec import CampaignSpec, Objective
 from uzen.core.campaign.store import CampaignStore
 from uzen.core.nir.graph import GraphValidationError
 from uzen.errors import (
+    CampaignCancelled,
+    CampaignConflict,
     CampaignNotFound,
     CampaignTimeout,
     InvalidOperationParameters,
@@ -147,6 +149,7 @@ class CampaignEngine:
         store: CampaignStore | None = None,
         corpus: BenchmarkCorpus | None = None,
         trial_executor: TrialExecutor | None = None,
+        job_service: Any | None = None,
     ) -> None:
         self.root = Path(root)
         self.store = store or CampaignStore(self.root)
@@ -154,10 +157,32 @@ class CampaignEngine:
         # ``None`` keeps the N6 local thread-pool evaluator. N7 supplies a
         # DistributedTrialExecutor, which submits trials to the N4 queue.
         self.trial_executor = trial_executor
+        # N8 cancellation needs the N4 service to cancel linked jobs. A synchronous
+        # local campaign has no linked jobs and can leave this unset.
+        self.job_service = job_service
 
     # ------------------------------------------------------------------ #
     # run / resume
     # ------------------------------------------------------------------ #
+
+    def _stop_requested(
+        self,
+        campaign_id: str,
+        stop_requested: Callable[[], bool] | None,
+    ) -> bool:
+        """Observe campaign cancellation and an optional owning-job cancellation."""
+        if self.store.cancel_requested(campaign_id):
+            return True
+        if stop_requested is not None and bool(stop_requested()):
+            self.store.request_cancel(campaign_id)
+            return True
+        return False
+
+    def _finish_cancelled(self, campaign_id: str, *, rounds: int) -> CampaignReport:
+        row = self.store.campaign(campaign_id)
+        if row["status"] != "cancelled":
+            self.store.finish_cancel(campaign_id, rounds=rounds)
+        return self.report(campaign_id)
 
     def run(
         self,
@@ -165,13 +190,19 @@ class CampaignEngine:
         *,
         resume: bool = True,
         max_rounds: int | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> CampaignReport:
         row = self.store.create_or_load(spec, resume=resume)
         campaign_id = str(row["campaign_id"])
+        round_count = int(row["rounds"])
         if row["status"] == "completed" and row["stop_reason"] in TERMINAL_STOP_REASONS:
             return self.report(campaign_id)
+        if row["status"] == "cancelled" or self.store.cancel_requested(campaign_id):
+            return self._finish_cancelled(campaign_id, rounds=round_count)
+        if self._stop_requested(campaign_id, stop_requested):
+            return self._finish_cancelled(campaign_id, rounds=round_count)
 
-        self.store.update_campaign(campaign_id, status="running", stop_reason="", rounds=int(row["rounds"]))
+        self.store.update_campaign(campaign_id, status="running", stop_reason="", rounds=round_count)
         evaluator = Evaluator(spec)
         existing = self.store.trials(campaign_id)
         total = len(existing)
@@ -183,6 +214,8 @@ class CampaignEngine:
         round_count = int(row["rounds"]) or (round_index if existing else 0)
 
         while True:
+            if self._stop_requested(campaign_id, stop_requested):
+                return self._finish_cancelled(campaign_id, rounds=round_count)
             if total >= spec.budget:
                 stop_reason = "budget"
                 break
@@ -211,6 +244,8 @@ class CampaignEngine:
                         raise InvalidOperationParameters(
                             "trial executor returned a different number of outcomes than candidates"
                         )
+            except CampaignCancelled:
+                return self._finish_cancelled(campaign_id, rounds=round_count)
             except CampaignTimeout:
                 # The batch is not lost: its jobs remain in the queue and the same
                 # idempotency keys recover their results when the campaign is resumed.
@@ -231,8 +266,12 @@ class CampaignEngine:
                     rounds=round_count,
                 )
                 raise
+            if self._stop_requested(campaign_id, stop_requested):
+                return self._finish_cancelled(campaign_id, rounds=round_count)
             inserted = 0
             for sequence, (candidate, outcome) in enumerate(zip(proposals, results)):
+                if self._stop_requested(campaign_id, stop_requested):
+                    break
                 if outcome["status"] == "ok":
                     failures = _constraint_failures(spec, outcome["metrics"])
                     status = "constraint" if failures else "ok"
@@ -273,6 +312,8 @@ class CampaignEngine:
                 best_score = current_best
                 last_improvement = round_index
 
+            if self._stop_requested(campaign_id, stop_requested):
+                return self._finish_cancelled(campaign_id, rounds=round_count)
             self.store.update_campaign(
                 campaign_id,
                 status="running",
@@ -293,15 +334,21 @@ class CampaignEngine:
                     stop_reason = "patience"
                     break
 
+        if self._stop_requested(campaign_id, stop_requested):
+            return self._finish_cancelled(campaign_id, rounds=round_count)
         if not stop_reason:
             stop_reason = "budget"
         paused = stop_reason == PAUSE_STOP_REASON
-        self.store.update_campaign(
+        updated = self.store.update_campaign(
             campaign_id,
             status="paused" if paused else "completed",
             stop_reason=stop_reason,
             rounds=round_count,
         )
+        if not updated:
+            # A cancellation committed after the last stop check; do not publish a
+            # completed report for a campaign the operator has cancelled.
+            return self._finish_cancelled(campaign_id, rounds=round_count)
         return self.report(campaign_id)
 
     def _history(
@@ -408,6 +455,67 @@ class CampaignEngine:
         if not campaign_id:
             raise CampaignNotFound("campaign id is required")
         return self.report(campaign_id)
+
+    def _job_service(self) -> Any:
+        if self.job_service is not None:
+            return self.job_service
+        service = getattr(self.trial_executor, "service", None)
+        if service is not None:
+            return service
+        from uzen.jobs.service import JobService
+
+        return JobService(self.root)
+
+    def jobs(self, campaign_id: str) -> list[dict[str, Any]]:
+        """Linked N4 jobs (trial evaluations and campaign-run coordinators)."""
+        campaign = self.store.campaign(campaign_id)
+        job_ids = self.store.job_ids(str(campaign["campaign_id"]))
+        if not job_ids:
+            return []
+        service = self._job_service()
+        jobs: list[dict[str, Any]] = []
+        for job_id in job_ids:
+            try:
+                jobs.append(service.get(job_id))
+            except UzenError:
+                continue
+        return jobs
+
+    def cancel(self, campaign_id: str) -> dict[str, Any]:
+        """Cancel a campaign and every linked queued or leased job.
+
+        The campaign flag is durable: a coordinator in another process observes it at
+        its next batch/wait boundary. Jobs that already settled are left untouched;
+        queued jobs are cancelled immediately and leased jobs are asked to cancel.
+        """
+        if not campaign_id:
+            raise CampaignNotFound("campaign id is required")
+        row = self.store.campaign(campaign_id)
+        if row["status"] == "completed":
+            raise CampaignConflict(
+                f"campaign '{campaign_id}' already completed and cannot be cancelled",
+                campaign_id=campaign_id,
+            )
+        if row["status"] == "cancelled":
+            return {"campaign": self.report(campaign_id).to_dict(), "jobs": self.jobs(campaign_id)}
+
+        self.store.request_cancel(campaign_id)
+        job_ids = self.store.job_ids(campaign_id)
+        cancelled: list[str] = []
+        if job_ids:
+            service = self._job_service()
+            for job_id in job_ids:
+                try:
+                    job = service.cancel(job_id)
+                except UzenError:
+                    continue
+                cancelled.append(str(job["id"]))
+        self.store.finish_cancel(campaign_id, rounds=int(row["rounds"]))
+        return {
+            "campaign": self.report(campaign_id).to_dict(),
+            "jobs": self.jobs(campaign_id),
+            "cancelled_job_ids": cancelled,
+        }
 
     def verify_corpus(self, digests: Sequence[str] | None = None) -> dict[str, Any]:
         return self.corpus.verify(digests)

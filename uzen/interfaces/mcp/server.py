@@ -460,10 +460,11 @@ class MCPServer:
             "uzen.run_campaign": (
                 {
                     "description": (
-                        "Run or resume a deterministic N6/N7 research campaign over architecture "
-                        "fields or weight transforms. Set distributed=true to submit read-only "
-                        "trials to N4 workers. Returns trials, Pareto front, best candidate and "
-                        "a content-addressed corpus digest."
+                        "Run, resume or enqueue a deterministic N6/N7/N8 research campaign over "
+                        "architecture fields or weight transforms. Set distributed=true to "
+                        "submit read-only trials to N4 workers. Set background=true to get a "
+                        "durable campaign-run job. Returns trials, Pareto front, best candidate "
+                        "and a content-addressed corpus digest (or the queued job)."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -474,6 +475,7 @@ class MCPServer:
                             "distributed": {"type": "boolean"},
                             "trial_timeout_seconds": {"type": "number"},
                             "poll_interval_seconds": {"type": "number"},
+                            "background": {"type": "boolean"},
                         },
                         "required": ["spec"],
                     },
@@ -500,6 +502,31 @@ class MCPServer:
                     },
                 },
                 self._list_campaigns,
+            ),
+            "uzen.cancel_campaign": (
+                {
+                    "description": (
+                        "Cancel a campaign, its linked trial jobs and its background run job. "
+                        "Already settled jobs are left untouched."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"campaign_id": {"type": "string"}},
+                        "required": ["campaign_id"],
+                    },
+                },
+                self._cancel_campaign,
+            ),
+            "uzen.campaign_jobs": (
+                {
+                    "description": "List the N4 jobs linked to a campaign.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"campaign_id": {"type": "string"}},
+                        "required": ["campaign_id"],
+                    },
+                },
+                self._campaign_jobs,
             ),
             "uzen.verify_campaign_corpus": (
                 {
@@ -813,7 +840,14 @@ class MCPServer:
             distributed=bool(args.get("distributed", False)),
             trial_timeout_seconds=float(args.get("trial_timeout_seconds", 600.0)),
             poll_interval_seconds=float(args.get("poll_interval_seconds", 0.1)),
+            background=bool(args.get("background", False)),
         )
+
+    def _cancel_campaign(self, args: Mapping[str, Any]) -> Any:
+        return self.client.cancel_campaign(str(args["campaign_id"]))
+
+    def _campaign_jobs(self, args: Mapping[str, Any]) -> Any:
+        return {"jobs": self.client.campaign_jobs(str(args["campaign_id"]))}
 
     def _get_campaign(self, args: Mapping[str, Any]) -> Any:
         return self.client.campaign(str(args["campaign_id"]))

@@ -724,10 +724,16 @@ class JobService:
         # Campaign trial jobs are a read-only task kind, not a registered engineering
         # operation. Validate their closed payload before they enter the queue.
         task_kind = job_request.options.get("task_kind")
-        if task_kind == "campaign_trial":
+        campaign_trial = task_kind == "campaign_trial"
+        campaign_run = task_kind == "campaign_run"
+        if campaign_trial:
             from uzen.core.campaign.distributed import validate_campaign_trial_request
 
             validate_campaign_trial_request(request)
+        elif campaign_run:
+            from uzen.core.campaign.control import validate_campaign_run_request
+
+            validate_campaign_run_request(request)
         else:
             # Reject unregistered / out-of-scope / malformed operations at submission, so a
             # job never enters the queue carrying work the engine cannot legally perform.
@@ -788,10 +794,9 @@ class JobService:
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
             return row.to_dict()
-        self.db.request_cancel(job_id)
-        if row.state in ("QUEUED", "CREATED"):
-            self.db.transition(job_id, "CANCELLED", payload={"reason": "cancelled before execution"})
-        return self.db.get_job(job_id).to_dict()
+        # ``request_cancel`` atomically makes a queued job terminal and flags a leased
+        # one, so there is no separate read-then-transition window here.
+        return self.db.request_cancel(job_id).to_dict()
 
     # ------------------------------------------------------------------ #
 
@@ -821,9 +826,13 @@ class JobService:
                 current_worker=row.worker_id,
             )
         if self.db.is_cancel_requested(job_id):
-            self.db.transition(job_id, "CANCELLED", payload={"reason": "cancel requested"})
-            return self.db.get_job(job_id).to_dict()
-        self.db.transition(job_id, "RUNNING", progress=0.05)
+            return self._settle_cancelled(job_id, worker_id, token)
+        try:
+            self.db.transition(job_id, "RUNNING", progress=0.05)
+        except JobStateError:
+            if self.db.is_cancel_requested(job_id):
+                return self._settle_cancelled(job_id, worker_id, token)
+            raise
         request = JobRequest.from_dict(row.request)
         try:
             result = self._execute(job_id, request)
@@ -847,7 +856,26 @@ class JobService:
                 token,
             )
             return self.db.get_job(job_id).to_dict()
-        self.db.transition(job_id, "VALIDATING", progress=0.9)
+        campaign_cancelled = (
+            isinstance(result, Mapping)
+            and result.get("task_kind") == "campaign_run"
+            and result.get("status") == "cancelled"
+        )
+        if self.db.is_cancel_requested(job_id) or campaign_cancelled:
+            # A cancellation can arrive while the work is executing. Its result is not
+            # published; the dispatch record is settled as cancelled instead. A campaign
+            # run that observed the durable campaign flag is also settled as cancelled,
+            # even if the coordinator job's own flag arrived a moment later.
+            return self._settle_cancelled(
+                job_id, worker_id, token, result={"cancelled": True}
+            )
+        try:
+            self.db.transition(job_id, "VALIDATING", progress=0.9)
+        except JobStateError:
+            # Cancellation won the race between the flag check and this transition.
+            if self.db.is_cancel_requested(job_id):
+                return self._settle_cancelled(job_id, worker_id, token)
+            raise
         if leased:
             assert worker_id is not None and token is not None
             self.db.finish_from_worker(
@@ -855,6 +883,33 @@ class JobService:
             )
         else:
             self.db.set_result(job_id, result)
+            self.db.release_lease(job_id)
+        return self.db.get_job(job_id).to_dict()
+
+    def _settle_cancelled(
+        self,
+        job_id: str,
+        worker_id: str | None,
+        token: str | None,
+        *,
+        result: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close a cancellation that raced with the run state machine."""
+        if worker_id is not None and token is not None:
+            self.db.finish_from_worker(
+                job_id,
+                worker_id=worker_id,
+                token=token,
+                state="CANCELLED",
+                result=result,
+            )
+        else:
+            self.db.transition(
+                job_id,
+                "CANCELLED",
+                payload={"reason": "cancel requested"},
+                progress=0.9,
+            )
             self.db.release_lease(job_id)
         return self.db.get_job(job_id).to_dict()
 
@@ -886,8 +941,11 @@ class JobService:
     # ------------------------------------------------------------------ #
 
     def _execute(self, job_id: str, request: JobRequest) -> dict[str, Any]:
-        if request.options.get("task_kind") == "campaign_trial":
+        task_kind = request.options.get("task_kind")
+        if task_kind == "campaign_trial":
             return self._execute_campaign_trial(job_id, request)
+        if task_kind == "campaign_run":
+            return self._execute_campaign_run(job_id, request)
         scope = request.task_scope
         if scope.value in ("model_architecture_research", "architecture_synthesis", "model_creation"):
             return self._execute_architecture(job_id, request)
@@ -975,6 +1033,76 @@ class JobService:
             "output_format": request.output_format,
         }
 
+    def _execute_campaign_trial(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        from uzen.core.campaign.distributed import (
+            campaign_trial_outcome,
+            validate_campaign_trial_request,
+        )
+
+        spec, candidate = validate_campaign_trial_request(request.to_dict())
+        outcome = campaign_trial_outcome(spec, candidate)
+        self.db.append_event(
+            job_id,
+            "campaign_trial",
+            {
+                "campaign_id": spec.candidate_id,
+                "candidate_digest": candidate.digest,
+                "status": outcome["status"],
+            },
+        )
+        return {
+            "task_kind": "campaign_trial",
+            "campaign_id": spec.candidate_id,
+            "candidate_digest": candidate.digest,
+            "trial": outcome,
+        }
+
+    def _execute_campaign_run(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        from uzen.core.campaign import CampaignEngine, DistributedTrialExecutor
+        from uzen.core.campaign.control import validate_campaign_run_request
+
+        spec, options = validate_campaign_run_request(request.to_dict())
+
+        def stop_requested() -> bool:
+            return self.db.is_cancel_requested(job_id)
+
+        executor = None
+        if options["distributed"]:
+            executor = DistributedTrialExecutor(
+                self,
+                timeout_seconds=float(options["trial_timeout_seconds"]),
+                poll_interval_seconds=float(options["poll_interval_seconds"]),
+                should_stop=stop_requested,
+            )
+        engine = CampaignEngine(
+            self.root,
+            trial_executor=executor,
+            job_service=self,
+        )
+        report = engine.run(
+            spec,
+            resume=bool(options["resume"]),
+            max_rounds=options["max_rounds"],
+            stop_requested=stop_requested,
+        )
+        self.db.append_event(
+            job_id,
+            "campaign_run",
+            {
+                "campaign_id": report.campaign_id,
+                "status": report.status,
+                "stop_reason": report.stop_reason,
+                "trials": len(report.trials),
+            },
+        )
+        return {
+            "task_kind": "campaign_run",
+            "campaign_id": report.campaign_id,
+            "status": report.status,
+            "stop_reason": report.stop_reason,
+            "report": report.to_dict(),
+        }
+
     # ------------------------------------------------------------------ #
 
     def _resolve_inputs(self, request: JobRequest) -> dict[str, WeightPackage]:
@@ -1043,30 +1171,6 @@ class JobService:
         return target, reference, graph, graph_inputs
 
     # ------------------------------------------------------------------ #
-
-    def _execute_campaign_trial(self, job_id: str, request: JobRequest) -> dict[str, Any]:
-        from uzen.core.campaign.distributed import (
-            campaign_trial_outcome,
-            validate_campaign_trial_request,
-        )
-
-        spec, candidate = validate_campaign_trial_request(request.to_dict())
-        outcome = campaign_trial_outcome(spec, candidate)
-        self.db.append_event(
-            job_id,
-            "campaign_trial",
-            {
-                "campaign_id": spec.candidate_id,
-                "candidate_digest": candidate.digest,
-                "status": outcome["status"],
-            },
-        )
-        return {
-            "task_kind": "campaign_trial",
-            "campaign_id": spec.candidate_id,
-            "candidate_digest": candidate.digest,
-            "trial": outcome,
-        }
 
     def _execute_weight_research(self, job_id: str, request: JobRequest) -> dict[str, Any]:
         packages = self._resolve_inputs(request)

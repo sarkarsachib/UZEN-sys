@@ -5,7 +5,7 @@ Advanced computational substrate**, and exactly what is implemented. The master
 specification lists Rust integration, a native compiler, C++/CUDA kernels,
 additional runtime backends, advanced parameter representations and large-scale
 autonomous research. Those are too large to pretend to finish in one step, so
-they are split into six core phases, plus the N7 post-P6 campaign extension.
+they are split into six core phases, plus the N7 and N8 post-P6 campaign extensions.
 
 No phase below is claimed because a directory or interface name exists. A phase is
 `implemented` only when its kernels/engine execute real computation and the
@@ -22,6 +22,7 @@ listed gate passes.
 | **N5** | GPU/native boundary: real CUDA kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | **implemented at the CUDA boundary** (17 kernels compile to PTX with NVRTC and assemble with `ptxas`; driver-API runtime and GPU tests present; execution not verified in the authoring environment because it has no driver/device; HIP not implemented) |
 | **N6** | Large-scale autonomous research: candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | **implemented** (in-process batch scheduler; inference-only proxy metrics; see [N6_CAMPAIGNS.md](N6_CAMPAIGNS.md)) |
 | **N7** | Distributed campaign trials over the N4 worker queue | **implemented** (post-P6 extension; see [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md)) |
+| **N8** | Campaign control: durable background runs, cancellation propagation and job-kind isolation | **implemented** (post-P6 extension; see [N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md)) |
 
 N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
 a machine with a device. N6 runs real architecture and weight-transform campaigns with
@@ -651,3 +652,26 @@ idempotency keys and reuses jobs that settled in the meantime. The coordinator r
 single-host SQLite: this is distributed execution, not a distributed campaign database.
 See [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md) for the job schema,
 worker loop, demo gates and limits.
+
+## N8 — campaign control and isolation (post-P6 extension)
+
+N8 makes a campaign run itself an N4 job (`task_kind=campaign_run`) so the REST request
+can return a durable coordinator job instead of blocking. `CampaignEngine.cancel` sets a
+durable cancellation flag, cancels the linked coordinator and trial jobs, and
+`CampaignStore.record_trial` serializes the cancel check with the insert so no trial is
+appended after cancellation returns. A late worker report is settled as `CANCELLED`
+instead of publishing a result. Job rows now carry `job_kind`; the claim query accepts a
+kind filter, `CampaignWorker` defaults to `campaign_trial`, and a coordinator worker must
+opt into `campaign_run`.
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_campaign_control.py
+.venv/bin/python examples/campaign_control_demo.py --root /tmp/uzen-n8-demo
+```
+
+Measured in this workspace: 10 N8-focused tests pass, the 9 N7 tests stay green, the
+real-process demo has 10/10 gates PASS, and the full suite is 553 passed / 37 skipped
+(37 skips are the documented opt-in/hardware gates plus 4 CUDA compilation skips because
+NVRTC is not installed in this restored environment). See
+[N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md) for the job contract, cancellation
+barrier, interfaces and limits.

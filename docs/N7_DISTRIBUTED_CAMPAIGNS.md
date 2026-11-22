@@ -109,8 +109,9 @@ It uses the same atomic claim and dispatch token as a remote worker. A normal
 contains N7.
 
 A campaign worker claims any eligible job on the queue, so it should use a dedicated
-control plane. Capability routing remains N4's job; this phase does not add a second
-scheduler.
+control plane. N8 adds a `job_kind` claim filter and makes `CampaignWorker` default to
+`campaign_trial`; see [N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md). Capability
+routing remains N4's job; neither phase adds a second scheduler.
 
 ## Determinism and resume
 
@@ -179,7 +180,7 @@ optional NVRTC wheel is absent in this environment.
    cancel already-submitted trial jobs; operators can cancel jobs through `/v1/jobs`.
 5. **Batch-granular resume.** Trials are persisted after the batch settles. A crash
    inside a batch preserves the jobs, not partially written campaign rows.
-6. **Dedicated queue recommended.** `CampaignWorker` claims any eligible queued job;
-   use a dedicated control plane on shared installations.
+6. **Dedicated queue recommended.** N7's `CampaignWorker` claims any eligible queued
+   job. N8 adds the optional kind filter; use it on shared queues.
 7. **Same code version required.** Workers must understand the N7 task kind; older
    workers will fail the job rather than silently evaluating something else.

@@ -136,7 +136,7 @@ single-objective contract.
 | Embedded ONNX runtime | planned |
 | Native CPU kernels (C++17 + ctypes) | implemented for float32 linear/matmul, layernorm/rmsnorm, softmax, GELU (tanh/exact)/SiLU/ReLU/tanh/sigmoid, add/sub/mul/scale/clip, embedding, last-axis mean/sum and masked attention; optional OpenMP; no CUDA claim |
 
-## Research campaigns (N6 / N7)
+## Research campaigns (N6 / N7 / N8)
 
 | Capability | Status |
 | --- | --- |
@@ -146,8 +146,9 @@ single-objective contract.
 | Durable scheduler | implemented; SQLite WAL, idempotent `(campaign_id, candidate)` trials, pause on `max_rounds`, batch-boundary resume, event history |
 | Objectives/scoring/Pareto | implemented; min-max weighted score and multi-objective domination |
 | Benchmark corpus | implemented; content-addressed JSON, replay re-executes the candidate, integrity check rejects modified records, signed/relative-tolerance metric comparison |
-| Interfaces | SDK (`run_campaign`, `campaign`, `campaigns`, `verify_campaign_corpus`, `replay_benchmark`), CLI (`campaign run|show|list|events|verify|replay`), REST (`/v1/campaigns`, `/v1/benchmarks/{digest}`), MCP (five tools) |
+| Interfaces | SDK (`run_campaign`, `campaign`, `campaigns`, `cancel_campaign`, `campaign_jobs`, `verify_campaign_corpus`, `replay_benchmark`), CLI (`campaign run|show|list|events|verify|replay|cancel|jobs`), REST (`/v1/campaigns`, `/v1/campaigns/{id}/cancel`, `/v1/campaigns/{id}/jobs`, `/v1/benchmarks/{digest}`), MCP (seven tools) |
 | Distributed execution (N7) | `CampaignEngine(trial_executor=DistributedTrialExecutor(...))` submits read-only `campaign_trial` jobs to the N4 queue; `CampaignWorker` claims under a lease and returns metrics. Covered by `tests/test_distributed_campaigns.py` and `examples/distributed_campaign_demo.py` with two worker processes. |
+| Campaign control (N8) | Durable `campaign_run` background jobs executed by `CampaignWorker(job_kinds=(CAMPAIGN_RUN_KIND,))`; `cancel_campaign` cancels the coordinator and linked trials, refuses late reports, and blocks trial inserts after cancellation. `job_kind` claim filtering keeps dedicated workers on their queue. Covered by `tests/test_campaign_control.py` and `examples/campaign_control_demo.py` with four real processes. |
 
 Metrics are inference-only proxies (size, output RMS/diversity, sparsity, int8 round-trip
 error, base distance/agreement). No dataset, loss or task accuracy is measured.
@@ -187,7 +188,7 @@ error, base distance/agreement). No dataset, loss or task accuracy is measured.
 | Python SDK (local + remote HTTP) | implemented |
 | CLI (argparse) | implemented |
 | REST API (FastAPI, OpenAPI) | implemented (optional extra) |
-| MCP stdio server (26 tools) | implemented, including NASE composition/edit and N6/N7 campaign/replay tools |
+| MCP stdio server (28 tools) | implemented, including NASE composition/edit and N6/N7/N8 campaign tools |
 | Worker protocol + daemon (local and remote) | implemented: claim under a token-guarded lease, input fetching through the object-store transport or the shared exchange directory, local job id equal to the control-plane job id, and reuse of a completed result instead of re-execution |
 | Distributed scheduler (capability routing, priority, leases, attempts, idempotent dispatch) | implemented: requirements derived from the job request and matched inside the atomic claiming statement, operator `priority` with optional aging, `dispatch_token` per attempt, lease expiry requeue with exponential backoff and attempt cap (`job.lease_expired`), cooperative preemption, worker draining/resume, a per-worker in-flight cap, long-poll claims, first-report-wins via `dispatch_records`, and unroutable-job reporting. Verified across real worker processes in `examples/distributed_scheduling_demo.py` |
 | Object-store artifact transport | implemented for S3-compatible endpoints: local SigV4 signing, streamed single and multipart uploads, SHA-256 verification before publication, parent-lineage closure and stored-tokenizer sidecars; validated against a real S3-compatible server and by an independently signature-checking test server |
@@ -213,10 +214,12 @@ error, base distance/agreement). No dataset, loss or task accuracy is measured.
    fabricate activations for unsupported architectures.
 5. **Architecture families outside the 24-family registry** are reported as unsupported;
    UZEN will not synthesize a graph it cannot execute.
-6. **Campaign state remains single-host, but N7 distributes trials.** The coordinator,
-   campaign SQLite store and corpus remain on one host; there is no multi-coordinator
-   election and no task-quality metric. The synchronous REST path still blocks. Resume is
-   batch-granular. Campaign proxy metrics must not be presented as benchmark superiority.
+6. **Campaign state remains single-host; N7 distributes trials and N8 adds background
+   control.** N8 can enqueue a durable `campaign_run` job and cancel a campaign and its
+   linked jobs, but the coordinator, campaign SQLite store and corpus remain on one host,
+   there is no multi-coordinator election, cancellation is cooperative, and there is no
+   task-quality metric. The synchronous REST path still blocks. Resume is batch-granular.
+   Campaign proxy metrics must not be presented as benchmark superiority.
 7. **The native CPU backend is float32-only and correctness-first.** The direct
    executor uses a naive GEMM and NumPy for layout ops and covers
    [P6_NATIVE.md](P6_NATIVE.md)'s documented operator set; the compiled plan adds

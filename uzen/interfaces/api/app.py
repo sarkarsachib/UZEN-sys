@@ -586,7 +586,7 @@ def create_app(
         return service.run(job["id"])
 
     # ------------------------------------------------------------------ #
-    # research campaigns (N6/N7)
+    # research campaigns (N6/N7/N8)
     # ------------------------------------------------------------------ #
 
     @app.post(f"/{API_VERSION}/campaigns")
@@ -596,6 +596,18 @@ def create_app(
         if "spec" not in payload:
             raise HTTPException(400, detail={"code": "request.invalid", "message": "provide spec"})
         spec = CampaignSpec.from_dict(payload["spec"])
+        if bool(payload.get("background", False)):
+            from uzen.core.campaign.control import submit_campaign_run
+
+            return submit_campaign_run(
+                service,
+                spec,
+                distributed=bool(payload.get("distributed", False)),
+                resume=bool(payload.get("resume", True)),
+                max_rounds=payload.get("max_rounds"),
+                trial_timeout_seconds=float(payload.get("trial_timeout_seconds", 600.0)),
+                poll_interval_seconds=float(payload.get("poll_interval_seconds", 0.1)),
+            )
         executor = None
         if bool(payload.get("distributed", False)):
             from uzen.core.campaign import DistributedTrialExecutor
@@ -605,7 +617,7 @@ def create_app(
                 timeout_seconds=float(payload.get("trial_timeout_seconds", 600.0)),
                 poll_interval_seconds=float(payload.get("poll_interval_seconds", 0.1)),
             )
-        engine = CampaignEngine(service.root, trial_executor=executor)
+        engine = CampaignEngine(service.root, trial_executor=executor, job_service=service)
         report = engine.run(
             spec,
             resume=bool(payload.get("resume", True)),
@@ -636,6 +648,19 @@ def create_app(
         from uzen.core.campaign import CampaignEngine
 
         return {"events": CampaignEngine(service.root).events(campaign_id, after=after)}
+
+    @app.get(f"/{API_VERSION}/campaigns/{{campaign_id}}/jobs")
+    def campaign_jobs(campaign_id: str, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        engine = CampaignEngine(service.root, job_service=service)
+        return {"campaign_id": campaign_id, "jobs": engine.jobs(campaign_id)}
+
+    @app.post(f"/{API_VERSION}/campaigns/{{campaign_id}}/cancel")
+    def cancel_campaign(campaign_id: str, _: None = Depends(require_auth)):
+        from uzen.core.campaign import CampaignEngine
+
+        return CampaignEngine(service.root, job_service=service).cancel(campaign_id)
 
     @app.get(f"/{API_VERSION}/campaigns/{{campaign_id}}/corpus")
     def campaign_corpus(campaign_id: str, _: None = Depends(require_auth)):
@@ -699,6 +724,12 @@ def create_app(
     def worker_claim(payload: dict[str, Any]):
         worker_id = _authenticate_worker(payload)
         capabilities = payload.get("capabilities")
+        requested_kinds = payload.get("job_kinds")
+        if requested_kinds is not None and not isinstance(requested_kinds, list):
+            raise HTTPException(
+                400,
+                detail={"code": "worker.invalid", "message": "job_kinds must be a list"},
+            )
         job = scheduler.claim(
             worker_id,
             capabilities=dict(capabilities) if isinstance(capabilities, Mapping) else None,
@@ -707,6 +738,11 @@ def create_app(
             ),
             wait_seconds=(
                 float(payload["wait_seconds"]) if payload.get("wait_seconds") is not None else 0.0
+            ),
+            job_kinds=(
+                tuple(str(kind) for kind in requested_kinds)
+                if requested_kinds is not None
+                else None
             ),
         )
         return {"job": job, "scheduler": scheduler.describe()}

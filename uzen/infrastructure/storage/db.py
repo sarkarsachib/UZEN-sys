@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
     priority INTEGER NOT NULL DEFAULT 0,
+    job_kind TEXT NOT NULL DEFAULT '',
     enqueued_at REAL,
     available_at REAL,
     dispatch_token TEXT,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS idx_jobs_kind ON jobs(job_kind);
 
 CREATE TABLE IF NOT EXISTS job_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +172,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     # that stops heartbeating loses the job and the attempt is returned to the queue.
     "DISPATCHED": {"RUNNING", "QUEUED", "VALIDATING", "CANCEL_REQUESTED", "FAILED", "CANCELLED"},
     "RUNNING": {"VALIDATING", "QUEUED", "FAILED", "CANCEL_REQUESTED", "CANCELLED", "SUCCEEDED"},
-    "VALIDATING": {"SUCCEEDED", "FAILED"},
+    "VALIDATING": {"SUCCEEDED", "FAILED", "CANCEL_REQUESTED", "CANCELLED"},
     "CANCEL_REQUESTED": {"CANCELLED", "FAILED"},
     "SUCCEEDED": set(),
     "FAILED": set(),
@@ -200,6 +202,7 @@ class JobRow:
     min_cpu_count: int | None = None
     min_memory_bytes: int | None = None
     priority: int = 0
+    job_kind: str = ""
     enqueued_at: float | None = None
     available_at: float | None = None
 
@@ -225,6 +228,7 @@ class JobRow:
             "min_cpu_count": self.min_cpu_count,
             "min_memory_bytes": self.min_memory_bytes,
             "priority": self.priority,
+            "job_kind": self.job_kind,
             "enqueued_at": self.enqueued_at,
             "available_at": self.available_at,
         }
@@ -258,6 +262,7 @@ class Database:
                 "min_cpu_count": "INTEGER",
                 "min_memory_bytes": "INTEGER",
                 "priority": "INTEGER NOT NULL DEFAULT 0",
+                "job_kind": "TEXT NOT NULL DEFAULT ''",
                 "enqueued_at": "REAL",
                 "available_at": "REAL",
             },
@@ -306,6 +311,10 @@ class Database:
         priority = max(-1000, min(1000, int(priority)))
         request_json = json.dumps(request, separators=(",", ":"), sort_keys=True)
         request_hash = sha256_text(request_json)
+        options = request.get("options") if isinstance(request, Mapping) else None
+        job_kind = ""
+        if isinstance(options, Mapping):
+            job_kind = str(options.get("task_kind") or "")
         with self._lock:
             if idempotency_key:
                 existing = self._conn.execute(
@@ -328,9 +337,9 @@ class Database:
                 )
             self._conn.execute(
                 "INSERT INTO jobs(id, state, task_scope, objective, request_json, idempotency_key, "
-                "request_hash, max_attempts, priority, enqueued_at, min_cpu_count, min_memory_bytes, "
-                "created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "request_hash, max_attempts, priority, job_kind, enqueued_at, min_cpu_count, "
+                "min_memory_bytes, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     state,
@@ -341,6 +350,7 @@ class Database:
                     request_hash,
                     int(max_attempts),
                     priority,
+                    job_kind,
                     _time.time(),
                     getattr(requirements, "min_cpu_count", None) or None,
                     getattr(requirements, "min_memory_bytes", None),
@@ -362,12 +372,24 @@ class Database:
             raise JobNotFound(f"job '{job_id}' not found")
         return _row_to_job(row)
 
-    def list_jobs(self, *, state: str | None = None, limit: int = 50) -> list[JobRow]:
+    def list_jobs(
+        self,
+        *,
+        state: str | None = None,
+        job_kind: str | None = None,
+        limit: int = 50,
+    ) -> list[JobRow]:
         query = "SELECT * FROM jobs"
         params: list[Any] = []
+        clauses: list[str] = []
         if state:
-            query += " WHERE state = ?"
+            clauses.append("state = ?")
             params.append(state)
+        if job_kind is not None:
+            clauses.append("job_kind = ?")
+            params.append(job_kind)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(int(limit))
         with self._lock:
@@ -441,18 +463,50 @@ class Database:
         self.append_event(job_id, "failed", dict(error))
 
     def request_cancel(self, job_id: str) -> JobRow:
+        """Durably request cancellation without reopening a terminal job.
+
+        A worker can settle a job on another connection at the same moment. The read
+        and write therefore happen under one ``BEGIN IMMEDIATE`` transaction: checking
+        terminal state first with a plain SELECT lets a concurrent success commit in
+        between, after which this update would overwrite ``SUCCEEDED`` with
+        ``CANCEL_REQUESTED``. Queued jobs become terminal immediately; a leased job is
+        flagged so its worker (or the lease reaper) settles it.
+        """
         with self._lock:
-            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            if row is None:
-                raise JobNotFound(f"job '{job_id}' not found")
-            if row["state"] in TERMINAL_STATES:
-                return _row_to_job(row)
-            self._conn.execute(
-                "UPDATE jobs SET cancel_requested = 1, state = ?, updated_at = ? WHERE id = ?",
-                ("CANCEL_REQUESTED", utc_now_iso(), job_id),
-            )
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise JobNotFound(f"job '{job_id}' not found")
+                previous = _row_to_job(row)
+                if previous.state in TERMINAL_STATES:
+                    self._conn.rollback()
+                    return previous
+                state = (
+                    "CANCELLED"
+                    if previous.state in ("CREATED", "QUEUED")
+                    else "CANCEL_REQUESTED"
+                )
+                self._conn.execute(
+                    "UPDATE jobs SET cancel_requested = 1, state = ?, updated_at = ? WHERE id = ?",
+                    (state, utc_now_iso(), job_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         self.append_event(job_id, "cancel_requested", {})
+        if state == "CANCELLED":
+            self.append_event(
+                job_id,
+                "state_changed",
+                {"from": previous.state, "to": "CANCELLED"},
+            )
+            self.append_event(
+                job_id,
+                "cancelled",
+                {"from": previous.state, "to": "CANCELLED"},
+            )
         return self.get_job(job_id)
 
     def is_cancel_requested(self, job_id: str) -> bool:
@@ -467,16 +521,24 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def append_event(self, job_id: str, kind: str, payload: Mapping[str, Any]) -> None:
+        # ``seq`` is per job. A plain SELECT MAX + INSERT races when a control-plane
+        # process and a worker append to the same job through different connections;
+        # BEGIN IMMEDIATE takes the writer lock before reading the sequence.
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS m FROM job_events WHERE job_id = ?", (job_id,)
-            ).fetchone()
-            seq = int(row["m"]) + 1
-            self._conn.execute(
-                "INSERT INTO job_events(job_id, seq, kind, payload_json, created_at) VALUES (?,?,?,?,?)",
-                (job_id, seq, kind, json.dumps(payload, separators=(",", ":"), sort_keys=True), utc_now_iso()),
-            )
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS m FROM job_events WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                seq = int(row["m"]) + 1
+                self._conn.execute(
+                    "INSERT INTO job_events(job_id, seq, kind, payload_json, created_at) VALUES (?,?,?,?,?)",
+                    (job_id, seq, kind, json.dumps(payload, separators=(",", ":"), sort_keys=True), utc_now_iso()),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def events(self, job_id: str, *, after: int = 0, limit: int = 500) -> list[dict[str, Any]]:
         self.get_job(job_id)
@@ -736,6 +798,7 @@ class Database:
         capabilities: Mapping[str, Any] | None = None,
         aging_seconds: float = 0.0,
         max_in_flight_per_worker: int = 0,
+        job_kinds: Sequence[str] | None = None,
     ) -> JobRow | None:
         """Atomically lease the oldest job this worker is capable of executing.
 
@@ -755,6 +818,18 @@ class Database:
         now = now if now is not None else _time.time()
         token = uuid.uuid4().hex
         expires_at = now + float(lease_seconds)
+        kind_clause = ""
+        kind_parameters: dict[str, Any] = {}
+        if job_kinds is not None:
+            kinds = tuple(str(kind) for kind in job_kinds)
+            if kinds:
+                placeholders = ", ".join(f":kind{index}" for index in range(len(kinds)))
+                kind_clause = f"AND j.job_kind IN ({placeholders})"
+                kind_parameters = {
+                    f"kind{index}": kind for index, kind in enumerate(kinds)
+                }
+            else:
+                kind_clause = "AND 0"
         statement = f"""
             UPDATE jobs SET state = 'DISPATCHED', worker_id = :worker, attempts = attempts + 1,
                 dispatch_token = :token, lease_expires_at = :expires, available_at = NULL,
@@ -765,6 +840,7 @@ class Database:
                   AND j.cancel_requested = 0
                   AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= :now)
                   AND (j.available_at IS NULL OR j.available_at <= :now)
+                  {kind_clause}
                   AND COALESCE(
                       (SELECT status FROM workers w WHERE w.worker_id = :worker), 'online'
                   ) != 'draining'
@@ -794,6 +870,7 @@ class Database:
                     "now_iso": utc_now_iso(),
                     "aging": float(aging_seconds),
                     "max_in_flight": int(max_in_flight_per_worker),
+                    **kind_parameters,
                 },
             )
             self._conn.commit()
@@ -1066,68 +1143,139 @@ class Database:
         """
         if state not in ("SUCCEEDED", "FAILED", "CANCELLED"):
             raise JobStateError(f"worker reports must be terminal states, got '{state}'", job_id=job_id)
-        job = self.get_job(job_id)
-        if job.dispatch_token != token or job.worker_id != worker_id:
-            return {
-                "status": "stale",
-                "job_id": job_id,
-                "worker_id": worker_id,
-                "detail": (
-                    "dispatch token does not belong to this worker's current attempt; the "
-                    "job was requeued or taken over"
-                ),
-                "current_worker": job.worker_id,
-                "current_attempt": job.attempts,
-            }
+        # Settlement and cancellation race on separate connections. One immediate
+        # transaction re-reads the job, decides the outcome and closes the dispatch
+        # record together, so a cancellation that commits first wins and a late report
+        # can never overwrite it (nor can a report reopen a terminal job).
+        previous_state = ""
+        final_state = ""
+        attempts = 0
         with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE dispatch_records SET outcome = ?, reported_at = ? "
-                "WHERE job_id = ? AND attempt = ? AND token = ? AND outcome = 'dispatched'",
-                (state, utc_now_iso(), job_id, job.attempts, token),
-            )
-            self._conn.commit()
-            duplicate = cursor.rowcount == 0
-            recorded = self._conn.execute(
-                "SELECT outcome FROM dispatch_records WHERE job_id = ? AND attempt = ?",
-                (job_id, job.attempts),
-            ).fetchone()
-        if duplicate:
-            return {
-                "status": "duplicate",
-                "job_id": job_id,
-                "recorded_outcome": recorded["outcome"] if recorded else None,
-                "attempt": job.attempts,
-            }
-        if job.state in TERMINAL_STATES:
-            return {
-                "status": "rejected",
-                "job_id": job_id,
-                "state": job.state,
-                "detail": "job is already terminal; the report was not applied",
-            }
-        if state == "SUCCEEDED":
-            self.transition(job_id, "VALIDATING", progress=0.9, payload={"worker_id": worker_id})
-            self.set_result(job_id, dict(result or {"worker_id": worker_id}))
-        elif state == "FAILED":
-            self.set_error(
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
+                    raise JobNotFound(f"job '{job_id}' not found")
+                job = _row_to_job(row)
+                if job.dispatch_token != token or job.worker_id != worker_id:
+                    self._conn.rollback()
+                    return {
+                        "status": "stale",
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "detail": (
+                            "dispatch token does not belong to this worker's current attempt; the "
+                            "job was requeued or taken over"
+                        ),
+                        "current_worker": job.worker_id,
+                        "current_attempt": job.attempts,
+                    }
+                recorded = self._conn.execute(
+                    "SELECT outcome FROM dispatch_records WHERE job_id = ? AND attempt = ?",
+                    (job_id, job.attempts),
+                ).fetchone()
+                if recorded is None or recorded["outcome"] != "dispatched":
+                    self._conn.rollback()
+                    return {
+                        "status": "duplicate",
+                        "job_id": job_id,
+                        "recorded_outcome": recorded["outcome"] if recorded else None,
+                        "attempt": job.attempts,
+                    }
+                if job.state in TERMINAL_STATES:
+                    self._conn.rollback()
+                    return {
+                        "status": "rejected",
+                        "job_id": job_id,
+                        "state": job.state,
+                        "detail": "job is already terminal; the report was not applied",
+                    }
+                previous_state = job.state
+                attempts = job.attempts
+                final_state = (
+                    "CANCELLED"
+                    if job.cancel_requested and state != "CANCELLED"
+                    else state
+                )
+                now = utc_now_iso()
+                self._conn.execute(
+                    "UPDATE dispatch_records SET outcome = ?, reported_at = ? "
+                    "WHERE job_id = ? AND attempt = ? AND token = ? AND outcome = 'dispatched'",
+                    (final_state, now, job_id, job.attempts, token),
+                )
+                if final_state == "SUCCEEDED":
+                    self._conn.execute(
+                        "UPDATE jobs SET state = 'SUCCEEDED', result_json = ?, progress = 1.0, "
+                        "lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+                        (
+                            json.dumps(
+                                dict(result or {"worker_id": worker_id}),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            now,
+                            job_id,
+                        ),
+                    )
+                elif final_state == "FAILED":
+                    recorded_error = {
+                        "error": dict(error or {"code": "job.failed", "message": "worker reported failure"}),
+                        "timestamp": now,
+                        "worker_id": worker_id,
+                    }
+                    self._conn.execute(
+                        "UPDATE jobs SET state = 'FAILED', error_json = ?, lease_expires_at = NULL, "
+                        "updated_at = ? WHERE id = ?",
+                        (
+                            json.dumps(recorded_error, separators=(",", ":"), sort_keys=True),
+                            now,
+                            job_id,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE jobs SET state = 'CANCELLED', lease_expires_at = NULL, "
+                        "updated_at = ? WHERE id = ?",
+                        (now, job_id),
+                    )
+                self._conn.execute("DELETE FROM leases WHERE job_id = ?", (job_id,))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if final_state != previous_state:
+            self.append_event(
                 job_id,
+                "state_changed",
+                {"from": previous_state, "to": final_state, "worker_id": worker_id},
+            )
+            self.append_event(
+                job_id,
+                final_state.lower(),
+                {"from": previous_state, "to": final_state, "worker_id": worker_id},
+            )
+        if final_state == "SUCCEEDED":
+            self.append_event(job_id, "completed", {"state": "SUCCEEDED"})
+        elif final_state == "FAILED":
+            self.append_event(
+                job_id,
+                "failed",
                 {
                     "error": dict(error or {"code": "job.failed", "message": "worker reported failure"}),
                     "timestamp": utc_now_iso(),
                     "worker_id": worker_id,
                 },
             )
-        else:
-            self.transition(job_id, "CANCELLED", payload={"worker_id": worker_id})
-        self.release_lease(job_id)
-        settled = self.get_job(job_id)
-        return {
+        result_payload: dict[str, Any] = {
             "status": "accepted",
             "job_id": job_id,
-            "state": settled.state,
-            "attempt": job.attempts,
+            "state": final_state,
+            "attempt": attempts,
             "worker_id": worker_id,
         }
+        if final_state == "CANCELLED" and previous_state != "CANCELLED":
+            result_payload["detail"] = "job was cancelled before the late report could be applied"
+        return result_payload
 
     def dispatch_records(self, job_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -1168,6 +1316,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRow:
         min_cpu_count=row["min_cpu_count"],
         min_memory_bytes=row["min_memory_bytes"],
         priority=int(row["priority"] or 0) if "priority" in row.keys() else 0,
+        job_kind=str(row["job_kind"] or "") if "job_kind" in row.keys() else "",
         enqueued_at=row["enqueued_at"] if "enqueued_at" in row.keys() else None,
         available_at=row["available_at"] if "available_at" in row.keys() else None,
     )

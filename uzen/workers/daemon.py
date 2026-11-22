@@ -63,6 +63,7 @@ class WorkerDaemon:
     lease_seconds: float = 120.0
     claim_wait_seconds: float = 0.0
     max_jobs: int | None = None
+    job_kinds: tuple[str, ...] | None = None
     capability_overrides: Mapping[str, Any] | None = None
     transport: Any | None = None
     _service: JobService | None = field(default=None, init=False, repr=False)
@@ -161,6 +162,7 @@ class WorkerDaemon:
                 "lease_seconds": self.lease_seconds,
                 "wait_seconds": self.claim_wait_seconds,
                 "capabilities": self.capabilities(),
+                "job_kinds": list(self.job_kinds) if self.job_kinds is not None else None,
             },
         )
         return response.get("job")

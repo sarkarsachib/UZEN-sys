@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     spec_json TEXT NOT NULL,
     status TEXT NOT NULL,
     stop_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    run_job_id TEXT NOT NULL DEFAULT '',
     seed INTEGER NOT NULL,
     budget INTEGER NOT NULL,
     rounds INTEGER NOT NULL DEFAULT 0,
@@ -79,6 +81,20 @@ class CampaignStore:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            self._migrate(connection)
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(campaigns)").fetchall()
+        }
+        if "cancel_requested" not in columns:
+            connection.execute(
+                "ALTER TABLE campaigns ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+            )
+        if "run_job_id" not in columns:
+            connection.execute(
+                "ALTER TABLE campaigns ADD COLUMN run_job_id TEXT NOT NULL DEFAULT ''"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.db_path), timeout=30.0)
@@ -120,8 +136,8 @@ class CampaignStore:
             connection.execute(
                 "INSERT INTO campaigns "
                 "(campaign_id, name, mode, spec_digest, spec_json, status, stop_reason, "
-                "seed, budget, rounds, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'running', '', ?, ?, 0, ?, ?)",
+                "cancel_requested, seed, budget, rounds, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'running', '', 0, ?, ?, 0, ?, ?)",
                 (
                     campaign_id,
                     spec.name,
@@ -162,31 +178,62 @@ class CampaignStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def update_campaign(
-        self,
-        campaign_id: str,
-        *,
-        status: str,
-        stop_reason: str,
-        rounds: int,
-    ) -> None:
+    def cancel_requested(self, campaign_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_requested FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+        if row is None:
+            raise CampaignNotFound(f"campaign '{campaign_id}' not found", campaign_id=campaign_id)
+        return bool(row["cancel_requested"])
+
+    def request_cancel(self, campaign_id: str) -> dict[str, Any]:
+        """Durably request cancellation; the running engine observes this flag."""
         now = utc_now_iso()
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if row is None:
+                raise CampaignNotFound(
+                    f"campaign '{campaign_id}' not found", campaign_id=campaign_id
+                )
+            if row["status"] in ("completed", "cancelled"):
+                return dict(row)
+            if not row["cancel_requested"]:
+                connection.execute(
+                    "UPDATE campaigns SET cancel_requested = 1, status = 'cancelling', "
+                    "updated_at = ? WHERE campaign_id = ?",
+                    (now, campaign_id),
+                )
+                connection.execute(
+                    "INSERT INTO events (campaign_id, kind, payload_json, created_at) "
+                    "VALUES (?, 'campaign.cancel_requested', ?, ?)",
+                    (campaign_id, canonical_json({}), now),
+                )
+        return self.campaign(campaign_id)
+
+    def finish_cancel(self, campaign_id: str, *, rounds: int) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT status FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if existing is None:
+                raise CampaignNotFound(
+                    f"campaign '{campaign_id}' not found", campaign_id=campaign_id
+                )
+            if existing["status"] == "cancelled":
+                return
             connection.execute(
-                "UPDATE campaigns SET status = ?, stop_reason = ?, rounds = ?, updated_at = ? "
-                "WHERE campaign_id = ?",
-                (status, stop_reason, int(rounds), now, campaign_id),
+                "UPDATE campaigns SET cancel_requested = 1, status = 'cancelled', "
+                "stop_reason = 'cancelled', rounds = ?, updated_at = ? WHERE campaign_id = ?",
+                (int(rounds), now, campaign_id),
             )
             connection.execute(
                 "INSERT INTO events (campaign_id, kind, payload_json, created_at) "
-                "VALUES (?, 'campaign.updated', ?, ?)",
-                (
-                    campaign_id,
-                    canonical_json(
-                        {"status": status, "stop_reason": stop_reason, "rounds": int(rounds)}
-                    ),
-                    now,
-                ),
+                "VALUES (?, 'campaign.cancelled', ?, ?)",
+                (campaign_id, canonical_json({"rounds": int(rounds)}), now),
             )
 
     def link_job(
@@ -203,6 +250,22 @@ class CampaignStore:
                 (campaign_id, job_id, candidate_digest, utc_now_iso()),
             )
 
+    def run_job_id(self, campaign_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT run_job_id FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+        if row is None:
+            raise CampaignNotFound(f"campaign '{campaign_id}' not found", campaign_id=campaign_id)
+        return str(row["run_job_id"] or "")
+
+    def set_run_job_id(self, campaign_id: str, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE campaigns SET run_job_id = ?, updated_at = ? WHERE campaign_id = ?",
+                (job_id, utc_now_iso(), campaign_id),
+            )
+
     def job_ids(self, campaign_id: str) -> list[str]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -212,12 +275,60 @@ class CampaignStore:
             ).fetchall()
         return [str(row["job_id"]) for row in rows]
 
+    def update_campaign(
+        self,
+        campaign_id: str,
+        *,
+        status: str,
+        stop_reason: str,
+        rounds: int,
+    ) -> bool:
+        """Advance status without overwriting a cancellation that already won.
+
+        Cancellation and the coordinator's final ``completed`` write can race. Both
+        are writers, so the conditional UPDATE makes the first committed transition
+        authoritative: a cancellation flag turns later status writes into no-ops
+        instead of replacing ``cancelled`` with ``completed``.
+        """
+        now = utc_now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE campaigns SET status = ?, stop_reason = ?, rounds = ?, updated_at = ? "
+                "WHERE campaign_id = ? AND cancel_requested = 0",
+                (status, stop_reason, int(rounds), now, campaign_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+            connection.execute(
+                "INSERT INTO events (campaign_id, kind, payload_json, created_at) "
+                "VALUES (?, 'campaign.updated', ?, ?)",
+                (
+                    campaign_id,
+                    canonical_json(
+                        {"status": status, "stop_reason": stop_reason, "rounds": int(rounds)}
+                    ),
+                    now,
+                ),
+            )
+        return True
+
     # ------------------------------------------------------------------ #
     # trials
     # ------------------------------------------------------------------ #
 
     def record_trial(self, campaign_id: str, trial: Trial) -> bool:
         with self._connect() as connection:
+            # Serialize the cancellation check with the insert. A deferred read could
+            # observe cancel_requested=0, let a cancellation commit, and then append a
+            # trial after the cancel call returned.
+            connection.execute("BEGIN IMMEDIATE")
+            campaign = connection.execute(
+                "SELECT cancel_requested FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if campaign is not None and campaign["cancel_requested"]:
+                # Cancellation is a durable barrier: a batch that was already being
+                # evaluated when the request arrived may not append new trials.
+                return False
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO trials "
                 "(campaign_id, digest, round_index, sequence, candidate_json, status, "

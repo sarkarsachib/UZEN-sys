@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     ae.add_argument("--param", action="append", default=[])
 
     # campaigns ------------------------------------------------------- #
-    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6/N7)")
+    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6/N7/N8)")
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     cr = campaign_sub.add_parser("run")
     cr.add_argument("--spec", help="inline campaign spec JSON")
@@ -230,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--distributed", action="store_true", help="submit trials to N4 workers")
     cr.add_argument("--trial-timeout", type=float, default=600.0)
     cr.add_argument("--poll-interval", type=float, default=0.1)
+    cr.add_argument(
+        "--background",
+        action="store_true",
+        help="enqueue a durable campaign-run job instead of blocking",
+    )
     cs = campaign_sub.add_parser("show")
     cs.add_argument("campaign_id")
     cl = campaign_sub.add_parser("list")
@@ -241,6 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
     cv.add_argument("--digest", action="append", default=[])
     cp = campaign_sub.add_parser("replay")
     cp.add_argument("digest")
+    cc = campaign_sub.add_parser("cancel")
+    cc.add_argument("campaign_id")
+    cj = campaign_sub.add_parser("jobs")
+    cj.add_argument("campaign_id")
 
     # artifacts ------------------------------------------------------- #
     art = sub.add_parser("artifacts", help="artifact store")
@@ -306,6 +315,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker_run.add_argument("--poll", type=float, default=1.0)
     worker_run.add_argument("--lease-seconds", type=float, default=120.0)
     worker_run.add_argument("--wait-seconds", type=float, default=0.0)
+    worker_run.add_argument(
+        "--job-kind",
+        action="append",
+        default=None,
+        help="restrict this worker to a task kind (repeatable); default claims every kind",
+    )
 
     mcp = sub.add_parser("mcp", help="run the MCP stdio server")
     mcp.add_argument("--root", default="./uzen-workspace")
@@ -591,6 +606,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     distributed=args.distributed,
                     trial_timeout_seconds=args.trial_timeout,
                     poll_interval_seconds=args.poll_interval,
+                    background=args.background,
                 )
             )
         elif args.campaign_command == "show":
@@ -601,6 +617,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             _emit({"events": client.campaign_events(args.campaign_id, after=args.after)})
         elif args.campaign_command == "verify":
             _emit(client.verify_campaign_corpus(args.digest or None))
+        elif args.campaign_command == "cancel":
+            _emit(client.cancel_campaign(args.campaign_id))
+        elif args.campaign_command == "jobs":
+            _emit({"jobs": client.campaign_jobs(args.campaign_id)})
         else:
             _emit(client.replay_benchmark(args.digest))
         return 0
@@ -682,6 +702,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             lease_seconds=args.lease_seconds,
             claim_wait_seconds=args.wait_seconds,
             poll_interval=args.poll,
+            job_kinds=tuple(args.job_kind) if args.job_kind else None,
         )
         if args.once:
             _emit(daemon.run_once())

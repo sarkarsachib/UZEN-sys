@@ -9,8 +9,8 @@ artifact carries provenance and validation evidence.
                  │
         ┌────────┴─────────┐
         ▼                  ▼
-      jobs/          core/campaign (N6 local, N7 distributed trials)
- control plane       scheduler · Pareto · replay corpus
+      jobs/          core/campaign (N6 local, N7 distributed trials, N8 control)
+ control plane       scheduler · Pareto · replay corpus · cancellation
         │                  │
         └────────┬─────────┘
                  ▼
@@ -183,7 +183,7 @@ none exists it reports `NO_VALID_ALIGNMENT` rather than inventing a result.
 `LLMPlanner` optionally consults an OpenAI-compatible endpoint, but every proposed
 stage is re-validated through the same registry/scope/policy path.
 
-## Campaigns (N6/N7)
+## Campaigns (N6/N7/N8)
 
 `uzen.core.campaign` is a separate research loop over the deterministic engines. A
 seeded planner (`grid`/`random`/`evolution`) proposes architecture specs or weight
@@ -201,6 +201,16 @@ engine. It submits each proposal as a read-only `inspection` job with
 scheduler and returns metrics through the token-guarded job result. The coordinator
 waits for the batch, stores the same trials and corpus records as a local run, and
 pauses on a typed timeout. The campaign database remains local to the coordinator.
+
+N8 (`uzen.core.campaign.control`) makes a campaign run itself an N4 job with
+`options.task_kind=campaign_run`. A coordinator worker executes it through the same
+lease/token path as any other job, so the run survives a lost HTTP request or coordinator
+crash. Campaign jobs are linked in `campaign_jobs`; `CampaignEngine.cancel` sets a
+durable cancel flag, cancels the coordinator and trial jobs, and blocks new trial inserts
+at the SQLite write boundary. Late worker reports are settled as `CANCELLED`, never as
+successful results. `job_kind` is stored on job rows and can be used as a claim filter, so
+`CampaignWorker` defaults to `campaign_trial` while a coordinator claims only
+`campaign_run`.
 
 ## Control and execution planes
 
