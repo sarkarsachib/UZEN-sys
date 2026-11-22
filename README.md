@@ -29,10 +29,14 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Weight operation registry (45 registered operations) | **implemented** |
 | Arithmetic, merging (incl. TIES/DARE), decomposition (SVD/orthogonal/sparsify) | **implemented** |
 | NPA alignment: identity, Procrustes, linear map, permutation (Hungarian), basis, activation/CKA | **implemented** |
-| NASE synthesis: 24 families ordered simple→advanced (residual/gated MLP, CNN, RNN, autoencoder, Siamese, retrieval, set transformer, VAE, SSM, GNN, MoE, diffusion, multimodal, hybrid, transformer encoder, ALBERT, BERT, ViT, perceiver, seq2seq, transformer decoder), compose, substitute, bypass, truncate | **implemented** |
-| WComp compiler + WPL language (real lexer, recursive-descent parser, typed pipeline) | **implemented** |
+| NASE synthesis: 24 families ordered simple→advanced (residual/gated MLP, CNN, RNN, autoencoder, Siamese, retrieval, set transformer, VAE, SSM, GNN, MoE, diffusion, multimodal, hybrid, transformer encoder, ALBERT, BERT, ViT, perceiver, seq2seq, transformer decoder), compose, substitute, bypass, truncate; composition and graph surgery are persisted with lineage through SDK/CLI/REST/MCP | **implemented** |
+| WComp compiler + WPL language (real lexer, recursive-descent parser, typed pipeline) | **implemented** (compile-time `if`/`else`, `constraint` declarations, `expect` postconditions) |
 | VEL verification: structural, numerical, functional, regression, performance, provenance | **implemented** |
 | ANE planning, candidate generation, 6 scalar derivative-free algorithms + NSGA-II Pareto search, diagnosis | **implemented** |
+| N6 research campaigns: seeded architecture/weight-transform search, batch evaluator, resumable SQLite scheduler, Pareto reports, content-addressed replay corpus | **implemented** (in-process scheduler; inference-only proxy metrics, not task quality) |
+| N7 distributed campaign trials over the N4 worker queue: read-only trial jobs, token-guarded workers, deterministic resume and local-equivalent corpus replay | **implemented** (worker processes over a shared SQLite control plane; synchronous coordinator; no task-quality claim) |
+| N8 campaign control: durable background campaign-run jobs, cancellation propagated to linked trials, late-report refusal, and job-kind-isolated workers | **implemented** (post-N7 extension; single-host campaign state; cooperative cancellation; no task-quality claim) |
+| N9 campaign durability: atomic single-coordinator admission and lease keepalive for long-running campaign jobs | **implemented** (post-N8 extension; SQLite reservation, token-guarded renewal; still single-host) |
 | WGE / WME / WAR / MAR engines | **implemented** (built on NWPC/NASE) |
 | WIE inspection, statistics, role inference, family hypothesis | **implemented** |
 | Hugging Face / safetensors import plus weights-only PyTorch state-dict and single-file ONNX artifact import (sharded checkpoints, optional Hub download, explicit provenance and compatibility reports) | **implemented** |
@@ -44,9 +48,12 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Autoregressive text generation | **implemented** (greedy, seeded top-k/top-p sampling, beam search; cached single-token decoding for RoPE decoder graphs; EOS and context-length stopping) |
 | REST API (FastAPI), Python SDK, CLI, MCP stdio server, worker daemon | **implemented** |
 | Worker authentication: versioned HMAC envelopes, signing-key rotation, durable SQLite replay guard, scoped credentials | **implemented** |
+| Worker sandbox: process rlimits/environment scrubbing/process-group kill and a Docker isolation path | **implemented** (process sandbox verified; the Docker daemon is unreachable here, and the report says so rather than claiming container isolation) |
+| PostgreSQL job store and queue (`postgresql://` DSN, `FOR UPDATE SKIP LOCKED` claims) | **implemented** (tested against a real bundled PostgreSQL 16.2 server; not yet across physical hosts) |
+| Tenancy, scoped tokens, artifact ACLs, keyset pagination and W3C/OTLP tracing | **implemented** |
 | PyTorch runtime adapter (safe state-dict IO, inference-mode forward) | **implemented and tested with CPU-only torch 2.15; CUDA is never claimed** |
-| Torch-CPU NIR execution (all 44 operators, parity-tested against NumPy) | **implemented** |
-| GGUF v3 adapter + GGML type registry (F32/F16, Q4/Q5/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K decode, Q8_0 encode, payload-free inspection) | **implemented** |
+| Torch-CPU NIR execution (all 45 operators, parity-tested against NumPy) | **implemented** |
+| GGUF v3 adapter + GGML type registry (F32/F16, Q4/Q5/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K and IQ4_NL decode, Q8_0 encode, payload-free inspection) | **implemented** (new codecs value-compared against the reference `gguf` package; IQ2/IQ3/IQ1 remain metadata-only) |
 | ONNX interchange (export/import of the supported NIR subset) | **implemented** (requires the `onnx` extra; opset 20, `Gelu(approximate="tanh")` round trip, validated with `onnx.checker`; the Erf GELU form is refused rather than rewritten) |
 | Sparse-dispatch MoE (only routed tokens are computed per expert) | **implemented** |
 | Prometheus `/metrics` + structured JSON logging (no extra dependencies) | **implemented** |
@@ -55,9 +62,10 @@ STRICT_PLUS: no training · no fine-tuning · no backpropagation · no gradient 
 | Native graph compiler (fusion, prepacked blocked GEMM, liveness buffer planner) | **implemented**; plans fuse linear+bias+activation and residual+norm, prepack linear weights and reuse dead buffer slots, with parity tests per family |
 | Native conv/pool, RNN/LSTM/GRU, SSM, GCN, sparse-MoE and int8 quantized-linear kernels | **implemented** in the compiled plan path; seeded sampling operators are refused |
 | Native parameter representations: block int8, block int4, low-rank factors, CSR sparse and transposed layouts | **implemented** as per-weight layouts chosen at compile time, each with packed-byte, bits/weight, reconstruction-error and digest provenance; lossy layouts report their measured error instead of claiming to be exact |
-| CUDA device runtime: 17 float32 kernels, NVRTC/nvcc PTX build, driver-API launches, pooled device allocator, weight residency | **implemented and compile-verified** (NVRTC 12.4 PTX + ptxas assembly); **GPU execution not verified in the authoring environment** (no driver/device), and no speed claim is made |
-| Embedded ONNX runtime / GGUF quantized tensor types | **planned** (typed refusal, no simulation) |
-| Rust integration | **planned** |
+| CUDA device runtime: 18 float32 kernels (including batchnorm), NVRTC/nvcc PTX build, driver-API launches, pooled device allocator, weight residency | **implemented and compile-verified** (NVRTC 12.9 PTX + ptxas assembly); **GPU execution not verified in the authoring environment** (no driver/device), and no speed claim is made |
+| Embedded ONNX executor for the exported NIR subset (own protobuf decoder, no `onnxruntime`) | **implemented and parity-tested**; arbitrary third-party ONNX graphs are out of scope |
+| Rust kernel runtime (`cdylib` crate, ctypes bindings) | **implemented and built with `cargo build --release`**; parity-tested against NumPy, not wired into the default executor |
+| Remaining GGUF IQ codecs (IQ2_XXS/IQ2_XS/IQ3_XXS/IQ3_S/IQ1_S) | **planned** (inspected and refused by name, never simulated) |
 | S3-compatible object-store artifact transport | **implemented** (stdlib SigV4 client, streamed single/multipart uploads, SHA-256 and tensor-fingerprint verification, parent lineage and tokenizer sidecars; validated against a real S3-compatible server) |
 | LLM-assisted planning | **implemented when an OpenAI-compatible endpoint is configured** |
 
@@ -67,8 +75,11 @@ CUDA acceleration that does not exist.
 
 ### Computational-substrate phase plan
 
-The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N5
-are implemented at their stated level; N6 is a design, not a partially working claim.
+The master roadmap's Phase 6 is split into six phases with explicit gates. N1–N6
+are implemented at their stated level; N6 is the local campaign engine, N7 adds
+distributed campaign trials over the N4 queue, N8 adds durable background runs,
+cancellation and job-kind isolation, and N9 hardens admission and long-run leases. None
+is a training or task-quality-optimization system.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -76,12 +87,19 @@ are implemented at their stated level; N6 is a design, not a partially working c
 | **N2** | Native graph compiler, fusion, prepacking, blocked GEMM, conv/RNN/SSM/GCN/MoE/int8 kernels, single-pass attention, memory planner | **implemented** |
 | **N3** | Advanced parameter representations: block int8/int4 with group scales, low-rank factors, CSR sparse and transposed layouts, representation-aware execution | **implemented** |
 | **N4** | Durable distributed queue/scheduler, capability-aware worker routing, priority and aging, leases with expiry, backoff and attempts, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
-| **N5** | CUDA kernels and a device boundary: 17 real kernels, NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
-| **N6** | Large-scale autonomous research campaigns on the deterministic engines | planned |
+| **N5** | CUDA kernels and a device boundary: 18 real kernels (including batchnorm), NVRTC/nvcc PTX build, driver-API launches, pooled allocator, resident weights, explicit CPU fallback | **implemented** (CUDA; PTX and `ptxas` assembly verified, GPU execution not verified here; HIP not implemented) |
+| **N6** | Large-scale autonomous research campaigns on the deterministic engines: seeded architecture/parameter search, batch scheduler, Pareto reporting, replayable benchmark corpus | **implemented** (in-process scheduler; no training and no task-quality claim) |
+| **N7** | Distributed campaign trials over the N4 worker queue: read-only trial jobs, capability/lease-guarded execution, deterministic resume, local-equivalent corpus replay | **implemented** (post-P6 extension; shared SQLite control plane and a synchronous coordinator) |
+| **N8** | Campaign control: durable background campaign-run jobs, cancellation propagated to coordinator/trial jobs, late-report refusal, and job-kind-isolated workers | **implemented** (post-P6 extension; single-host campaign state, cooperative cancellation) |
+| **N9** | Campaign run durability: atomic single-coordinator admission and token-guarded lease keepalive for long campaign jobs | **implemented** (post-P6 extension; SQLite reservation, single-host campaign state) |
 
 See [docs/N5_CUDA.md](docs/N5_CUDA.md) for the CUDA kernels, build, fallback policy and
-limitations, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for coverage, build instructions, verified
-measurements and limitations.
+limitations, [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) for campaign specs, determinism,
+corpus replay and limits, [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md)
+for distributed trial execution, [docs/N8_CAMPAIGN_CONTROL.md](docs/N8_CAMPAIGN_CONTROL.md)
+for background campaigns and cancellation, [docs/N9_CAMPAIGN_DURABILITY.md](docs/N9_CAMPAIGN_DURABILITY.md)
+for admission and lease keepalive, and [docs/P6_NATIVE.md](docs/P6_NATIVE.md) for
+coverage, build instructions, verified measurements and limitations.
 
 ---
 
@@ -145,9 +163,18 @@ uzen quantize <source_id> --scheme int8
 uzen compare-models <source_id> <candidate_id> --tokens '[[0,1,2,3]]'
 uzen compare-quantized <source_id> <quantized_id> --tokens '[[0,1,2,3]]'
 uzen evaluate <artifact_id> --family mlp --spec '{"input_dim":8,"hidden_dims":[16],"output_dim":4}'
+uzen architecture compose <id_a> <id_b> --mode sequential
+uzen architecture edit <artifact_id> --operation truncate --keep-layers 1
+uzen campaign run --spec-file campaign.json
+uzen campaign run --spec-file campaign.json --distributed --trial-timeout 120
+uzen campaign run --spec-file campaign.json --distributed --background
+uzen campaign cancel <campaign_id>
+uzen campaign jobs <campaign_id>
+uzen campaign verify
 uzen serve --host 0.0.0.0 --port 8080
 uzen mcp --root ./uzen-workspace
 uzen worker run --root ./uzen-worker
+uzen worker run --root ./uzen-worker --job-kind campaign_trial
 ```
 
 ## Real-model demo: int8 release candidate
@@ -310,11 +337,13 @@ curl -s -X POST localhost:8080/v1/jobs -H 'content-type: application/json' \
 ## MCP
 
 `uzen mcp` speaks JSON-RPC 2.0 over stdio (newline or `Content-Length` framing) and
-exposes deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
-`uzen.generate_weights`, `uzen.evaluate_candidate`, `uzen.inspect_provenance`, and
-others. Each tool enforces task scope and STRICT_PLUS; an AI client cannot widen scope
-or request a prohibited effect. A `tools/call` with `params._meta.progressToken` emits
-real JSON-RPC `notifications/progress` messages during import, incrementing per stage.
+exposes 28 deliberate tools — `uzen.inspect_model`, `uzen.modify_weights`,
+`uzen.generate_weights`, `uzen.compose_architectures`, `uzen.run_campaign`,
+`uzen.cancel_campaign`, `uzen.campaign_jobs`, `uzen.verify_campaign_corpus`,
+`uzen.inspect_provenance`, and others. Each tool enforces
+task scope and STRICT_PLUS; an AI client cannot widen scope or request a prohibited
+effect. A `tools/call` with `params._meta.progressToken` emits real JSON-RPC
+`notifications/progress` messages during import, incrementing per stage.
 
 ## The two engineering domains
 
@@ -342,7 +371,10 @@ uzen/
 │   ├── wie/      # weight intelligence / inspection
 │   ├── nwpc/     # operation registry, operation context
 │   ├── npa/      # neural parameter alignment
-│   ├── nase/     # architecture synthesis
+│   ├── nase/     # architecture synthesis and graph surgery
+│   ├── campaign/ # N6 planners, evaluator, SQLite store, benchmark corpus,
+│   │             # N7 distributed trials, N8 background/cancel control,
+│   │             # N9 admission and lease keepalive
 │   ├── wcomp/    # compiler, pipeline, execution plan
 │   ├── vel/      # verification & evaluation lab
 │   └── ane/      # autonomous neural engineer, search, planning, LLM bridge
@@ -366,6 +398,10 @@ uzen/
 * [docs/P1_IMPORT.md](docs/P1_IMPORT.md) — Hugging Face/safetensors import and compatibility report.
 * [docs/P2_MODEL_EXECUTION.md](docs/P2_MODEL_EXECUTION.md) — stored-model execution and modified-model comparison.
 * [docs/P6_NATIVE.md](docs/P6_NATIVE.md) — native CPU kernels, phase plan and measured limits.
+* [docs/N6_CAMPAIGNS.md](docs/N6_CAMPAIGNS.md) — campaign specs, determinism, corpus replay and limits.
+* [docs/N7_DISTRIBUTED_CAMPAIGNS.md](docs/N7_DISTRIBUTED_CAMPAIGNS.md) — N4-backed trial execution, worker protocol and limits.
+* [docs/N8_CAMPAIGN_CONTROL.md](docs/N8_CAMPAIGN_CONTROL.md) — background campaign jobs, cancellation propagation and job-kind isolation.
+* [docs/N9_CAMPAIGN_DURABILITY.md](docs/N9_CAMPAIGN_DURABILITY.md) — single-coordinator admission and lease keepalive.
 
 ## Tests
 

@@ -14,6 +14,7 @@ provenance and verification evidence.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -22,6 +23,7 @@ import numpy as np
 from uzen.core.ane.planner import ANEResult, AutonomousNeuralEngineer, JobRequest
 from uzen.core.nase.synth import ArchitectureSynthesizer
 from uzen.core.nir.executor import execute
+from uzen.core.nir.graph import Graph, GraphValidationError
 from uzen.core.nws.families import build_architecture
 from uzen.core.nws.store import ArtifactRecord, ArtifactStore
 from uzen.core.nws.tensors import WeightPackage
@@ -51,10 +53,97 @@ from uzen.errors import (
     UnsupportedFormat,
     UzenError,
 )
+from uzen.infrastructure.observability.tracing import TRACER
+from uzen.infrastructure.pagination import clamp_limit, decode_cursor, page_payload
+from uzen.infrastructure.security.access import (
+    current_project,
+    project_filter,
+    require_project_access,
+)
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
 from uzen.jobs.scheduling import requirements_from_request
 from uzen.policies.strict_plus.engine import StrictPlusEngine, default_engine
 from uzen.util.canonical import sha256_file, utc_now_iso
+
+
+def _traced_execution(method: Any) -> Any:
+    """Record one span per executed job (parented to the request span when present)."""
+
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self: "JobService", job_id: str, request: JobRequest) -> dict[str, Any]:
+        attributes = {
+            "uzen.job.id": job_id,
+            "uzen.job.task_scope": request.task_scope.value,
+            "uzen.job.kind": str(request.options.get("task_kind") or "engineering"),
+            "uzen.job.operations": len(request.operations),
+        }
+        with TRACER.span("uzen.job.execute", attributes=attributes) as span:
+            try:
+                result = method(self, job_id, request)
+            except Exception as exc:
+                span.set_attribute("uzen.job.outcome", "failed")
+                raise exc
+            span.set_attribute("uzen.job.outcome", "completed")
+            return result
+
+    return wrapper
+
+
+class _LeaseRenewer:
+    """Keep a leased execution's claim alive while its work runs.
+
+    A campaign coordinator can execute for longer than its initial lease. Without a
+    renewer the reaper would return the job to the queue and another worker could run
+    it concurrently with the still-live coordinator. Renewal is guarded by the same
+    dispatch token, so a lease that was already lost cannot be taken back.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        job_id: str,
+        worker_id: str,
+        token: str,
+        lease_seconds: float,
+    ) -> None:
+        self.db = db
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.token = token
+        self.lease_seconds = float(lease_seconds)
+        # Three renewals per lease leaves room for scheduling and SQLite contention.
+        self.interval = max(0.02, min(self.lease_seconds / 3.0, 30.0))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"uzen-lease-{job_id[:8]}", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.interval * 2.0))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = self.db.renew_lease(
+                    self.job_id,
+                    self.worker_id,
+                    lease_seconds=self.lease_seconds,
+                    token=self.token,
+                )
+            except Exception:
+                # A transient database failure must not take down the job thread; the
+                # next tick retries while the existing lease may still be valid.
+                continue
+            if not renewed:
+                # The lease was reaped or replaced. The worker keeps its local result
+                # fence: settlement checks the token and cannot publish over a winner.
+                return
 
 
 class JobService:
@@ -69,7 +158,11 @@ class JobService:
         self.root.mkdir(parents=True, exist_ok=True)
         self.engine = engine or default_engine()
         self.store = ArtifactStore(self.root / "artifacts")
-        self.db = Database(db_path or (self.root / "uzen.sqlite3"))
+        # A postgresql:// location selects the multi-host store; anything else is the
+        # single-node SQLite database (see uzen.infrastructure.storage.factory).
+        from uzen.infrastructure.storage.factory import open_database
+
+        self.db = open_database(db_path or (self.root / "uzen.sqlite3"))
         self.ane = AutonomousNeuralEngineer(engine=self.engine)
         self.wie = WeightIntelligenceEngine()
         self.wme = WeightModificationEngine(engine=self.engine)
@@ -716,44 +809,67 @@ class JobService:
     # jobs
     # ------------------------------------------------------------------ #
 
-    def submit(self, request: Mapping[str, Any], *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        request: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        job_id: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         job_request = JobRequest.from_dict(request)
         if job_request.policy != "STRICT_PLUS":
             raise InvalidOperationParameters("only STRICT_PLUS jobs are accepted")
-        # Reject unregistered / out-of-scope / malformed operations at submission, so a
-        # job never enters the queue carrying work the engine cannot legally perform.
-        from uzen.core.nwpc.registry import default_registry
-        from uzen.errors import OperationUnavailable
+        # Campaign trial jobs are a read-only task kind, not a registered engineering
+        # operation. Validate their closed payload before they enter the queue.
+        task_kind = job_request.options.get("task_kind")
+        campaign_trial = task_kind == "campaign_trial"
+        campaign_run = task_kind == "campaign_run"
+        if campaign_trial:
+            from uzen.core.campaign.distributed import validate_campaign_trial_request
 
-        registry = default_registry()
-        for index, entry in enumerate(job_request.operations):
-            if not isinstance(entry, Mapping):
-                raise InvalidOperationParameters(f"operation #{index} must be an object")
-            code = str(entry.get("op") or entry.get("code") or "")
-            if not code:
-                raise InvalidOperationParameters(f"operation #{index} has no 'op' code")
-            spec = registry.get(code)
-            if not spec.maturity.executable:
-                raise OperationUnavailable(
-                    f"operation '{code}' is '{spec.maturity.value}' and cannot be executed",
-                    operation=code,
-                )
-            if job_request.task_scope not in spec.scopes:
-                raise OperationUnavailable(
-                    f"operation '{code}' is not authorized in scope '{job_request.task_scope.value}'",
-                    operation=code,
-                    scope=job_request.task_scope.value,
-                )
-            spec.validate_params(dict(entry.get("params") or {}))
+            validate_campaign_trial_request(request)
+        elif campaign_run:
+            from uzen.core.campaign.control import validate_campaign_run_request
+
+            validate_campaign_run_request(request)
+        else:
+            # Reject unregistered / out-of-scope / malformed operations at submission, so a
+            # job never enters the queue carrying work the engine cannot legally perform.
+            from uzen.core.nwpc.registry import default_registry
+            from uzen.errors import OperationUnavailable
+
+            registry = default_registry()
+            for index, entry in enumerate(job_request.operations):
+                if not isinstance(entry, Mapping):
+                    raise InvalidOperationParameters(f"operation #{index} must be an object")
+                code = str(entry.get("op") or entry.get("code") or "")
+                if not code:
+                    raise InvalidOperationParameters(f"operation #{index} has no 'op' code")
+                spec = registry.get(code)
+                if not spec.maturity.executable:
+                    raise OperationUnavailable(
+                        f"operation '{code}' is '{spec.maturity.value}' and cannot be executed",
+                        operation=code,
+                    )
+                if job_request.task_scope not in spec.scopes:
+                    raise OperationUnavailable(
+                        f"operation '{code}' is not authorized in scope '{job_request.task_scope.value}'",
+                        operation=code,
+                        scope=job_request.task_scope.value,
+                    )
+                spec.validate_params(dict(entry.get("params") or {}))
         # The capability requirement set is derived from the request itself and stored
         # with the job, so dispatch can decide eligibility inside the claiming statement
         # without re-parsing the request (and without trusting the worker's word).
         requirements = requirements_from_request(request)
         row = self.db.create_job(
             request,
+            job_id=job_id,
             idempotency_key=idempotency_key,
             requirements=requirements,
             priority=int(request.get("priority") or 0),
+            project_id=project_id or current_project(),
         )
         self.db.append_event(
             row.id,
@@ -767,22 +883,61 @@ class JobService:
         return row.to_dict()
 
     def get(self, job_id: str) -> dict[str, Any]:
-        return self.db.get_job(job_id).to_dict()
+        row = self.db.get_job(job_id)
+        require_project_access(row.project_id)
+        return row.to_dict()
 
-    def list(self, *, state: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        return [r.to_dict() for r in self.db.list_jobs(state=state, limit=limit)]
+    def list(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.list_page(
+            state=state, limit=limit, cursor=cursor, project_id=project_id
+        )["jobs"]
+
+    def list_page(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One cursor page of jobs plus ``next_cursor``/``has_more``."""
+        size = clamp_limit(limit)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "id"))
+            before = (key["created_at"], key["id"])
+        rows = self.db.list_jobs(
+            state=state,
+            project_id=project_filter(project_id),
+            before=before,
+            limit=size + 1,
+        )
+        return page_payload(
+            [row.to_dict() for row in rows],
+            limit=size,
+            cursor_of=lambda job: {"created_at": job["created_at"], "id": job["id"]},
+            key="jobs",
+        )
 
     def events(self, job_id: str, *, after: int = 0) -> list[dict[str, Any]]:
+        require_project_access(self.db.project_of_job(job_id))
         return self.db.events(job_id, after=after)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
+        require_project_access(self.db.project_of_job(job_id))
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
             return row.to_dict()
-        self.db.request_cancel(job_id)
-        if row.state in ("QUEUED", "CREATED"):
-            self.db.transition(job_id, "CANCELLED", payload={"reason": "cancelled before execution"})
-        return self.db.get_job(job_id).to_dict()
+        # ``request_cancel`` atomically makes a queued job terminal and flags a leased
+        # one, so there is no separate read-then-transition window here.
+        return self.db.request_cancel(job_id).to_dict()
 
     # ------------------------------------------------------------------ #
 
@@ -792,14 +947,19 @@ class JobService:
         *,
         worker_id: str | None = None,
         token: str | None = None,
+        lease_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Execute a job, either as the control plane or as a worker holding a lease.
 
         A leased execution (``worker_id`` and ``token`` supplied) settles the job through
         :meth:`Database.finish_from_worker`, so the dispatch record, the attempt number and
         the idempotency guard are the same ones a remote worker goes through. A local
-        execution settles it directly. Either way the caller never declares success: the
+        execution settles it directly.         Either way the caller never declares success: the
         state comes from the executed work or from the recorded error.
+
+        ``lease_seconds`` enables a keepalive for a leased execution. The worker daemon
+        renews its own lease while it runs; an in-process coordinator uses this argument
+        so a long campaign does not lose its claim mid-execution.
         """
         row = self.db.get_job(job_id)
         if row.state in TERMINAL_STATES:
@@ -812,10 +972,36 @@ class JobService:
                 current_worker=row.worker_id,
             )
         if self.db.is_cancel_requested(job_id):
-            self.db.transition(job_id, "CANCELLED", payload={"reason": "cancel requested"})
-            return self.db.get_job(job_id).to_dict()
-        self.db.transition(job_id, "RUNNING", progress=0.05)
+            return self._settle_cancelled(job_id, worker_id, token)
+        try:
+            self.db.transition(job_id, "RUNNING", progress=0.05)
+        except JobStateError:
+            if self.db.is_cancel_requested(job_id):
+                return self._settle_cancelled(job_id, worker_id, token)
+            raise
         request = JobRequest.from_dict(row.request)
+        renewer = (
+            _LeaseRenewer(self.db, job_id, worker_id, token, float(lease_seconds))
+            if leased and lease_seconds is not None and float(lease_seconds) > 0
+            else None
+        )
+        if renewer is not None:
+            renewer.start()
+        try:
+            return self._serve_claimed(job_id, request, worker_id, token, leased)
+        finally:
+            if renewer is not None:
+                renewer.stop()
+
+    def _serve_claimed(
+        self,
+        job_id: str,
+        request: JobRequest,
+        worker_id: str | None,
+        token: str | None,
+        leased: bool,
+    ) -> dict[str, Any]:
+        """Execute and settle a job whose RUNNING transition has already won."""
         try:
             result = self._execute(job_id, request)
             if isinstance(result, dict) and "artifact_id" in result:
@@ -838,7 +1024,26 @@ class JobService:
                 token,
             )
             return self.db.get_job(job_id).to_dict()
-        self.db.transition(job_id, "VALIDATING", progress=0.9)
+        campaign_cancelled = (
+            isinstance(result, Mapping)
+            and result.get("task_kind") == "campaign_run"
+            and result.get("status") == "cancelled"
+        )
+        if self.db.is_cancel_requested(job_id) or campaign_cancelled:
+            # A cancellation can arrive while the work is executing. Its result is not
+            # published; the dispatch record is settled as cancelled instead. A campaign
+            # run that observed the durable campaign flag is also settled as cancelled,
+            # even if the coordinator job's own flag arrived a moment later.
+            return self._settle_cancelled(
+                job_id, worker_id, token, result={"cancelled": True}
+            )
+        try:
+            self.db.transition(job_id, "VALIDATING", progress=0.9)
+        except JobStateError:
+            # Cancellation won the race between the flag check and this transition.
+            if self.db.is_cancel_requested(job_id):
+                return self._settle_cancelled(job_id, worker_id, token)
+            raise
         if leased:
             assert worker_id is not None and token is not None
             self.db.finish_from_worker(
@@ -846,6 +1051,33 @@ class JobService:
             )
         else:
             self.db.set_result(job_id, result)
+            self.db.release_lease(job_id)
+        return self.db.get_job(job_id).to_dict()
+
+    def _settle_cancelled(
+        self,
+        job_id: str,
+        worker_id: str | None,
+        token: str | None,
+        *,
+        result: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close a cancellation that raced with the run state machine."""
+        if worker_id is not None and token is not None:
+            self.db.finish_from_worker(
+                job_id,
+                worker_id=worker_id,
+                token=token,
+                state="CANCELLED",
+                result=result,
+            )
+        else:
+            self.db.transition(
+                job_id,
+                "CANCELLED",
+                payload={"reason": "cancel requested"},
+                progress=0.9,
+            )
             self.db.release_lease(job_id)
         return self.db.get_job(job_id).to_dict()
 
@@ -876,7 +1108,13 @@ class JobService:
 
     # ------------------------------------------------------------------ #
 
+    @_traced_execution
     def _execute(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        task_kind = request.options.get("task_kind")
+        if task_kind == "campaign_trial":
+            return self._execute_campaign_trial(job_id, request)
+        if task_kind == "campaign_run":
+            return self._execute_campaign_run(job_id, request)
         scope = request.task_scope
         if scope.value in ("model_architecture_research", "architecture_synthesis", "model_creation"):
             return self._execute_architecture(job_id, request)
@@ -885,11 +1123,25 @@ class JobService:
 
         packages = self._resolve_inputs(request)
         target, reference, graph, graph_inputs = self._resolve_context(request, packages)
+        planner = request.options.get("planner")
+        if planner not in (None, "deterministic", "llm"):
+            raise InvalidOperationParameters(
+                "options.planner must be 'deterministic', 'llm', or omitted"
+            )
         self.db.append_event(
             job_id,
             "planning",
-            {"objective": request.objective, "inputs": list(packages)},
+            {
+                "objective": request.objective,
+                "inputs": list(packages),
+                "planner": planner or "deterministic",
+            },
         )
+        engineering_plan = None
+        if planner == "llm":
+            from uzen.core.ane.llm import LLMPlanner
+
+            engineering_plan = LLMPlanner(engine=self.engine).propose(request, list(packages))
         result: ANEResult = self.ane.execute(
             request,
             packages,
@@ -898,6 +1150,7 @@ class JobService:
             graph_inputs=graph_inputs,
             reference=reference,
             job_id=job_id,
+            plan=engineering_plan,
         )
         self.db.set_plan(job_id, result.plan.to_dict())
         self.db.append_event(
@@ -962,6 +1215,76 @@ class JobService:
             "policy": result.policy,
             "trace": result.trace,
             "output_format": request.output_format,
+        }
+
+    def _execute_campaign_trial(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        from uzen.core.campaign.distributed import (
+            campaign_trial_outcome,
+            validate_campaign_trial_request,
+        )
+
+        spec, candidate = validate_campaign_trial_request(request.to_dict())
+        outcome = campaign_trial_outcome(spec, candidate)
+        self.db.append_event(
+            job_id,
+            "campaign_trial",
+            {
+                "campaign_id": spec.candidate_id,
+                "candidate_digest": candidate.digest,
+                "status": outcome["status"],
+            },
+        )
+        return {
+            "task_kind": "campaign_trial",
+            "campaign_id": spec.candidate_id,
+            "candidate_digest": candidate.digest,
+            "trial": outcome,
+        }
+
+    def _execute_campaign_run(self, job_id: str, request: JobRequest) -> dict[str, Any]:
+        from uzen.core.campaign import CampaignEngine, DistributedTrialExecutor
+        from uzen.core.campaign.control import validate_campaign_run_request
+
+        spec, options = validate_campaign_run_request(request.to_dict())
+
+        def stop_requested() -> bool:
+            return self.db.is_cancel_requested(job_id)
+
+        executor = None
+        if options["distributed"]:
+            executor = DistributedTrialExecutor(
+                self,
+                timeout_seconds=float(options["trial_timeout_seconds"]),
+                poll_interval_seconds=float(options["poll_interval_seconds"]),
+                should_stop=stop_requested,
+            )
+        engine = CampaignEngine(
+            self.root,
+            trial_executor=executor,
+            job_service=self,
+        )
+        report = engine.run(
+            spec,
+            resume=bool(options["resume"]),
+            max_rounds=options["max_rounds"],
+            stop_requested=stop_requested,
+        )
+        self.db.append_event(
+            job_id,
+            "campaign_run",
+            {
+                "campaign_id": report.campaign_id,
+                "status": report.status,
+                "stop_reason": report.stop_reason,
+                "trials": len(report.trials),
+            },
+        )
+        return {
+            "task_kind": "campaign_run",
+            "campaign_id": report.campaign_id,
+            "status": report.status,
+            "stop_reason": report.stop_reason,
+            "report": report.to_dict(),
         }
 
     # ------------------------------------------------------------------ #
@@ -1055,6 +1378,190 @@ class JobService:
             ],
         }
 
+    # ------------------------------------------------------------------ #
+    # architecture engineering (NASE)
+    # ------------------------------------------------------------------ #
+
+    def _definition_from_artifact(
+        self, artifact_id: str
+    ) -> tuple[Any, WeightPackage, dict[str, Any]]:
+        manifest = self.artifact_manifest(artifact_id)
+        graph_doc = (manifest.get("metadata") or {}).get("graph")
+        if not graph_doc:
+            raise InvalidOperationParameters(
+                f"artifact '{artifact_id}' has no stored NIR graph; only synthesized "
+                "architectures can be edited"
+            )
+        package = self.get_package(artifact_id)
+        architecture = (manifest.get("metadata") or {}).get("architecture") or {}
+        definition = self.nase.from_graph(
+            Graph.from_dict(graph_doc),
+            parameter_shapes={entry["name"]: entry["shape"] for entry in manifest["tensors"]},
+            family=str(manifest.get("family", "custom")),
+            spec=architecture.get("spec") if isinstance(architecture, Mapping) else None,
+        )
+        return definition, package, manifest
+
+    def _architecture_inputs(self, graph: Graph, *, batch: int = 2, seq: int = 8) -> dict[str, np.ndarray]:
+        inputs: dict[str, np.ndarray] = {}
+        for name, spec in graph.inputs.items():
+            shape = tuple(
+                batch if dim == "B" else seq if isinstance(dim, str) else int(dim)
+                for dim in spec.shape
+            )
+            inputs[name] = np.zeros(shape, dtype=spec.dtype)
+        return inputs
+
+    def _persist_architecture(
+        self,
+        definition: Any,
+        package: WeightPackage,
+        *,
+        operation: str,
+        parents: list[str],
+        note: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        inputs = self._architecture_inputs(definition.graph)
+        result = execute(definition.graph, inputs, package)
+        verification = verify(
+            package,
+            graph=definition.graph,
+            inputs=inputs,
+            policy_records=[],
+            operations=[],
+        )
+        record = self.store.put(
+            package,
+            operation=operation,
+            parents=parents,
+            reuse_existing=True,
+            metadata={
+                "architecture": definition.summary(),
+                "graph": definition.graph.to_dict(),
+                **(dict(extra or {})),
+            },
+            validation=verification.to_dict(),
+            note=note,
+        )
+        self.db.index_artifact(
+            artifact_id=record.artifact_id,
+            path=str(record.path),
+            name=package.name,
+            family=package.family,
+            operation=operation,
+            numel=package.numel(),
+            num_tensors=len(package),
+        )
+        self.db.register_model(
+            artifact_id=record.artifact_id,
+            family=package.family,
+            spec={**definition.spec, "graph": definition.graph.to_dict()},
+        )
+        return {
+            "artifact_id": record.artifact_id,
+            "architecture": definition.summary(),
+            "forward_outputs": {key: list(value.shape) for key, value in result.outputs.items()},
+            "verification": verification.to_dict(),
+        }
+
+    def edit_architecture(
+        self,
+        artifact_id: str,
+        operation: str,
+        *,
+        node_id: str | None = None,
+        keep_layers: int | None = None,
+        new_op: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        port: str = "a",
+    ) -> dict[str, Any]:
+        """Apply NASE graph surgery to a stored architecture and persist the result.
+
+        Bypass and truncation preserve the surviving tensors exactly; substitution is
+        persisted only when the replacement operator binds the existing parameter
+        names. A structure that would need new random weights is refused rather than
+        silently initialising them.
+        """
+        definition, package, _manifest = self._definition_from_artifact(artifact_id)
+        if operation == "bypass":
+            if not node_id:
+                raise InvalidOperationParameters("bypass requires node_id")
+            report = self.nase.bypass(definition, node_id, port=port)
+        elif operation == "truncate":
+            if keep_layers is None:
+                raise InvalidOperationParameters("truncate requires keep_layers")
+            report = self.nase.truncate_layers(definition, int(keep_layers))
+        elif operation == "substitute":
+            if not node_id or not new_op:
+                raise InvalidOperationParameters("substitute requires node_id and new_op")
+            report = self.nase.substitute(definition, node_id, new_op, params)
+        else:
+            raise InvalidOperationParameters(
+                f"unknown architecture operation '{operation}'; use bypass|truncate|substitute"
+            )
+        definition = report.definition
+        definition.graph.require_valid()
+        surviving = package.without(report.invalidated_parameters)
+        validation = definition.graph.validate(surviving)
+        if not validation.ok:
+            raise GraphValidationError(
+                "architecture edit does not bind the surviving parameters; regenerate "
+                "weights instead of silently replacing them",
+                errors=validation.errors[:10],
+                warnings=report.warnings,
+            )
+        persisted = self._persist_architecture(
+            definition,
+            surviving,
+            operation=f"architecture_{operation}",
+            parents=[artifact_id],
+            note=f"NASE {operation}",
+            extra={"changes": report.changes, "warnings": report.warnings},
+        )
+        return {
+            **persisted,
+            "changes": report.changes,
+            "invalidated_parameters": report.invalidated_parameters,
+            "warnings": report.warnings,
+        }
+
+    def compose_architectures(
+        self,
+        artifact_ids: Sequence[str],
+        *,
+        mode: str = "sequential",
+        name: str | None = None,
+        seed: int | str | None = 0,
+    ) -> dict[str, Any]:
+        if len(artifact_ids) < 2:
+            raise InvalidOperationParameters("composition requires at least two artifacts")
+        definitions = []
+        for artifact_id in artifact_ids:
+            definition, _package, _manifest = self._definition_from_artifact(artifact_id)
+            definitions.append(definition)
+        composed = self.nase.compose(definitions, mode=mode, name=name)
+        package = composed.build_package(seed=seed, name=name or "composed")
+        composed.graph.require_valid(package)
+        persisted = self._persist_architecture(
+            composed,
+            package,
+            operation="architecture_compose",
+            parents=list(artifact_ids),
+            note=f"NASE {mode} composition",
+            extra={"composition": mode},
+        )
+        return {
+            **persisted,
+            "components": list(artifact_ids),
+            "composition": mode,
+            "notes": [
+                "component parameters are not transplanted by composition; the new "
+                "graph is initialised with labelled structured random weights",
+                "the source artifacts remain unchanged and appear as lineage parents",
+            ],
+        }
+
     def _execute_architecture(self, job_id: str, request: JobRequest) -> dict[str, Any]:
         options = request.options
         if "family" in options:
@@ -1137,8 +1644,39 @@ class JobService:
     # read APIs
     # ------------------------------------------------------------------ #
 
-    def artifacts(self, limit: int = 100) -> list[dict[str, Any]]:
-        return self.db.artifacts(limit=limit)
+    def artifacts(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.artifacts_page(limit=limit, cursor=cursor, project_id=project_id)["artifacts"]
+
+    def artifacts_page(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        size = clamp_limit(limit, default=100)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "artifact_id"))
+            before = (key["created_at"], key["artifact_id"])
+        rows = self.db.artifacts(
+            limit=size + 1, project_id=project_filter(project_id), before=before
+        )
+        return page_payload(
+            rows,
+            limit=size,
+            cursor_of=lambda row: {
+                "created_at": row["created_at"],
+                "artifact_id": row["artifact_id"],
+            },
+            key="artifacts",
+        )
 
     def artifact_manifest(self, artifact_id: str) -> dict[str, Any]:
         return self.store.manifest(artifact_id).to_dict()
@@ -1146,8 +1684,36 @@ class JobService:
     def verify_artifact(self, artifact_id: str) -> dict[str, Any]:
         return self.store.verify(artifact_id)
 
-    def models(self, limit: int = 100) -> list[dict[str, Any]]:
-        return self.db.models(limit=limit)
+    def models(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.models_page(limit=limit, cursor=cursor, project_id=project_id)["models"]
+
+    def models_page(
+        self,
+        limit: int = 100,
+        *,
+        cursor: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        size = clamp_limit(limit, default=100)
+        before = None
+        if cursor:
+            key = decode_cursor(cursor, keys=("created_at", "model_id"))
+            before = (key["created_at"], key["model_id"])
+        rows = self.db.models(
+            limit=size + 1, project_id=project_filter(project_id), before=before
+        )
+        return page_payload(
+            rows,
+            limit=size,
+            cursor_of=lambda row: {"created_at": row["created_at"], "model_id": row["model_id"]},
+            key="models",
+        )
 
     def stats(self) -> dict[str, Any]:
         return {"store": self.store.stats(), "database": self.db.stats()}

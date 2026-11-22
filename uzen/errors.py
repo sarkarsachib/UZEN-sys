@@ -137,6 +137,34 @@ class CudaKernelError(UzenError):
     http_status = 500
 
 
+class CampaignConflict(UzenError):
+    """A campaign id was reused with a different specification."""
+
+    code = "campaign.conflict"
+    http_status = 409
+
+
+class CampaignNotFound(UzenError):
+    """No campaign with the requested id exists in this workspace."""
+
+    code = "campaign.not_found"
+    http_status = 404
+
+
+class CampaignTimeout(UzenError):
+    """A distributed campaign batch did not settle before its deadline."""
+
+    code = "campaign.timeout"
+    http_status = 504
+
+
+class CampaignCancelled(UzenError):
+    """A campaign was cancelled before it could finish."""
+
+    code = "campaign.cancelled"
+    http_status = 409
+
+
 class UnsupportedFormat(UzenError):
     code = "format.unsupported"
     http_status = 415
@@ -165,6 +193,27 @@ class ValidationFailed(UzenError):
 class BudgetExhausted(UzenError):
     code = "ane.budget_exhausted"
     http_status = 429
+
+
+class AuthenticationRequired(UzenError):
+    """No valid bearer token accompanied a request that requires one."""
+
+    code = "auth.required"
+    http_status = 401
+
+
+class AuthorizationDenied(UzenError):
+    """The caller is authenticated but not allowed to touch this resource."""
+
+    code = "auth.denied"
+    http_status = 403
+
+
+class InvalidCursor(UzenError):
+    """A pagination cursor or page size is malformed."""
+
+    code = "pagination.invalid_cursor"
+    http_status = 400
 
 
 class WorkerAuthError(UzenError):

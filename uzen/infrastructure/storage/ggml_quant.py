@@ -5,11 +5,14 @@ block geometry and effective bits per weight; dequantization and quantization ar
 *separately registered* kernels. A type can therefore be inspected and reported as
 metadata-only without any risk of being silently decoded by a guessed layout.
 
-Implemented codecs here: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K and Q8_K
-(decode), Q8_0 (encode). Remaining K-quant and IQ types are registered with their
-real geometry but no codec until an exact, version-matched implementation is added;
-``dequantize`` then raises :class:`UnsupportedFormat` naming the type instead of
-returning fabricated values.
+Implemented codecs here: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
+and Q8_K (decode), Q8_0 (encode), plus IQ4_NL (decode). The remaining IQ types need
+their published grid/lookup tables and are still metadata-only: ``dequantize`` raises
+:class:`UnsupportedFormat` naming the type instead of returning fabricated values.
+
+The K-quant decoders follow the GGML block layouts (super-block sizes, 6-bit
+scale/min packing, high-bit masks) and are verified against the reference ``gguf``
+implementation on randomised blocks in ``tests/test_gguf_codecs.py``.
 
 Third-party codecs can be added with :func:`register_decoder` / :func:`register_encoder`.
 """
@@ -318,6 +321,95 @@ def decode_q8_k(raw: bytes, element_count: int) -> np.ndarray:
     return (d[:, None] * qs).reshape(-1)
 
 
+def decode_q2_k(raw: bytes, element_count: int) -> np.ndarray:
+    """Q2_K super-blocks: 16 sub-blocks of 16, 4-bit (2+2) scales/mins, 2-bit quants."""
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 84)
+    scales = blocks[:, 0:16]
+    qs = blocks[:, 16:80]
+    d = blocks[:, 80:82].copy().view("<f2").reshape(-1).astype(np.float32)
+    dmin = blocks[:, 82:84].copy().view("<f2").reshape(-1).astype(np.float32)
+    out = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    for half in range(2):
+        q = qs[:, 32 * half : 32 * half + 32].astype(np.uint16)
+        for j in range(4):
+            shift = 2 * j
+            sc1 = scales[:, 8 * half + 2 * j]
+            sc2 = scales[:, 8 * half + 2 * j + 1]
+            dl1 = d * (sc1 & 0x0F).astype(np.float32)
+            ml1 = dmin * (sc1 >> 4).astype(np.float32)
+            dl2 = d * (sc2 & 0x0F).astype(np.float32)
+            ml2 = dmin * (sc2 >> 4).astype(np.float32)
+            base = 128 * half + 32 * j
+            out[:, base : base + 16] = (
+                dl1[:, None] * ((q[:, :16] >> shift) & 3).astype(np.float32) - ml1[:, None]
+            )
+            out[:, base + 16 : base + 32] = (
+                dl2[:, None] * ((q[:, 16:] >> shift) & 3).astype(np.float32) - ml2[:, None]
+            )
+    return out.reshape(-1)
+
+
+def _q3k_scales(scales_raw: np.ndarray) -> np.ndarray:
+    """Unpack 12 packed bytes into 16 six-bit signed scales (ggml's aux trick)."""
+    kmask1 = np.uint32(0x03030303)
+    kmask2 = np.uint32(0x0F0F0F0F)
+    a0 = scales_raw[:, 0:4].copy().view("<u4").reshape(-1)
+    a1 = scales_raw[:, 4:8].copy().view("<u4").reshape(-1)
+    a2 = scales_raw[:, 8:12].copy().view("<u4").reshape(-1)
+    tmp = a2.copy()
+    aux = np.empty((scales_raw.shape[0], 4), dtype=np.uint32)
+    aux[:, 0] = (a0 & kmask2) | (((tmp >> np.uint32(0)) & kmask1) << np.uint32(4))
+    aux[:, 1] = (a1 & kmask2) | (((tmp >> np.uint32(2)) & kmask1) << np.uint32(4))
+    aux[:, 2] = ((a0 >> np.uint32(4)) & kmask2) | (((tmp >> np.uint32(4)) & kmask1) << np.uint32(4))
+    aux[:, 3] = ((a1 >> np.uint32(4)) & kmask2) | (((tmp >> np.uint32(6)) & kmask1) << np.uint32(4))
+    return aux.view(np.int8).reshape(-1, 16).astype(np.float32) - 32.0
+
+
+def decode_q3_k(raw: bytes, element_count: int) -> np.ndarray:
+    """Q3_K super-blocks: 16 sub-blocks of 16, 6-bit scales, 3-bit quants."""
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 110)
+    hmask = blocks[:, 0:32]
+    qs = blocks[:, 32:96]
+    scales = _q3k_scales(blocks[:, 96:108])
+    d = blocks[:, 108:110].copy().view("<f2").reshape(-1).astype(np.float32)
+    out = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    for half in range(2):
+        q = qs[:, 32 * half : 32 * half + 32].astype(np.uint16)
+        for j in range(4):
+            shift = 2 * j
+            # The high bit of value 32*j + l is bit (4*half + j) of hmask[l]; a
+            # cleared bit subtracts 4 from the 2-bit quant.
+            bit = np.uint8(1 << (4 * half + j))
+            high_low = (hmask[:, :16] & bit) != 0
+            high_high = (hmask[:, 16:32] & bit) != 0
+            q_low = ((q[:, :16] >> shift) & 3).astype(np.int8) - np.where(high_low, 0, 4)
+            q_high = ((q[:, 16:] >> shift) & 3).astype(np.int8) - np.where(high_high, 0, 4)
+            dl1 = d * scales[:, 8 * half + 2 * j]
+            dl2 = d * scales[:, 8 * half + 2 * j + 1]
+            base = 128 * half + 32 * j
+            out[:, base : base + 16] = dl1[:, None] * q_low
+            out[:, base + 16 : base + 32] = dl2[:, None] * q_high
+    return out.reshape(-1)
+
+
+#: GGML's non-linear 4-bit lookup table for IQ4_NL.
+IQ4_NL_VALUES = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.float32,
+)
+
+
+def decode_iq4_nl(raw: bytes, element_count: int) -> np.ndarray:
+    """IQ4_NL: 32-value blocks of nibble indices into a fixed non-linear table."""
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 18)
+    d = blocks[:, 0:2].copy().view("<f2").reshape(-1).astype(np.float32)
+    qs = blocks[:, 2:18]
+    low = IQ4_NL_VALUES[(qs & 0x0F).astype(np.intp)]
+    high = IQ4_NL_VALUES[(qs >> 4).astype(np.intp)]
+    out = np.concatenate([low, high], axis=1) * d[:, None]
+    return out.reshape(-1)
+
+
 def dequantize(raw: bytes, type_id: int, element_count: int) -> np.ndarray:
     entry = get_type(type_id)
     if entry.type_id == GGML_F32:
@@ -374,10 +466,13 @@ register_decoder(GGML_Q4_1, decode_q4_1)
 register_decoder(GGML_Q5_0, decode_q5_0)
 register_decoder(GGML_Q5_1, decode_q5_1)
 register_decoder(GGML_Q8_0, decode_q8_0)
+register_decoder(GGML_Q2_K, decode_q2_k)
+register_decoder(GGML_Q3_K, decode_q3_k)
 register_decoder(GGML_Q4_K, decode_q4_k)
 register_decoder(GGML_Q5_K, decode_q5_k)
 register_decoder(GGML_Q6_K, decode_q6_k)
 register_decoder(GGML_Q8_K, decode_q8_k)
+register_decoder(GGML_IQ4_NL, decode_iq4_nl)
 register_encoder(GGML_Q8_0, encode_q8_0)
 
 

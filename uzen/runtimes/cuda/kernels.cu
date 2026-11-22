@@ -332,4 +332,23 @@ __global__ void uzen_attention_f32(
     }
 }
 
+// Inference batch normalization with stored running statistics. One block per row;
+// mean/var are per-channel, so unlike layernorm this kernel never reduces over the
+// row: it applies the frozen affine transform (x - mean) / sqrt(var + eps) * w + b.
+__global__ void uzen_batchnorm_f32(
+    const float* x, const float* weight, const float* bias,
+    const float* running_mean, const float* running_var, float* out,
+    int rows, int cols, float eps) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* source = x + (long long)row * cols;
+    float* destination = out + (long long)row * cols;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float value = (source[i] - running_mean[i]) * rsqrtf(running_var[i] + eps);
+        if (weight) value *= weight[i];
+        if (bias) value += bias[i];
+        destination[i] = value;
+    }
+}
+
 }  // extern "C"

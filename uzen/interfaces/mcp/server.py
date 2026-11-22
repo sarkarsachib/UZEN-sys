@@ -376,14 +376,37 @@ class MCPServer:
                         "type": "object",
                         "properties": {
                             "artifact_id": {"type": "string"},
-                            "operation": {"type": "string"},
+                            "operation": {"type": "string", "enum": ["bypass", "truncate", "substitute"]},
                             "node_id": {"type": "string"},
                             "keep_layers": {"type": "integer"},
+                            "new_op": {"type": "string"},
+                            "params": {"type": "object"},
+                            "port": {"type": "string"},
                         },
                         "required": ["artifact_id", "operation"],
                     },
                 },
                 self._modify_architecture,
+            ),
+            "uzen.compose_architectures": (
+                {
+                    "description": (
+                        "Compose stored NIR architectures sequentially, in parallel or "
+                        "with residuals; validates and persists the new artifact. Component "
+                        "weights are not transplanted; new weights are labelled random."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_ids": {"type": "array", "items": {"type": "string"}},
+                            "mode": {"type": "string", "enum": ["sequential", "parallel", "residual"]},
+                            "name": {"type": "string"},
+                            "seed": {},
+                        },
+                        "required": ["artifact_ids"],
+                    },
+                },
+                self._compose_architectures,
             ),
             "uzen.create_model": (
                 {
@@ -433,6 +456,103 @@ class MCPServer:
                     },
                 },
                 self._job_status,
+            ),
+            "uzen.run_campaign": (
+                {
+                    "description": (
+                        "Run, resume or enqueue a deterministic N6/N7/N8 research campaign over "
+                        "architecture fields or weight transforms. Set distributed=true to "
+                        "submit read-only trials to N4 workers. Set background=true to get a "
+                        "durable campaign-run job. Returns trials, Pareto front, best candidate "
+                        "and a content-addressed corpus digest (or the queued job)."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {"type": "object"},
+                            "resume": {"type": "boolean"},
+                            "max_rounds": {"type": "integer"},
+                            "distributed": {"type": "boolean"},
+                            "trial_timeout_seconds": {"type": "number"},
+                            "poll_interval_seconds": {"type": "number"},
+                            "background": {"type": "boolean"},
+                        },
+                        "required": ["spec"],
+                    },
+                },
+                self._run_campaign,
+            ),
+            "uzen.get_campaign": (
+                {
+                    "description": "Read a persisted campaign report and its trial history.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"campaign_id": {"type": "string"}},
+                        "required": ["campaign_id"],
+                    },
+                },
+                self._get_campaign,
+            ),
+            "uzen.list_campaigns": (
+                {
+                    "description": "List persisted research campaigns.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"limit": {"type": "integer"}},
+                    },
+                },
+                self._list_campaigns,
+            ),
+            "uzen.cancel_campaign": (
+                {
+                    "description": (
+                        "Cancel a campaign, its linked trial jobs and its background run job. "
+                        "Already settled jobs are left untouched."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"campaign_id": {"type": "string"}},
+                        "required": ["campaign_id"],
+                    },
+                },
+                self._cancel_campaign,
+            ),
+            "uzen.campaign_jobs": (
+                {
+                    "description": "List the N4 jobs linked to a campaign.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"campaign_id": {"type": "string"}},
+                        "required": ["campaign_id"],
+                    },
+                },
+                self._campaign_jobs,
+            ),
+            "uzen.verify_campaign_corpus": (
+                {
+                    "description": (
+                        "Replay benchmark records by rebuilding and executing their "
+                        "candidates; reports matched and mismatched digests."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "digests": {"type": "array", "items": {"type": "string"}}
+                        },
+                    },
+                },
+                self._verify_campaign_corpus,
+            ),
+            "uzen.replay_benchmark": (
+                {
+                    "description": "Replay one content-addressed benchmark record.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"digest": {"type": "string"}},
+                        "required": ["digest"],
+                    },
+                },
+                self._replay_benchmark,
             ),
         }
 
@@ -694,43 +814,55 @@ class MCPServer:
         )
 
     def _modify_architecture(self, args: Mapping[str, Any]) -> Any:
-        from uzen.core.nase.synth import ArchitectureSynthesizer
-        from uzen.core.nir.graph import Graph
-        from uzen.core.vel.verify import verify
-
-        manifest = self.client.artifact(str(args["artifact_id"]))
-        graph_doc = (manifest.get("metadata") or {}).get("graph")
-        if not graph_doc:
-            raise UzenError("artifact has no stored NIR graph; only synthesized models can be edited")
-        package = self.client.package(str(args["artifact_id"]))
-        synth = ArchitectureSynthesizer()
-        from uzen.interfaces.python_sdk.client import Uzen as _U
-
-        definition = synth.from_graph(
-            Graph.from_dict(graph_doc),
-            parameter_shapes={e["name"]: e["shape"] for e in manifest["tensors"]},
-            family=manifest.get("family", "custom"),
+        return self.client.edit_architecture(
+            str(args["artifact_id"]),
+            str(args.get("operation", "bypass")),
+            node_id=args.get("node_id"),
+            keep_layers=args.get("keep_layers"),
+            new_op=args.get("new_op"),
+            params=args.get("params") or {},
+            port=str(args.get("port", "a")),
         )
-        operation = str(args.get("operation", "bypass"))
-        if operation == "bypass":
-            report = synth.bypass(definition, str(args["node_id"]))
-        elif operation == "truncate":
-            report = synth.truncate_layers(definition, int(args["keep_layers"]))
-        else:
-            raise UzenError(f"unsupported architecture operation '{operation}'")
-        report.definition.graph.require_valid()
-        inputs = {
-            name: __import__("numpy").zeros(tuple(2 if not isinstance(d, int) else d for d in spec.shape), dtype=spec.dtype)
-            for name, spec in report.definition.graph.inputs.items()
-        }
-        verification = verify(package, graph=report.definition.graph, inputs=inputs)
-        return {
-            "changes": report.changes,
-            "invalidated_parameters": report.invalidated_parameters,
-            "summary": report.definition.summary(),
-            "graph": report.definition.graph.to_dict(),
-            "verification": verification.to_dict(),
-        }
+
+    def _compose_architectures(self, args: Mapping[str, Any]) -> Any:
+        return self.client.compose_architectures(
+            [str(item) for item in args["artifact_ids"]],
+            mode=str(args.get("mode", "sequential")),
+            name=args.get("name"),
+            seed=args.get("seed", 0),
+        )
+
+    def _run_campaign(self, args: Mapping[str, Any]) -> Any:
+        return self.client.run_campaign(
+            args["spec"],
+            resume=bool(args.get("resume", True)),
+            max_rounds=args.get("max_rounds"),
+            distributed=bool(args.get("distributed", False)),
+            trial_timeout_seconds=float(args.get("trial_timeout_seconds", 600.0)),
+            poll_interval_seconds=float(args.get("poll_interval_seconds", 0.1)),
+            background=bool(args.get("background", False)),
+        )
+
+    def _cancel_campaign(self, args: Mapping[str, Any]) -> Any:
+        return self.client.cancel_campaign(str(args["campaign_id"]))
+
+    def _campaign_jobs(self, args: Mapping[str, Any]) -> Any:
+        return {"jobs": self.client.campaign_jobs(str(args["campaign_id"]))}
+
+    def _get_campaign(self, args: Mapping[str, Any]) -> Any:
+        return self.client.campaign(str(args["campaign_id"]))
+
+    def _list_campaigns(self, args: Mapping[str, Any]) -> Any:
+        return {"campaigns": self.client.campaigns(limit=int(args.get("limit", 50)))}
+
+    def _verify_campaign_corpus(self, args: Mapping[str, Any]) -> Any:
+        digests = args.get("digests")
+        return self.client.verify_campaign_corpus(
+            [str(item) for item in digests] if digests else None
+        )
+
+    def _replay_benchmark(self, args: Mapping[str, Any]) -> Any:
+        return self.client.replay_benchmark(str(args["digest"]))
 
     def _create_model(self, args: Mapping[str, Any]) -> Any:
         return self.client.generate(

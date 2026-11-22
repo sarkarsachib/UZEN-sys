@@ -546,6 +546,7 @@ class AutonomousNeuralEngineer:
         graph_inputs: Mapping[str, np.ndarray] | None = None,
         reference: WeightPackage | None = None,
         job_id: str | None = None,
+        plan: EngineeringPlan | None = None,
     ) -> ANEResult:
         if request.task_scope.is_architecture_scope:
             raise NoValidStrategy(
@@ -553,7 +554,9 @@ class AutonomousNeuralEngineer:
                 "transformation planner",
                 hint="use /v1/architectures/synthesize or /v1/architectures/research",
             )
-        plan = self.plan(request, input_names=list(inputs))
+        plan = plan or self.plan(request, input_names=list(inputs))
+        if plan.request is not request and plan.request.to_dict() != request.to_dict():
+            raise InvalidOperationParameters("supplied engineering plan belongs to a different request")
         base = inputs.get(plan.stages[0].input_names[0]) if plan.stages else None
         objective = Objective(
             plan.evaluation,

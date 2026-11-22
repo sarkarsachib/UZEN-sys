@@ -20,8 +20,10 @@ the requested scope.
 
 ## Remaining audit gaps
 
-* GPU/native backends are not implemented, so there is no GPU execution route to
-  audit. Capability reporting says so explicitly.
+* The native CPU backend and CUDA source/compile path are implemented. CUDA execution
+  could not be audited in the authoring environment because no driver/device is
+  present; GPU parity tests skip there, and capability reporting does not claim a
+  verified GPU speedup.
 * A malicious caller with process-level access can bypass Python-level guards by
   editing files directly; artifact checksums and the hash-chained audit log make
   such tampering detectable, not impossible.

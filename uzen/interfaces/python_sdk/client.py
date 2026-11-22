@@ -672,6 +672,191 @@ class Uzen:
         report = verify(package, reference=reference, graph=graph, inputs=inputs)
         return report.to_dict()
 
+    def compose_architectures(
+        self,
+        artifact_ids: Sequence[str],
+        *,
+        mode: str = "sequential",
+        name: str | None = None,
+        seed: int | str | None = 0,
+    ) -> dict[str, Any]:
+        """Compose stored architectures and persist the validated result."""
+        if not self.local:
+            return self._request(
+                "POST",
+                "/v1/architectures/compose",
+                {
+                    "artifact_ids": list(artifact_ids),
+                    "mode": mode,
+                    "name": name,
+                    "seed": seed,
+                },
+            )
+        return self.service.compose_architectures(
+            list(artifact_ids), mode=mode, name=name, seed=seed
+        )
+
+    def edit_architecture(
+        self,
+        artifact_id: str,
+        operation: str,
+        *,
+        node_id: str | None = None,
+        keep_layers: int | None = None,
+        new_op: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        port: str = "a",
+    ) -> dict[str, Any]:
+        """Bypass, truncate or substitute a stored architecture and persist it."""
+        if not self.local:
+            return self._request(
+                "POST",
+                f"/v1/architectures/{artifact_id}/edit",
+                {
+                    "operation": operation,
+                    "node_id": node_id,
+                    "keep_layers": keep_layers,
+                    "new_op": new_op,
+                    "params": dict(params or {}),
+                    "port": port,
+                },
+            )
+        return self.service.edit_architecture(
+            artifact_id,
+            operation,
+            node_id=node_id,
+            keep_layers=keep_layers,
+            new_op=new_op,
+            params=params,
+            port=port,
+        )
+
+    # ------------------------------------------------------------------ #
+    # research campaigns (N6/N7/N8)
+    # ------------------------------------------------------------------ #
+
+    def run_campaign(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        resume: bool = True,
+        max_rounds: int | None = None,
+        distributed: bool = False,
+        trial_timeout_seconds: float = 600.0,
+        poll_interval_seconds: float = 0.1,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """Run, resume or enqueue a deterministic architecture/weight campaign.
+
+        ``distributed=True`` submits each trial to the N4 control-plane queue and
+        waits for workers; it never silently falls back to local evaluation.
+        ``background=True`` returns a durable campaign-run job instead of blocking;
+        a ``CampaignWorker`` restricted to ``campaign_run`` must be running.
+        """
+        if not self.local:
+            return self._request(
+                "POST",
+                "/v1/campaigns",
+                {
+                    "spec": dict(spec),
+                    "resume": resume,
+                    "max_rounds": max_rounds,
+                    "distributed": distributed,
+                    "trial_timeout_seconds": trial_timeout_seconds,
+                    "poll_interval_seconds": poll_interval_seconds,
+                    "background": background,
+                },
+            )
+        from uzen.core.campaign import CampaignEngine, CampaignSpec, DistributedTrialExecutor
+
+        parsed = CampaignSpec.from_dict(spec)
+        if background:
+            from uzen.core.campaign.control import submit_campaign_run
+
+            return submit_campaign_run(
+                self.service,
+                parsed,
+                distributed=distributed,
+                resume=resume,
+                max_rounds=max_rounds,
+                trial_timeout_seconds=trial_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        executor = None
+        if distributed:
+            executor = DistributedTrialExecutor(
+                self.service,
+                timeout_seconds=trial_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        engine = CampaignEngine(
+            self.service.root,
+            trial_executor=executor,
+            job_service=self.service,
+        )
+        return engine.run(parsed, resume=resume, max_rounds=max_rounds).to_dict()
+
+    def campaign(self, campaign_id: str) -> dict[str, Any]:
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(self.service.root).get(campaign_id).to_dict()
+        return self._request("GET", f"/v1/campaigns/{campaign_id}")
+
+    def campaigns(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(self.service.root).list_campaigns(limit=limit)
+        return self._request("GET", f"/v1/campaigns?limit={limit}")["campaigns"]
+
+    def campaign_events(self, campaign_id: str, *, after: int = 0) -> list[dict[str, Any]]:
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(self.service.root).events(campaign_id, after=after)
+        return self._request(
+            "GET", f"/v1/campaigns/{campaign_id}/events?after={after}"
+        )["events"]
+
+    def campaign_jobs(self, campaign_id: str) -> list[dict[str, Any]]:
+        """N4 jobs linked to a campaign (trial evaluations and run coordinators)."""
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(
+                self.service.root, job_service=self.service
+            ).jobs(campaign_id)
+        return self._request("GET", f"/v1/campaigns/{campaign_id}/jobs")["jobs"]
+
+    def cancel_campaign(self, campaign_id: str) -> dict[str, Any]:
+        """Cancel a campaign and its linked queued or leased jobs."""
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(
+                self.service.root, job_service=self.service
+            ).cancel(campaign_id)
+        return self._request("POST", f"/v1/campaigns/{campaign_id}/cancel", {})
+
+    def verify_campaign_corpus(self, digests: Sequence[str] | None = None) -> dict[str, Any]:
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(self.service.root).verify_corpus(digests)
+        return self._request(
+            "POST",
+            "/v1/campaigns/verify",
+            {"digests": list(digests) if digests is not None else None},
+        )
+
+    def replay_benchmark(self, digest: str) -> dict[str, Any]:
+        if self.local:
+            from uzen.core.campaign import CampaignEngine
+
+            return CampaignEngine(self.service.root).replay(digest)
+        return self._request("GET", f"/v1/benchmarks/{digest}")
+
     # ------------------------------------------------------------------ #
     # jobs
     # ------------------------------------------------------------------ #

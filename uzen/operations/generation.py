@@ -241,14 +241,18 @@ def _low_rank_regeneration_impl(ctx, inputs: list[WeightPackage], p: dict[str, A
 
 def _compose_donors_impl(ctx, inputs: list[WeightPackage], p: dict[str, Any]):
     conflict = str(p.get("conflict", "error"))
+    if conflict == "mean":
+        conflict = "average"
     if conflict not in ("error", "first", "last", "average"):
-        raise InvalidOperationParameters("conflict must be error|first|last|average")
+        raise InvalidOperationParameters("conflict must be error|first|last|average|mean")
     merged_tensors: dict[str, np.ndarray] = {}
+    counts: dict[str, int] = {}
     provenance: dict[str, str] = {}
     for index, pkg in enumerate(inputs):
         for name in pkg.names():
             if name not in merged_tensors:
                 merged_tensors[name] = np.array(pkg.tensors[name], copy=True)
+                counts[name] = 1
                 provenance[name] = f"input[{index}]"
                 continue
             existing = merged_tensors[name]
@@ -265,11 +269,16 @@ def _compose_donors_impl(ctx, inputs: list[WeightPackage], p: dict[str, Any]):
                 )
             if conflict == "last":
                 merged_tensors[name] = np.array(incoming, copy=True)
+                counts[name] = 1
                 provenance[name] = f"input[{index}]"
             elif conflict == "average":
+                # Running mean: (sum so far + incoming) / (n + 1). Pairwise halving
+                # made later donors count more than earlier ones.
+                count = counts.get(name, 1)
                 merged_tensors[name] = (
-                    (float_view(existing) + float_view(incoming)) / 2.0
+                    (float_view(existing) * count + float_view(incoming)) / (count + 1)
                 ).astype(existing.dtype)
+                counts[name] = count + 1
                 provenance[name] = provenance[name] + f"+input[{index}]"
     out = {name: ctx.emit(arr, name=name) for name, arr in merged_tensors.items()}
     return make_outcome(
@@ -368,7 +377,7 @@ _register(OperationSpec(
     fn=_compose_donors_impl,
     description="Compose a parameter set out of several donors with explicit conflict policy.",
     scopes=_SCOPES,
-    params={"conflict": ParamSpec("str", default="error", choices=("error", "first", "last", "average"))},
+    params={"conflict": ParamSpec("str", default="error", choices=("error", "first", "last", "average", "mean"))},
     assumptions=("tensors with the same name are semantically the same slot",),
     min_inputs=1,
     max_inputs=16,

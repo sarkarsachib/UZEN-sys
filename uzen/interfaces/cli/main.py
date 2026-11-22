@@ -201,6 +201,56 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--spec", required=True)
     ra.add_argument("--variants")
 
+    # architecture engineering ---------------------------------------- #
+    architecture = sub.add_parser("architecture", help="compose and edit NIR architectures")
+    architecture_sub = architecture.add_subparsers(dest="architecture_command", required=True)
+    ac = architecture_sub.add_parser("compose")
+    ac.add_argument("artifact_ids", nargs="+")
+    ac.add_argument("--mode", default="sequential")
+    ac.add_argument("--name")
+    ac.add_argument("--seed", default="0")
+    ae = architecture_sub.add_parser("edit")
+    ae.add_argument("artifact_id")
+    ae.add_argument("--operation", required=True, choices=("bypass", "truncate", "substitute"))
+    ae.add_argument("--node")
+    ae.add_argument("--keep-layers", type=int)
+    ae.add_argument("--new-op")
+    ae.add_argument("--port", default="a")
+    ae.add_argument("--param", action="append", default=[])
+
+    # campaigns ------------------------------------------------------- #
+    campaign = sub.add_parser("campaign", help="resumable research campaigns (N6/N7/N8)")
+    campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
+    cr = campaign_sub.add_parser("run")
+    cr.add_argument("--spec", help="inline campaign spec JSON")
+    cr.add_argument("--spec-file", help="campaign spec JSON file")
+    cr.add_argument("--id", help="override the campaign id")
+    cr.add_argument("--no-resume", action="store_true")
+    cr.add_argument("--max-rounds", type=int)
+    cr.add_argument("--distributed", action="store_true", help="submit trials to N4 workers")
+    cr.add_argument("--trial-timeout", type=float, default=600.0)
+    cr.add_argument("--poll-interval", type=float, default=0.1)
+    cr.add_argument(
+        "--background",
+        action="store_true",
+        help="enqueue a durable campaign-run job instead of blocking",
+    )
+    cs = campaign_sub.add_parser("show")
+    cs.add_argument("campaign_id")
+    cl = campaign_sub.add_parser("list")
+    cl.add_argument("--limit", type=int, default=50)
+    ce = campaign_sub.add_parser("events")
+    ce.add_argument("campaign_id")
+    ce.add_argument("--after", type=int, default=0)
+    cv = campaign_sub.add_parser("verify")
+    cv.add_argument("--digest", action="append", default=[])
+    cp = campaign_sub.add_parser("replay")
+    cp.add_argument("digest")
+    cc = campaign_sub.add_parser("cancel")
+    cc.add_argument("campaign_id")
+    cj = campaign_sub.add_parser("jobs")
+    cj.add_argument("campaign_id")
+
     # artifacts ------------------------------------------------------- #
     art = sub.add_parser("artifacts", help="artifact store")
     art_sub = art.add_subparsers(dest="artifacts_command", required=True)
@@ -265,6 +315,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker_run.add_argument("--poll", type=float, default=1.0)
     worker_run.add_argument("--lease-seconds", type=float, default=120.0)
     worker_run.add_argument("--wait-seconds", type=float, default=0.0)
+    worker_run.add_argument(
+        "--job-kind",
+        action="append",
+        default=None,
+        help="restrict this worker to a task kind (repeatable); default claims every kind",
+    )
 
     mcp = sub.add_parser("mcp", help="run the MCP stdio server")
     mcp.add_argument("--root", default="./uzen-workspace")
@@ -506,6 +562,69 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if cmd == "architecture":
+        client = _client(args)
+        if args.architecture_command == "compose":
+            _emit(
+                client.compose_architectures(
+                    args.artifact_ids,
+                    mode=args.mode,
+                    name=args.name,
+                    seed=args.seed,
+                )
+            )
+        else:
+            _emit(
+                client.edit_architecture(
+                    args.artifact_id,
+                    args.operation,
+                    node_id=args.node,
+                    keep_layers=args.keep_layers,
+                    new_op=args.new_op,
+                    params=_kv_params(args.param),
+                    port=args.port,
+                )
+            )
+        return 0
+
+    if cmd == "campaign":
+        client = _client(args)
+        if args.campaign_command == "run":
+            if args.spec_file:
+                spec = json.loads(Path(args.spec_file).read_text(encoding="utf-8"))
+            else:
+                spec = _json_arg(args.spec)
+            if not isinstance(spec, dict):
+                raise SystemExit("campaign run requires --spec or --spec-file with a JSON object")
+            if args.id:
+                spec["campaign_id"] = args.id
+            _emit(
+                client.run_campaign(
+                    spec,
+                    resume=not args.no_resume,
+                    max_rounds=args.max_rounds,
+                    distributed=args.distributed,
+                    trial_timeout_seconds=args.trial_timeout,
+                    poll_interval_seconds=args.poll_interval,
+                    background=args.background,
+                )
+            )
+        elif args.campaign_command == "show":
+            _emit(client.campaign(args.campaign_id))
+        elif args.campaign_command == "list":
+            _emit({"campaigns": client.campaigns(limit=args.limit)})
+        elif args.campaign_command == "events":
+            _emit({"events": client.campaign_events(args.campaign_id, after=args.after)})
+        elif args.campaign_command == "verify":
+            _emit(client.verify_campaign_corpus(args.digest or None))
+        elif args.campaign_command == "cancel":
+            _emit(client.cancel_campaign(args.campaign_id))
+        elif args.campaign_command == "jobs":
+            _emit({"jobs": client.campaign_jobs(args.campaign_id)})
+        else:
+            _emit(client.replay_benchmark(args.digest))
+        return 0
+
     if cmd == "artifacts":
         client = _client(args)
         if args.artifacts_command == "list":
@@ -583,6 +702,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             lease_seconds=args.lease_seconds,
             claim_wait_seconds=args.wait_seconds,
             poll_interval=args.poll,
+            job_kinds=tuple(args.job_kind) if args.job_kind else None,
         )
         if args.once:
             _emit(daemon.run_once())

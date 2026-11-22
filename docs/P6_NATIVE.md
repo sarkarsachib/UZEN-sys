@@ -5,7 +5,8 @@ Advanced computational substrate**, and exactly what is implemented. The master
 specification lists Rust integration, a native compiler, C++/CUDA kernels,
 additional runtime backends, advanced parameter representations and large-scale
 autonomous research. Those are too large to pretend to finish in one step, so
-they are split into six verifiable phases.
+they are split into six core phases, plus the N7, N8 and N9 post-P6 campaign
+extensions.
 
 No phase below is claimed because a directory or interface name exists. A phase is
 `implemented` only when its kernels/engine execute real computation and the
@@ -20,10 +21,15 @@ listed gate passes.
 | **N3** | Advanced parameter representations: block-wise int4/int8 with scales, low-rank/sparse native layouts, packed transposed weights, representation-aware execution | **implemented** |
 | **N4** | Distributed execution: durable queue adapter, capability-aware worker scheduling, leases with expiry and attempts, priority and backoff, preemption and draining, idempotent dispatch, remote artifact fetch | **implemented** (SQLite verified across processes; Redis/Valkey RESP2 adapter verified against a live Redis 7.4 server on localhost) |
 | **N5** | GPU/native boundary: real CUDA kernels, device allocator, transfer-aware dispatch, CPU fallback policy that is explicit rather than silent | **implemented at the CUDA boundary** (17 kernels compile to PTX with NVRTC and assemble with `ptxas`; driver-API runtime and GPU tests present; execution not verified in the authoring environment because it has no driver/device; HIP not implemented) |
-| **N6** | Large-scale autonomous research: native candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | planned |
+| **N6** | Large-scale autonomous research: candidate-evaluation batches, experiment scheduler, architecture/parameter search campaigns, reproducible benchmark corpus | **implemented** (in-process batch scheduler; inference-only proxy metrics; see [N6_CAMPAIGNS.md](N6_CAMPAIGNS.md)) |
+| **N7** | Distributed campaign trials over the N4 worker queue | **implemented** (post-P6 extension; see [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md)) |
+| **N8** | Campaign control: durable background runs, cancellation propagation and job-kind isolation | **implemented** (post-P6 extension; see [N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md)) |
+| **N9** | Campaign run durability: atomic single-coordinator admission and lease keepalive | **implemented** (post-P6 extension; see [N9_CAMPAIGN_DURABILITY.md](N9_CAMPAIGN_DURABILITY.md)) |
 
 N5 is implemented as code and compile-verified; its GPU tests remain skipped until run on
-a machine with a device. N6 is not started.
+a machine with a device. N6 runs real architecture and weight-transform campaigns with
+SQLite resume and a replayable corpus; it is not a distributed training or task-quality
+system.
 
 ## N1 — implemented native CPU layer
 
@@ -569,7 +575,7 @@ python -m pytest -o addopts="" -q tests/test_cuda_runtime.py
 python examples/cuda_device_demo.py --root /tmp/uzen-cuda-demo
 ```
 
-On this host the suite reports **10 passed, 4 skipped** and the demo ends
+On this host the suite reports **11 passed, 4 skipped** and the demo ends
 `RESULT: SKIPPED (no CUDA device; kernels compiled to PTX only)`. The four skips are
 the GPU parity tests (MLP, transformer with attention capture, weight residency,
 attention mask semantics), not fakes. The compile tests run and `ptxas` assembles the
@@ -589,8 +595,107 @@ PTX, so kernel syntax and PTX validity are checked without a device.
 10. Toolkit-free compilation needs the NVRTC wheel; execution still needs the vendor
     driver. A driver older than the PTX target fails with `runtime.cuda_kernel`.
 
-## N6 boundary
+## N6 — implemented campaign engine
 
-N6 builds research campaigns on the deterministic engines; candidate generation may
-be autonomous, but every candidate still passes the same STRICT_PLUS, validation and
-provenance path. No campaign engine is started.
+N6 builds research campaigns on the deterministic engines. Candidate generation is
+seeded and autonomous, but every candidate still passes the same validation and
+inference path; no candidate is trained or optimized by gradients.
+
+* `uzen/core/campaign/spec.py` defines immutable `CampaignSpec`, `Axis` and
+  `Objective` records. Architecture axes must name real family-spec fields; weight
+  axes are restricted to `scale`, `sparsity` and `quantize`.
+* `uzen/core/campaign/space.py` implements deterministic grid, random and evolutionary
+  proposal generation. Completed candidate digests are excluded and proposals are a
+  pure function of the seed, round and ranked trials.
+* `uzen/core/campaign/evaluate.py` builds the architecture or transformed package,
+  executes a real NumPy forward pass and measures parameters, bytes, node count,
+  output RMS/diversity, sparsity, int8 round-trip error and (for weight campaigns)
+  distance/activation agreement from a base package.
+* `uzen/core/campaign/store.py` persists campaigns, trials and events in SQLite. Trial
+  keys are `(campaign_id, candidate_digest)`, so a retry is idempotent. `max_rounds`
+  produces a paused campaign that can be resumed at the next batch boundary.
+* `uzen/core/campaign/corpus.py` writes successful trials to content-addressed JSON
+  records and rebuilds/re-executes them for verification. Timestamps and latency are
+  excluded from the record digest; environment versions are stored separately.
+* `uzen/core/campaign/engine.py` schedules batches (bounded thread pool), applies
+  constraints, scores objectives, computes the Pareto front, early-stops on patience
+  and persists every outcome, including `invalid`, `constraint` and `error` trials.
+
+The CLI exposes `campaign run|show|list|events|verify|replay`; the SDK exposes
+`run_campaign`, `campaign`, `campaigns`, `campaign_events`,
+`verify_campaign_corpus` and `replay_benchmark`; REST exposes `/v1/campaigns` and
+`/v1/benchmarks/{digest}`; MCP exposes five campaign tools. See
+[N6_CAMPAIGNS.md](N6_CAMPAIGNS.md) for the full schema, guarantees and limitations.
+
+### N6 honest limits
+
+1. The scheduler is in-process; there is no campaign distribution over N4 workers.
+2. Proxy metrics are not task quality. No dataset, loss or accuracy score exists.
+3. Resume is batch-granular: a crash inside a batch does not preserve its unwritten
+   trials, though completed trials are never duplicated.
+4. Verification tolerates low-bit BLAS differences within `1e-9` relative; it never
+   claims bitwise identity across machines.
+5. Weight campaigns cover scale, magnitude sparsity and symmetric int8 round-trip
+   simulation; they do not perform learned pruning or quantization-aware optimization.
+6. The REST run endpoint is synchronous and is not a background campaign daemon.
+
+## N7 — distributed campaign trials (post-P6 extension)
+
+N7 keeps N6's planners, scoring, SQLite campaign store and corpus unchanged and moves
+only trial evaluation onto the N4 queue. A trial is a read-only `inspection` job with
+`options.task_kind=campaign_trial`; it carries the campaign spec and candidate, is
+validated by recomputing the candidate digest, and returns metrics without creating an
+artifact. `DistributedTrialExecutor` submits every proposal with a stable idempotency
+key, waits for workers, and records the same `Trial` rows a local run records.
+
+Workers use the normal atomic claim and token-guarded `JobService.run` path. A timeout
+pauses the campaign with `stop_reason=worker_timeout`; resuming resubmits the same
+idempotency keys and reuses jobs that settled in the meantime. The coordinator remains
+single-host SQLite: this is distributed execution, not a distributed campaign database.
+See [N7_DISTRIBUTED_CAMPAIGNS.md](N7_DISTRIBUTED_CAMPAIGNS.md) for the job schema,
+worker loop, demo gates and limits.
+
+## N8 — campaign control and isolation (post-P6 extension)
+
+N8 makes a campaign run itself an N4 job (`task_kind=campaign_run`) so the REST request
+can return a durable coordinator job instead of blocking. `CampaignEngine.cancel` sets a
+durable cancellation flag, cancels the linked coordinator and trial jobs, and
+`CampaignStore.record_trial` serializes the cancel check with the insert so no trial is
+appended after cancellation returns. A late worker report is settled as `CANCELLED`
+instead of publishing a result. Job rows now carry `job_kind`; the claim query accepts a
+kind filter, `CampaignWorker` defaults to `campaign_trial`, and a coordinator worker must
+opt into `campaign_run`.
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_campaign_control.py
+.venv/bin/python examples/campaign_control_demo.py --root /tmp/uzen-n8-demo
+```
+
+Measured in this workspace: 10 N8-focused tests pass, the 9 N7 tests stay green, the
+real-process demo has 10/10 gates PASS, and the full suite is 553 passed / 37 skipped
+(37 skips are the documented opt-in/hardware gates plus 4 CUDA compilation skips because
+NVRTC is not installed in this restored environment). See
+[N8_CAMPAIGN_CONTROL.md](N8_CAMPAIGN_CONTROL.md) for the job contract, cancellation
+barrier, interfaces and limits.
+
+## N9 — campaign run durability (post-P6 extension)
+
+N9 closes the duplicate-admission and long-lease gaps documented by N8. A background
+submission now reserves the campaign's coordinator slot atomically with
+`CampaignStore.reserve_run` under `BEGIN IMMEDIATE`, then creates the job under that
+reserved id; concurrent submitters return the same job instead of each creating one.
+`JobService.run(..., lease_seconds=N)` renews a leased job every `N/3` seconds with the
+dispatch token, and `CampaignWorker` passes its lease into that path. A campaign that
+runs longer than its initial lease therefore stays on attempt 1 instead of being reaped
+and executed twice.
+
+```bash
+.venv/bin/python -m pytest -o addopts="" -q tests/test_campaign_durability.py
+.venv/bin/python examples/campaign_durability_demo.py --root /tmp/uzen-n9-demo
+```
+
+Measured in this workspace: 4 focused N9 tests pass, the 10 N8 and 9 N7 tests stay
+green, the full suite is 557 passed / 37 skipped, and the four-process demo reports 9/9
+gates PASS with one admitted job, 64 trials, and a ~0.4-second run under a 0.15-second
+lease. Admission remains single-host SQLite and cancellation remains cooperative; see
+[N9_CAMPAIGN_DURABILITY.md](N9_CAMPAIGN_DURABILITY.md) for the protocol and limits.

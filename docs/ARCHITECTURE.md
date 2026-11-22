@@ -7,9 +7,12 @@ artifact carries provenance and validation evidence.
 ```text
             interfaces            REST · MCP · CLI · Python SDK
                  │
-                 ▼
-              jobs/               control plane: lifecycle, idempotency, events, leases
-                 │
+        ┌────────┴─────────┐
+        ▼                  ▼
+      jobs/          core/campaign (N6 local, N7 distributed trials, N8 control)
+ control plane       scheduler · Pareto · replay corpus · cancellation
+        │                  │
+        └────────┬─────────┘
                  ▼
         core/ane (planner)        objective → plan → candidates → search → diagnosis
                  │
@@ -80,10 +83,9 @@ The interpreter (`executor.execute`) binds parameters **by tensor name**, resolv
 symbols, runs kernels in topological order, and raises `ShapeMismatch` with node id and
 input shapes on failure. `capture=` returns intermediate activations for VEL/NPA.
 
-Families (`transformer_decoder`, `mlp`, `cnn`, `recurrent`, `autoencoder`) construct
-graphs from specs, allocate parameter shapes, and initialize analytically where a
-closed form exists (orthogonal rows, unit norms, zero bias) or label tensors
-`randomly_initialized` otherwise.
+The 24 registered families construct graphs from specs, allocate parameter shapes, and
+initialize analytically where a closed form exists (orthogonal rows, unit norms, zero
+bias) or label tensors `randomly_initialized` otherwise.
 
 ## NWPC — operation registry
 
@@ -123,10 +125,14 @@ raises `NoValidAlignment` (`npa.no_valid_alignment`). The report always states
 
 ## NASE — architecture synthesis
 
-Build graphs from specs, compose definitions (`sequential`/`parallel`), substitute
-operators, bypass nodes, truncate layers. Every transformation validates the resulting
-graph and reports invalidated parameters, so callers know exactly which tensors must
-be re-bound. `from_graph` rebuilds an editable definition from a stored NIR graph.
+Build graphs from specs, compose definitions (`sequential`/`parallel`/`residual`),
+substitute operators, bypass nodes and truncate layers. Every transformation validates
+the resulting graph and reports invalidated parameters, so callers know exactly which
+tensors must be re-bound. `from_graph` rebuilds an editable definition from a stored
+NIR graph and preserves its family spec; composition selects the semantic output
+(`out`, `logits`, `y`, `reconstruction`, `eps_pred`) rather than relying on JSON key
+order. The service persists composed/edited graphs with parent lineage through SDK,
+CLI, REST and MCP.
 
 ## WComp / WPL
 
@@ -176,6 +182,43 @@ none exists it reports `NO_VALID_ALIGNMENT` rather than inventing a result.
 
 `LLMPlanner` optionally consults an OpenAI-compatible endpoint, but every proposed
 stage is re-validated through the same registry/scope/policy path.
+
+## Campaigns (N6/N7/N8/N9)
+
+`uzen.core.campaign` is a separate research loop over the deterministic engines. A
+seeded planner (`grid`/`random`/`evolution`) proposes architecture specs or weight
+transforms; an evaluator builds the package and executes a real NumPy forward pass;
+the engine scores objectives, applies constraints, computes a Pareto front and
+persists every trial in SQLite. `max_rounds` pauses at a batch boundary and a later
+run resumes from the same seed. Successful trials are written to a content-addressed
+corpus whose `verify`/`replay` paths rebuild and execute the candidate instead of
+trusting stored numbers. Campaigns never train, fine-tune or update weights by
+gradients, and their proxy metrics are not task quality.
+
+N7 (`uzen.core.campaign.distributed`) passes a `DistributedTrialExecutor` to the same
+engine. It submits each proposal as a read-only `inspection` job with
+`options.task_kind=campaign_trial`; `CampaignWorker` claims those jobs through the N4
+scheduler and returns metrics through the token-guarded job result. The coordinator
+waits for the batch, stores the same trials and corpus records as a local run, and
+pauses on a typed timeout. The campaign database remains local to the coordinator.
+
+N8 (`uzen.core.campaign.control`) makes a campaign run itself an N4 job with
+`options.task_kind=campaign_run`. A coordinator worker executes it through the same
+lease/token path as any other job, so the run survives a lost HTTP request or coordinator
+crash. Campaign jobs are linked in `campaign_jobs`; `CampaignEngine.cancel` sets a
+durable cancel flag, cancels the coordinator and trial jobs, and blocks new trial inserts
+at the SQLite write boundary. Late worker reports are settled as `CANCELLED`, never as
+successful results. `job_kind` is stored on job rows and can be used as a claim filter, so
+`CampaignWorker` defaults to `campaign_trial` while a coordinator claims only
+`campaign_run`.
+
+N9 (`uzen.core.campaign.control` and `uzen.core.campaign.store`) admits one coordinator
+per campaign across processes. A submission reserves `run_job_id` atomically under
+`BEGIN IMMEDIATE` before creating the job under that id, so a concurrent submitter
+waits for and returns the same job instead of creating a second one. `JobService.run`
+can also keep a leased execution alive with a token-guarded renewal thread;
+`CampaignWorker` enables it with its configured lease so a long campaign is not reaped
+mid-run. The campaign database and reservation remain single-host SQLite.
 
 ## Control and execution planes
 

@@ -110,7 +110,7 @@ def test_05_weight_only_modification_keeps_architecture():
         "w.merge.soup", [pkg, pkg.copy()], {"weights": [1.0, 1.0]}, scope=TaskScope.WEIGHT_MODIFICATION
     )
     assert out.output.structure_digest() == pkg.structure_digest()
-    assert out.output.fingerprint() != pkg.fingerprint() or True  # identical inputs may round-trip exactly
+    assert set(out.output.names()) == set(pkg.names())
 
 
 # 6 ------------------------------------------------------------------------- #
@@ -225,24 +225,30 @@ def test_13_mcp_submission_creates_a_real_job(tmp_path: Path):
     from uzen.interfaces.mcp.server import MCPServer
 
     server = MCPServer(root=tmp_path / "mcp")
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "uzen.plan_engineering",
-                "arguments": {
-                    "task_scope": "weight_modification",
-                    "objective": "interpolate two models",
-                    "inputs": [{"name": "a", "artifact_id": "x"}, {"name": "b", "artifact_id": "y"}],
-                },
-            },
-        }
+
+    def call(name: str, arguments: dict) -> dict:
+        response = server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+        assert response["result"].get("isError") is not True
+        return json.loads(response["result"]["content"][0]["text"])
+
+    created = call(
+        "uzen.create_model",
+        {"family": "mlp", "spec": {"input_dim": 4, "hidden_dims": [8], "output_dim": 3}, "seed": 0},
     )
-    assert response["result"].get("isError") is not True
-    plan = json.loads(response["result"]["content"][0]["text"])["plan"]
-    assert plan["stages"] and plan["scope"] == "weight_modification"
+    job = call(
+        "uzen.research_weight_architecture",
+        {"artifact_id": created["artifact_id"]},
+    )
+    assert job["id"] and job["state"] == "SUCCEEDED"
+    assert job["request"]["task_scope"] == "weight_architecture_research"
+    assert job["result"]["research"]["experiments"]
 
 
 # 14 ------------------------------------------------------------------------ #

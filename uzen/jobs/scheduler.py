@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from uzen.errors import JobNotFound
 from uzen.infrastructure.storage.db import Database, JobRow, TERMINAL_STATES
@@ -100,6 +100,7 @@ class JobScheduler:
         now: float | None = None,
         wait_seconds: float = 0.0,
         poll_interval: float = DEFAULT_CLAIM_POLL_SECONDS,
+        job_kinds: Sequence[str] | None = None,
     ) -> dict[str, Any] | None:
         """Lease the next eligible job for ``worker_id``.
 
@@ -121,6 +122,7 @@ class JobScheduler:
                 capabilities=capabilities,
                 aging_seconds=self.aging_seconds,
                 max_in_flight_per_worker=self.max_in_flight_per_worker,
+                job_kinds=job_kinds,
             )
             if job is not None:
                 break
